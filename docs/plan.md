@@ -268,6 +268,39 @@ This serves two consumers:
 1. **`mpsl_timeslot.rs`** — save/restore across MPSL timeslots (Phase 7)
 2. **RMK BLE/ESB hot-switch** — save/restore when switching radio mode (Phase 4 AtomicU8 dispatch)
 
+## Implementation Discipline
+
+### 1. Every hardware bit decision must cite a source
+
+When writing register values, bit layouts, timing constants, or address formats, every decision must reference one of:
+- esb-ng source file and line number (e.g. `esb-ng/src/payload.rs:101`)
+- nRF52840 Product Specification section (e.g. "PS §6.17.10 PCNF0")
+- Nordic ESB User Guide section
+
+No "I think it should be..." without a citation. When unsure, check esb-ng first.
+
+### 2. Cross-reference esb-ng line-by-line for register and protocol details
+
+The plan is an architectural outline. When implementing specific register writes, bit fields, or timing calculations, open esb-ng side-by-side and verify each value. Do not implement from plan description alone.
+
+### 3. Unsafe boundaries must be enforced by type visibility, not convention
+
+If an internal type has `unsafe impl Send/Sync` or wraps `UnsafeCell`, it must be `pub(crate)` or stricter. Safe public methods must not bypass the safety invariant — if a guard type claims exclusive access, the underlying pool must not also expose a `get()` method.
+
+### 4. Apply compiler_fence symmetrically to TX and RX paths
+
+Every DMA ownership transition needs a fence. If TX release has `compiler_fence(Acquire)`, RX release must too. Review both paths together, not independently.
+
+### 5. Run three-perspective review before declaring a milestone complete
+
+1. **Rust/Embassy**: soundness, API design, Embassy conventions
+2. **ESB protocol**: bit layout correctness, timing constants, register values vs esb-ng
+3. **RMK integration**: dependency compatibility, ISR coexistence, async model
+
+`cargo check` passing is necessary but not sufficient.
+
+---
+
 ## Milestones
 
 ### M0: Repository Skeleton (0.5 day)

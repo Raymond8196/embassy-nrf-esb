@@ -29,9 +29,11 @@ compile_error!(
     "One chip feature must be enabled: nrf52840, nrf52833, or nrf52832"
 );
 
+pub mod addresses;
 pub mod config;
 pub mod error;
 pub mod header;
+pub mod payload;
 
 // Re-export PAC for internal use and advanced users
 pub use embassy_nrf::pac;

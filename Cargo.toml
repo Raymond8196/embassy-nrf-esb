@@ -12,7 +12,6 @@ keywords = ["nrf52", "esb", "radio", "embassy", "async"]
 embassy-nrf = { version = "0.10", features = ["unstable-pac"] }
 embassy-sync = "0.8"
 cortex-m = { version = "0.7", default-features = false }
-static_cell = "2"
 defmt = { version = "0.3", optional = true }
 
 [features]
