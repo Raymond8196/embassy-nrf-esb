@@ -4,15 +4,15 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 
 ## Status
 
-**Pre-implementation** — Architecture plan finalized, implementation starting.
+**M0 — Repository skeleton.** Core types and build infrastructure in place.
 
 ## Goals
 
-1. **Self-use in RMK** — Drop-in replacement for Nordic Gazell in the RMK keyboard firmware
-2. **Open-source friendly** — Clean API boundaries following Embassy conventions, no PAC types in public API
-3. **MPSL timeslot support** — BLE + ESB concurrent operation is a hard requirement
+1. **Drop-in replacement for Nordic Gazell** in the RMK keyboard firmware
+2. **Open-source friendly** — Clean API following Embassy conventions, no PAC types in public API
+3. **MPSL timeslot support** — BLE + ESB concurrent operation (Phase 7)
 
-## Features (planned)
+## Features
 
 - PTX (Primary Transmitter) and PRX (Primary Receiver) roles
 - ACK with payload (bidirectional data)
@@ -20,8 +20,24 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 - Retransmission with configurable attempts
 - Embassy async API (`send().await`, `receive().await`)
 - Suspend/resume for MPSL timeslots and BLE/ESB hot-switching
-- Configurable timer (TIMER1/2/3/4, TIMER0 reserved for MPSL)
+- Configurable timer (TIMER1/2/3/4; TIMER0 reserved for MPSL)
 - `defmt` support
+
+## Supported Chips
+
+| Chip | Feature | Status |
+|------|---------|--------|
+| nRF52840 | `nrf52840` | Primary target |
+| nRF52833 | `nrf52833` | Reserved |
+| nRF52832 | `nrf52832` | Reserved |
+
+## Dependencies
+
+- `embassy-nrf` 0.10 (with `unstable-pac` for PAC access)
+- `embassy-sync` 0.8
+- `cortex-m` 0.7
+
+Version-aligned with RMK for seamless integration.
 
 ## Architecture
 
@@ -35,16 +51,14 @@ buffer ────────────────────────�
 
 ## References
 
-- [esb-ng](https://github.com/jamesmunns/esb) — Reference ESB state machine (Rust, nrf-pac 0.1)
+- [esb-ng](https://github.com/jamesmunns/esb) — Reference ESB state machine (Rust)
 - [Nordic ESB User Guide](https://infocenter.nordicsemi.com/topic/com.nordic.infocenter.sdk5.v15.0.0/esb_user_guide.html)
-- [nRF52840 Product Specification](https://docs.nordicsemi.com/bundle/ps_nrf52840/page/keydoc_html.html) — RADIO peripheral (Ch 6.17), TIMER (Ch 6.24)
-- [MPSL Timeslot API](https://docs.nordicsemi.com/bundle/ncs-latest/page/nrfxlib/mpsl/doc/timeslot.html)
+- [nRF52840 Product Specification](https://docs.nordicsemi.com/bundle/ps_nrf52840/page/keydoc_html.html)
 
 ## Documentation
 
-- [Implementation Plan](docs/plan.md) (English)
-- [Implementation Plan](docs/plan.zh.md) (Chinese)
+- [Implementation Plan](docs/plan.md)
 
 ## License
 
-MIT or Apache-2.0 (TBD)
+MIT OR Apache-2.0

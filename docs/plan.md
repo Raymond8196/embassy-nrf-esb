@@ -215,14 +215,14 @@ Embassy ecosystem crates with examples commit Cargo.lock (CI reproducibility).
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Fork vs. fresh repo | **Fresh repo**, esb-ng as reference | Every module needs fundamental restructuring; clean API > git history |
-| Rust edition | **2021** | Max compatibility; 2024 adds no benefit for no_std HAL crate |
+| Rust edition | **2024** | Matches embassy-nrf 0.10.0; 2024 is now standard in Embassy ecosystem |
 | Buffer | **embassy-sync** (not bbq2) | RMK already uses it; bbq2's maitake-sync is a parallel async runtime |
 | Timer default | **TIMER1** (generic `<T: EsbTimer>`) | TIMER0 owned by MPSL; TIMER2 used by Gazell; parameterize for flexibility |
 | MPSL integration | **Core suspend/resume API + timeslot adapter** | Suspend/resume is part of core design (needed by both MPSL timeslots and BLE/ESB hot-switch). Timeslot adapter is a separate module but not an afterthought |
 | MPSL timeslot approach | **Custom handler in Rust** (not Zephyr ESB lib) | Pure Rust ESB; can't use Zephyr's C library. Port the too1/inductivekickback patterns |
 | ESB suspend/resume | **Full re-init per timeslot** (not lightweight suspend) | Both reference implementations use full re-init; proven stable; avoids subtle state bugs |
 | PID persistence | **Save before suspend, restore after resume** | ESB protocol uses 2-bit PID for duplicate detection; losing PID causes receiver rejections |
-| PAC dependency | **via `embassy-nrf::pac` re-export** | Don't depend on `nrf-pac` directly; use embassy-nrf's re-export for version alignment |
+| PAC dependency | **via `embassy-nrf::pac` (`unstable-pac` feature)** | nrf-pac 0.3.0 on crates.io; embassy-nrf 0.10.0 re-exports via `unstable-pac` feature. No direct nrf-pac dependency needed |
 | ISR binding | **User chooses**: `bind_interrupts!` or manual `#[interrupt]` | Provide `on_radio_interrupt()` method; user can use Embassy macro or RMK's AtomicU8 dispatch |
 | Public API surface | **No PAC types exposed** | Wrap all PAC types in newtypes; version upgrades don't break users |
 
@@ -279,16 +279,14 @@ This serves two consumers:
 [package]
 name = "embassy-nrf-esb"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
 
 [dependencies]
-embassy-nrf = { version = "0.10", features = ["nrf52840"] }
+embassy-nrf = { version = "0.10", features = ["unstable-pac"] }
 embassy-sync = "0.8"
 cortex-m = { version = "0.7", default-features = false }
 static_cell = "2"
 defmt = { version = "0.3", optional = true }
-nrf-mpsl = { version = "0.1", optional = true }
 
 [features]
 # Chip selection (only nrf52840 implemented initially, others reserved)
@@ -297,10 +295,10 @@ nrf52833 = ["embassy-nrf/nrf52833"]
 nrf52832 = ["embassy-nrf/nrf52832"]
 # Functional options
 fast-ru = []
-mpsl = ["dep:nrf-mpsl"]
 defmt = ["dep:defmt", "embassy-nrf/defmt"]
 # NOTE: Timer selected via generics <T: TimerInstance>, no feature gate needed (A1)
-# PAC accessed via embassy-nrf::pac (not direct nrf-pac dependency)
+# PAC accessed via embassy-nrf::pac (unstable-pac feature, not direct nrf-pac dependency)
+# nrf-mpsl will be added in Phase 7 (M10), when MPSL timeslot integration begins
 ```
 
 **Timer selection** (fixes R4 + A1): No more feature gate mutual exclusion. Embassy standard generic pattern:
@@ -318,7 +316,7 @@ compile_error!("One chip feature must be enabled (nrf52840, nrf52833, or nrf5283
 
 **Example template** (fix B4): M0 deliverable includes `.cargo/config.toml` + `memory.x` + minimal example skeleton. `cargo build --example ptx_blinky --features nrf52840` must pass.
 
-**Version strategy note**: If `embassy-nrf 0.10` isn't released, use git dependency temporarily. Must switch to version dependency before crates.io publish. Document this limitation in README.
+**Version strategy note**: embassy-nrf 0.10.0 and nrf-pac 0.3.0 are both on crates.io. RMK uses the same versions. `unstable-pac` feature is used to access PAC types — semver-unstable but acceptable for an experimental protocol crate. No git dependency needed.
 
 **Open-source design rules**:
 - All PAC types accessed via `embassy_nrf::pac::*` — no direct `nrf-pac` import
@@ -334,7 +332,8 @@ compile_error!("One chip feature must be enabled (nrf52840, nrf52833, or nrf5283
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
 | nrf-pac 0.3 feature flag names wrong | Low | Low | Check nrf-pac docs for exact feature names before writing Cargo.toml |
-| dependency version conflicts with RMK | Medium | Medium | Pin to same versions RMK uses; verify `cargo tree` shows no duplicates |
+| dependency version conflicts with RMK | Low | Low | Both use same crates.io versions (embassy-nrf 0.10.0, nrf-pac 0.3.0); verified compatible |
+| unstable-pac semver break | Low | Medium | Acceptable for experimental crate; pin embassy-nrf version if needed |
 
 **Rollback**: Delete the repo and start over. No code at stake.
 
