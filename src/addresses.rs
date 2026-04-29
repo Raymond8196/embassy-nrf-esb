@@ -30,14 +30,10 @@ pub const MAX_PIPES: usize = 8;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EsbAddresses {
-    /// 4-byte base address for Pipe 0 (on-air byte order).
-    pub base0: [u8; 4],
-    /// 4-byte base address for Pipes 1–7 (on-air byte order).
-    pub base1: [u8; 4],
-    /// 1-byte prefix for each pipe (0–7, on-air byte order).
-    pub prefix: [u8; MAX_PIPES],
-    /// Number of enabled pipes (1–8).
-    pub pipe_count: u8,
+    base0: [u8; 4],
+    base1: [u8; 4],
+    prefix: [u8; MAX_PIPES],
+    pipe_count: u8,
 }
 
 #[allow(dead_code)]
@@ -60,6 +56,11 @@ impl EsbAddresses {
             prefix,
             pipe_count,
         })
+    }
+
+    /// Get the number of enabled pipes.
+    pub fn pipe_count(&self) -> u8 {
+        self.pipe_count
     }
 
     /// Get the enabled pipes as a bitmask (bit 0 = pipe 0, etc.).
@@ -131,7 +132,7 @@ fn reverse_bits(value: u32) -> u32 {
 /// Used for prefix register conversion.
 #[inline]
 fn bytewise_bit_swap(value: u32) -> u32 {
-    value.swap_bytes().reverse_bits()
+    value.reverse_bits().swap_bytes()
 }
 
 /// Address configuration errors.

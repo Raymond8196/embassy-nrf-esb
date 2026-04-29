@@ -161,26 +161,43 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     ///
     /// Called by the ISR before setting PACKETPTR.
     pub fn tx_to_dma(&self, index: usize) {
+        debug_assert!(index < N);
         compiler_fence(Ordering::Release);
         self.state[index].store(state::IN_DMA, Ordering::Release);
     }
 
     /// Release a TX packet after DMA completes: `in_dma → free`.
     pub fn release_tx(&self, index: usize) {
+        debug_assert!(index < N);
         compiler_fence(Ordering::Acquire);
+        self.state[index].store(state::FREE, Ordering::Release);
+    }
+
+    /// Cancel a TX allocation: `tx_queued → free`.
+    ///
+    /// Use when a packet was allocated but will not be sent.
+    pub fn cancel_tx(&self, index: usize) {
+        debug_assert!(index < N);
         self.state[index].store(state::FREE, Ordering::Release);
     }
 
     /// Transition an RX packet to DMA ownership: `free → in_dma`.
     ///
-    /// Called by the ISR before setting PACKETPTR for RX.
-    pub fn rx_to_dma(&self, index: usize) {
-        compiler_fence(Ordering::Release);
-        self.state[index].store(state::IN_DMA, Ordering::Release);
+    /// Returns false if the slot was not free.
+    pub fn rx_to_dma(&self, index: usize) -> bool {
+        debug_assert!(index < N);
+        let ok = self.state[index]
+            .compare_exchange(state::FREE, state::IN_DMA, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+        if ok {
+            compiler_fence(Ordering::Release);
+        }
+        ok
     }
 
     /// Complete RX: transition `in_dma → rx_queued` and enqueue for app.
     pub fn rx_complete(&self, index: usize) {
+        debug_assert!(index < N);
         compiler_fence(Ordering::Acquire);
         self.state[index].store(state::RX_QUEUED, Ordering::Release);
         let _ = self.rx_queue.try_send(index);
@@ -198,6 +215,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
 
     /// Release an RX packet back to the pool: `rx_queued → free`.
     pub fn release_rx(&self, index: usize) {
+        debug_assert!(index < N);
         compiler_fence(Ordering::Acquire);
         self.state[index].store(state::FREE, Ordering::Release);
     }
