@@ -6,26 +6,19 @@
 //! This module handles raw register I/O only. Protocol logic (state machine,
 //! duplicate detection, grant management) lives in `state_machine.rs`.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use crate::addresses::EsbAddresses;
 use crate::config::{Bitrate, EsbConfig};
 
-use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode, Skipaddr};
+use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode};
 #[cfg(feature = "fast-rx")]
 use crate::pac::radio::vals::Ru;
 use crate::pac::radio::{regs, Radio};
 
 /// Number of ESB pipes (matching hardware RXMATCH field width).
-#[allow(dead_code)]
 const NUM_PIPES: usize = 8;
-
-/// ESB CRC initial value (esb-ng peripherals.rs:37).
-#[allow(dead_code)]
-const CRC_INIT: u32 = 0x0000_FFFF;
-/// ESB CRC polynomial: x^16 + x^12 + x^5 + 1 (esb-ng peripherals.rs:38).
-#[allow(dead_code)]
-const CRC_POLY: u32 = 0x0001_1021;
 
 /// Result of checking a received PRX packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,14 +118,20 @@ impl EsbRadio {
         });
 
         // CRC configuration (esb-ng lines 122–130).
-        // CRCCNF.SKIPADDR explicitly set to SKIP — excludes address from CRC
-        // (fix R5: esb-ng relied on reset default).
-        r.crcinit().write(|w| w.set_crcinit(CRC_INIT & 0x00FF_FFFF));
-        r.crcpoly().write(|w| w.set_crcpoly(CRC_POLY & 0x00FF_FFFF));
-        r.crccnf().write(|w| {
-            w.set_len(Len::TWO);
-            w.set_skipaddr(Skipaddr::SKIP);
-        });
+        // CRCCNF.SKIPADDR not set: reset default INCLUDE is correct for ESB.
+        // Both nRF24L01+ and Nordic ESB SDK include address in CRC calculation.
+        // The x^N MSB bit is implicit in hardware; config stores lower bits only.
+        let crc_len = match config.crc.length {
+            0 => Len::DISABLED,
+            1 => Len::ONE,
+            _ => Len::TWO,
+        };
+        // For N-byte CRC, the polynomial MSB is bit (N*8). Config stores lower bits.
+        let crc_poly = (config.crc.poly as u32) | (1u32 << (config.crc.length as u32 * 8));
+        r.crcinit()
+            .write(|w| w.set_crcinit(config.crc.init as u32 & 0x00FF_FFFF));
+        r.crcpoly().write(|w| w.set_crcpoly(crc_poly & 0x00FF_FFFF));
+        r.crccnf().write(|w| w.set_len(crc_len));
 
         // Write addresses (esb-ng lines 132–136).
         r.base0().write_value(base0);
@@ -333,10 +332,11 @@ impl EsbRadio {
         r.tasks_rxen().write_value(1);
     }
 
-    /// Check received PRX packet: CRC, read metadata, duplicate detection.
+    /// Check received PRX packet CRC and read metadata.
     ///
-    /// Returns `RxResult` indicating whether this is a new packet, a duplicate,
-    /// or a CRC failure.
+    /// Returns `RxResult::BadCrc` if CRC failed (radio auto-restarted).
+    /// On CRC OK, returns `RxResult::NewPacket` — the caller should then read
+    /// PID from the DMA buffer and call `check_duplicate()` for full detection.
     ///
     /// On CRC failure, the radio is automatically restarted.
     /// Ref: esb-ng lines 337–357.
@@ -355,37 +355,29 @@ impl EsbRadio {
         }
 
         // CRC OK — ensure DMA writes visible (esb-ng line 357).
+        // This fence also orders the caller's subsequent DMA buffer reads
+        // (PID, payload) — they see the RADIO's DMA writes.
         compiler_fence(Ordering::Acquire);
         self.clear_ready_event();
-
-        // Read receive metadata (esb-ng lines 360–363).
-        let pipe = r.rxmatch().read().rxmatch() as usize;
-        let crc = r.rxcrc().read().rxcrc() as u16;
-
-        // Duplicate detection: compare CRC + PID with last received values
-        // on this pipe (esb-ng line 364).
-        // PID is read from the DMA buffer by the caller, passed in separately
-        // is not practical here. The state machine reads PID from the packet
-        // header and calls check_duplicate().
-        let repeated = (self.last_crc[pipe] == crc)
-            && self.last_pid[pipe] != 0
-            && pipe < NUM_PIPES;
-
-        if repeated {
-            return RxResult::Duplicate;
-        }
-
-        // Update tracking for this pipe (esb-ng lines 428–430).
-        self.last_crc[pipe] = crc;
-        // PID updated separately via update_pid() after reading from DMA buffer.
 
         RxResult::NewPacket
     }
 
-    /// Update last_pid for duplicate detection after reading PID from DMA buffer.
-    /// Must be called after check_packet() returns NewPacket.
-    pub(crate) fn update_pid(&mut self, pipe: usize, pid: u8) {
+    /// Check if a received packet is a duplicate of the last packet on this pipe.
+    ///
+    /// Uses exact CRC + PID comparison (esb-ng line 364).
+    /// Caller reads PID from DMA buffer after `check_packet()` returns NewPacket.
+    pub(crate) fn check_duplicate(&self, pipe: usize, pid: u8, crc: u16) -> bool {
+        pipe < NUM_PIPES
+            && self.last_crc[pipe] == crc
+            && self.last_pid[pipe] == pid
+    }
+
+    /// Update duplicate detection tracking for a pipe after accepting a new packet.
+    /// Must be called after `check_duplicate()` returns false.
+    pub(crate) fn update_detection(&mut self, pipe: usize, pid: u8, crc: u16) {
         if pipe < NUM_PIPES {
+            self.last_crc[pipe] = crc;
             self.last_pid[pipe] = pid;
         }
     }
@@ -440,12 +432,20 @@ impl EsbRadio {
 
     /// Set up ACK TX with fallback empty ACK `[0, 0]`.
     /// Used when no ACK payload is queued (esb-ng lines 377).
-    /// Returns false if DMA pointer is the fallback.
+    /// Minimum ACK is 2 bytes: DMA needs valid length + pid_no_ack fields.
     pub(crate) fn setup_ack_tx_fallback(&mut self, pipe: u8) {
-        // Fallback ACK: 2 bytes minimum (length + pid_no_ack).
-        // Static since it's read-only after init (esb-ng line 342).
-        static FALLBACK_ACK: [u8; 2] = [0, 0];
-        self.setup_ack_tx(pipe, FALLBACK_ACK.as_ptr() as *mut u8);
+        // SAFETY: UnsafeCell provides interior mutability for DMA access.
+        // The RADIO only reads from this buffer (never writes) — it transmits
+        // the 2-byte content as an empty ACK packet.
+        //
+        // SAFETY (Sync wrapper): Access is single-threaded — this method is only
+        // called from the RADIO ISR. No concurrent access is possible.
+        struct FallbackAck(UnsafeCell<[u8; 2]>);
+        unsafe impl Sync for FallbackAck {}
+        static FALLBACK_ACK: FallbackAck = FallbackAck(UnsafeCell::new([0, 0]));
+        // SAFETY: ISR-only access, RADIO reads while in TX mode.
+        let ptr = unsafe { (*FALLBACK_ACK.0.get()).as_mut_ptr() };
+        self.setup_ack_tx(pipe, ptr);
     }
 
     /// Stop PRX TX (NoAck path) — stops radio before TX begins
