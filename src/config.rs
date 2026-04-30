@@ -2,6 +2,57 @@
 
 use crate::error::Error;
 
+/// TX output power.
+///
+/// Maps to nRF RADIO TXPOWER register values (PS §6.17.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TxPower {
+    Neg40dBm,
+    Neg20dBm,
+    Neg16dBm,
+    Neg12dBm,
+    Neg8dBm,
+    Neg4dBm,
+    ZeroDbm,
+    Pos2dBm,
+    Pos3dBm,
+    Pos4dBm,
+    Pos5dBm,
+    Pos6dBm,
+    Pos7dBm,
+    Pos8dBm,
+}
+
+impl Default for TxPower {
+    fn default() -> Self {
+        Self::ZeroDbm
+    }
+}
+
+impl TxPower {
+    /// Convert to PAC TXPOWER register value.
+    pub(crate) fn to_pac(self) -> crate::pac::radio::vals::Txpower {
+        use crate::pac::radio::vals::Txpower;
+        match self {
+            Self::Neg40dBm => Txpower::NEG40_DBM,
+            Self::Neg20dBm => Txpower::NEG20_DBM,
+            Self::Neg16dBm => Txpower::NEG16_DBM,
+            Self::Neg12dBm => Txpower::NEG12_DBM,
+            Self::Neg8dBm => Txpower::NEG8_DBM,
+            Self::Neg4dBm => Txpower::NEG4_DBM,
+            Self::ZeroDbm => Txpower::_0_DBM,
+            Self::Pos2dBm => Txpower::POS2_DBM,
+            Self::Pos3dBm => Txpower::POS3_DBM,
+            Self::Pos4dBm => Txpower::POS4_DBM,
+            Self::Pos5dBm => Txpower::POS5_DBM,
+            Self::Pos6dBm => Txpower::POS6_DBM,
+            Self::Pos7dBm => Txpower::POS7_DBM,
+            Self::Pos8dBm => Txpower::POS8_DBM,
+        }
+    }
+}
+
 /// Radio ramp-up time in microseconds (normal mode).
 pub const RAMP_UP_US: u16 = 140;
 /// Radio ramp-up time in microseconds (fast ramp-up mode).
@@ -106,6 +157,8 @@ pub struct EsbConfig {
     pub ack_timeout_us: u16,
     /// Payload length (1–252 bytes).
     pub payload_length: u8,
+    /// TX output power.
+    pub tx_power: TxPower,
 }
 
 impl Default for EsbConfig {
@@ -117,6 +170,7 @@ impl Default for EsbConfig {
             retransmit: RetransmitConfig::default(),
             ack_timeout_us: 120,
             payload_length: 32,
+            tx_power: TxPower::default(),
         }
     }
 }

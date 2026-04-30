@@ -34,6 +34,7 @@ pub mod config;
 pub mod error;
 pub mod header;
 pub mod payload;
+pub mod radio;
 
 // Re-export PAC for internal use and advanced users
 pub use embassy_nrf::pac;
