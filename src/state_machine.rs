@@ -242,9 +242,8 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             }
 
             StatePtx::WaitAck => {
-                let mut retransmit = false;
-
                 if evts.disabled {
+                    // Got something — check CRC (esb-ng lines 249–259).
                     self.timer.disarm_ack_timeout();
                     self.release_ack_rx(pool);
 
@@ -254,28 +253,32 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                         self.attempts = 0;
                         self.send_next(pool);
                         return PtxEvent::None;
-                    } else {
-                        retransmit = true;
                     }
+                    // CRC mismatch — fall through to retransmit check
                 } else if evts.timer {
-                    self.release_ack_rx(pool);
-                    retransmit = true;
-                }
-
-                if retransmit {
-                    self.radio.stop();
-                    self.attempts += 1;
-                    self.state = StatePtx::WaitRetransmit;
-                }
-
-                // Check max attempts (R6: use >= not >).
-                if self.attempts >= self.max_attempts {
+                    // ACK timeout (esb-ng line 263).
+                    self.timer.disarm_ack_timeout();
                     self.timer.disarm_retransmit();
+                    self.release_ack_rx(pool);
+                } else {
+                    return PtxEvent::None;
+                }
+
+                // Retransmit needed — check max attempts FIRST (esb-ng line 270).
+                // R6: use >= not > — esb-ng uses > giving one extra attempt.
+                self.attempts += 1;
+                if self.attempts >= self.max_attempts {
+                    // Max reached — drop packet, try next
+                    self.radio.stop();
                     self.release_tx(pool);
                     self.attempts = 0;
                     self.send_next(pool);
                     return PtxEvent::MaxAttempts;
                 }
+
+                // Retransmit — radio stop + wait for timer
+                self.radio.stop();
+                self.state = StatePtx::WaitRetransmit;
 
                 PtxEvent::None
             }
@@ -486,7 +489,12 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 }
                                 return (PrxEvent::Duplicate, None);
                             } else {
-                                // Duplicate with ACK — send repeated fallback ACK
+                                // Duplicate with ACK — send repeated fallback ACK.
+                                // The original rx_idx buffer is no longer used by DMA
+                                // (PACKETPTR was changed by setup_ack_tx_fallback).
+                                // Release it before entering TxRepeatedAck.
+                                pool.release_rx(rx_idx);
+                                self.rx_idx = NO_IDX;
                                 self.radio.setup_ack_tx_fallback(pipe as u8);
                                 self.state = StatePrx::TxRepeatedAck;
                                 return (PrxEvent::Duplicate, None);
@@ -590,7 +598,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         }
     }
 
-    /// Handle TIMER ISR (PRX doesn't typically use timer).
+    /// Handle TIMER ISR (clear events, pend RADIO ISR).
     pub fn handle_timer_event(&self) {
         if self.timer.is_retransmit_fired() {
             self.timer.disarm_retransmit();
@@ -598,6 +606,9 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         if self.timer.is_ack_timeout_fired() {
             self.timer.disarm_ack_timeout();
         }
+        // Even though PRX doesn't normally use timers, pend RADIO ISR
+        // in case a stale timer event fired (defensive).
+        pend_radio_isr();
     }
 
     /// Stop receiving and go idle.

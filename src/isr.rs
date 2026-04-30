@@ -92,20 +92,27 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Called from the RADIO interrupt handler.
     ///
     /// Processes radio events and advances the PTX state machine.
+    /// Unpends RADIO ISR to prevent spurious re-entry (esb-ng line 149).
     pub fn on_radio_interrupt(&mut self) {
         let timer_flag = self.timer_flag.load(Ordering::Acquire);
         if timer_flag {
             self.timer_flag.store(false, Ordering::Release);
         }
         self.sm.handle_radio_event(self.pool, timer_flag);
+
+        // Clear any latched RADIO pending bit to prevent spurious re-entry
+        // (esb-ng irq.rs line 149).
+        #[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
+        cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::RADIO);
     }
 
     /// Called from the TIMER interrupt handler.
     ///
-    /// Minimal: clears timer events, sets flag, pends RADIO ISR (R9).
+    /// Minimal: sets flag, then clears timer events and pends RADIO ISR (R9).
+    /// Flag must be set BEFORE pending RADIO ISR to prevent race (esb-ng line 63).
     pub fn on_timer_interrupt(&self) {
-        self.sm.handle_timer_event();
         self.timer_flag.store(true, Ordering::Release);
+        self.sm.handle_timer_event(); // clears events, pends RADIO ISR
     }
 
     /// Queue a packet for transmission.
@@ -113,18 +120,21 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Returns after queuing. The packet will be sent in the next
     /// RADIO ISR cycle.
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
+        if payload.is_empty() || payload.len() > 252 {
+            return Err(Error::InvalidParam);
+        }
+        let payload_offset = EsbHeader::DMA_OFFSET + 2;
+        if payload_offset + payload.len() > SIZE {
+            return Err(Error::InvalidParam);
+        }
         let idx = self.pool.alloc_tx().ok_or(Error::TxFull)?;
 
-        // Fill the buffer
         let header = unsafe { self.pool.header_mut(idx) };
         header.length = payload.len() as u8;
         header.set_no_ack(false);
 
         let buf = unsafe { self.pool.buf_mut(idx) };
-        let payload_offset = EsbHeader::DMA_OFFSET + 2; // after length + pid_no_ack
-        if payload.len() <= 252 && payload_offset + payload.len() <= buf.len() {
-            buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-        }
+        buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
 
         self.pool.enqueue_tx(idx).await;
         self.sm.trigger_send();
@@ -135,6 +145,13 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     ///
     /// NoAck packets do not wait for acknowledgment — fire and forget.
     pub async fn send_no_ack(&self, payload: &[u8]) -> Result<(), Error> {
+        if payload.is_empty() || payload.len() > 252 {
+            return Err(Error::InvalidParam);
+        }
+        let payload_offset = EsbHeader::DMA_OFFSET + 2;
+        if payload_offset + payload.len() > SIZE {
+            return Err(Error::InvalidParam);
+        }
         let idx = self.pool.alloc_tx().ok_or(Error::TxFull)?;
 
         let header = unsafe { self.pool.header_mut(idx) };
@@ -143,9 +160,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
 
         let buf = unsafe { self.pool.buf_mut(idx) };
         let payload_offset = EsbHeader::DMA_OFFSET + 2;
-        if payload.len() <= 252 && payload_offset + payload.len() <= buf.len() {
-            buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-        }
+        buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
 
         self.pool.enqueue_tx(idx).await;
         self.sm.trigger_send();
@@ -219,10 +234,14 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             self.timer_flag.store(false, Ordering::Release);
         }
         self.sm.handle_radio_event(self.pool, timer_flag);
+
+        #[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
+        cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::RADIO);
     }
 
     /// Called from the TIMER interrupt handler.
     pub fn on_timer_interrupt(&self) {
+        self.timer_flag.store(true, Ordering::Release);
         self.sm.handle_timer_event();
     }
 
@@ -242,6 +261,13 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Queue an ACK payload for a specific pipe.
     pub async fn send_ack_payload(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
+        if payload.is_empty() || payload.len() > 252 {
+            return Err(Error::InvalidParam);
+        }
+        let payload_offset = EsbHeader::DMA_OFFSET + 2;
+        if payload_offset + payload.len() > SIZE {
+            return Err(Error::InvalidParam);
+        }
         let idx = self.pool.alloc_tx().ok_or(Error::TxFull)?;
 
         let header = unsafe { self.pool.header_mut(idx) };
