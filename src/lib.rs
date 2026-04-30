@@ -35,6 +35,7 @@ pub mod error;
 pub mod header;
 pub mod payload;
 pub(crate) mod radio;
+pub mod state_machine;
 pub mod timer;
 
 // Re-export PAC for internal use and advanced users

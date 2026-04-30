@@ -16,4 +16,6 @@ pub enum Error {
     NotReady,
     /// Address configuration error.
     InvalidAddress,
+    /// Packet pool exhausted — no free buffers for DMA.
+    OutOfMemory,
 }
