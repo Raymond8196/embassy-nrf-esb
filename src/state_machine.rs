@@ -511,11 +511,15 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                         pool.release_tx(rx_idx);
                                         self.rx_idx = new_idx;
                                         let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
+                                        // Stop TX ramp-up from disabled_txen shortcut
+                                        // before restarting RX (issue 4).
+                                        self.radio.stop_prx_no_ack();
                                         self.radio.complete_rx_no_ack(dma_ptr);
                                     }
                                     None => {
                                         // Re-use current buffer
                                         let dma_ptr = unsafe { pool.dma_ptr(rx_idx) };
+                                        self.radio.stop_prx_no_ack();
                                         self.radio.complete_rx_no_ack(dma_ptr);
                                     }
                                 }
@@ -548,6 +552,9 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 Some(new_idx) => {
                                     self.rx_idx = new_idx;
                                     let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
+                                    // Stop TX ramp-up from disabled_txen shortcut
+                                    // before restarting RX (issue 4).
+                                    self.radio.stop_prx_no_ack();
                                     self.radio.complete_rx_no_ack(dma_ptr);
                                 }
                                 None => {
@@ -679,11 +686,13 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         let _ = self.check_events(false);
 
         if self.rx_idx != NO_IDX {
-            pool.release_rx(self.rx_idx);
+            // rx_idx is IN_DMA, use release_tx (issue 3).
+            pool.release_tx(self.rx_idx);
             self.rx_idx = NO_IDX;
         }
         if self.pending_rx_idx != NO_IDX {
-            pool.release_rx(self.pending_rx_idx);
+            // pending_rx_idx is IN_DMA when stopped from TxAck state.
+            pool.release_tx(self.pending_rx_idx);
             self.pending_rx_idx = NO_IDX;
         }
         if self.ack_tx_idx != NO_IDX {
