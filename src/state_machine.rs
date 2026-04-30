@@ -5,16 +5,17 @@
 //! ISR context (RADIO ISR) — the TIMER ISR only sets a flag and pends the
 //! RADIO ISR (R9).
 //!
+//! The state machines are pure event processors: they receive event flags
+//! rather than owning shared state. This avoids self-referential struct
+//! issues and makes the code testable.
+//!
 //! Ref: esb-ng `src/irq.rs` lines 155–425.
-
-use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::{EsbConfig, RAMP_UP_US};
 use crate::error::Error;
 use crate::payload::PacketPool;
 use crate::radio::{EsbRadio, RxResult};
 use crate::timer::EsbTimer;
-
 use crate::timer::TimerInstance;
 
 // ---- PTX States ----
@@ -61,13 +62,21 @@ pub enum StatePrx {
 
 /// Events checked at the start of each ISR invocation.
 ///
+/// Passed to the state machine from the ISR wrapper.
 /// Ref: esb-ng `src/irq.rs` lines 105–108.
 #[derive(Debug, Clone, Copy)]
-struct IsrEvents {
+pub struct IsrEvents {
     /// RADIO EVENTS_DISABLED fired.
-    disabled: bool,
+    pub disabled: bool,
     /// TIMER ISR set the flag and pended RADIO ISR.
-    timer: bool,
+    pub timer: bool,
+}
+
+impl IsrEvents {
+    /// Neither disabled nor timer — user-triggered event.
+    pub fn user_event(self) -> bool {
+        !self.disabled && !self.timer
+    }
 }
 
 /// Result of PTX event handling.
@@ -104,19 +113,16 @@ const NO_IDX: usize = usize::MAX;
 /// PTX (Primary Transmitter) state machine.
 ///
 /// Holds radio, timer, and protocol state. All methods are called from
-/// ISR context only (R9). The `timer_flag` is set by the TIMER ISR and
-/// read/cleared in the RADIO ISR.
+/// ISR context only (R9).
 ///
 /// Ref: esb-ng `src/irq.rs` lines 191–310.
 #[allow(dead_code)]
 pub struct PtxStateMachine<T: TimerInstance> {
-    radio: EsbRadio,
-    timer: EsbTimer<T>,
+    pub(crate) radio: EsbRadio,
+    pub(crate) timer: EsbTimer<T>,
     state: StatePtx,
     /// Retransmit attempt counter for the current packet.
     attempts: u8,
-    /// Shared flag set by TIMER ISR, cleared by RADIO ISR.
-    timer_flag: &'static AtomicBool,
     /// TX pipe (typically 0 for PTX).
     tx_pipe: u8,
     /// Retransmit delay in µs (from config, minus ramp-up).
@@ -138,7 +144,6 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         radio: EsbRadio,
         timer: EsbTimer<T>,
         config: &EsbConfig,
-        timer_flag: &'static AtomicBool,
         tx_pipe: u8,
     ) -> Self {
         Self {
@@ -146,7 +151,6 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             timer,
             state: StatePtx::Idle,
             attempts: 0,
-            timer_flag,
             tx_pipe,
             // Timer calculations (R8):
             // Retransmit: subtract ramp-up (radio re-enables from DISABLED)
@@ -166,21 +170,14 @@ impl<T: TimerInstance> PtxStateMachine<T> {
 
     /// Check and clear ISR event flags.
     ///
+    /// Returns events with disabled flag from radio, timer flag from caller.
     /// Ref: esb-ng `src/irq.rs` lines 135–152.
-    fn check_events(&mut self) -> IsrEvents {
-        let evts = IsrEvents {
-            disabled: self.radio.check_disabled_event(),
-            timer: self.timer_flag.load(Ordering::Acquire),
-        };
-
-        if evts.disabled {
+    pub fn check_events(&mut self, timer_flag: bool) -> IsrEvents {
+        let disabled = self.radio.check_disabled_event();
+        if disabled {
             self.radio.clear_disabled_event();
         }
-        if evts.timer {
-            self.timer_flag.store(false, Ordering::Release);
-        }
-
-        evts
+        IsrEvents { disabled, timer: timer_flag }
     }
 
     /// Handle a RADIO ISR event.
@@ -188,24 +185,25 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     /// Must be called from the RADIO ISR only. Reads events, transitions
     /// state, and operates radio/timer registers inline (A3).
     ///
+    /// `timer_flag` is the value of the shared timer AtomicBool, already
+    /// loaded and cleared by the ISR wrapper.
+    ///
     /// Ref: esb-ng `src/irq.rs` lines 196–294.
     pub fn handle_radio_event<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
+        timer_flag: bool,
     ) -> PtxEvent {
-        let evts = self.check_events();
+        let evts = self.check_events(timer_flag);
 
         // If neither disabled nor timer, it's a user-triggered event
         // (e.g., new packet enqueued). Only valid in Idle state.
-        let user_event = !evts.disabled && !evts.timer;
-
-        if user_event && self.state != StatePtx::Idle {
+        if evts.user_event() && self.state != StatePtx::Idle {
             return PtxEvent::None;
         }
 
         match self.state {
             StatePtx::Idle => {
-                // User pushed a packet — start transmitting (esb-ng line 212).
                 self.send_next(pool);
                 PtxEvent::None
             }
@@ -214,13 +212,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 // TX END for NoAck packet — release and send next
                 // (esb-ng lines 215–219).
                 self.radio.finish_tx_no_ack();
-
-                // Release the TX buffer back to pool
-                if self.tx_idx != NO_IDX {
-                    pool.release_tx(self.tx_idx);
-                    self.tx_idx = NO_IDX;
-                }
-
+                self.release_tx(pool);
                 self.send_next(pool);
                 PtxEvent::None
             }
@@ -229,29 +221,21 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 // TX END — prepare for ACK reception (esb-ng lines 220–244).
                 debug_assert!(evts.disabled, "Tx: expected disabled event");
 
-                // Allocate a free buffer for ACK DMA
                 let ack_idx = alloc_dma_buffer(pool);
                 if let Some(idx) = ack_idx {
-                    // SAFETY: We just allocated this; it's in IN_DMA state.
                     let dma_ptr = unsafe { pool.dma_ptr(idx) };
                     self.radio.prepare_for_ack(dma_ptr);
                     self.ack_rx_idx = idx;
                     self.state = StatePtx::WaitAck;
                 } else {
-                    // No buffer available — stop and go idle (esb-ng line 231).
                     self.radio.stop();
-                    if self.tx_idx != NO_IDX {
-                        pool.release_tx(self.tx_idx);
-                        self.tx_idx = NO_IDX;
-                    }
+                    self.release_tx(pool);
                     self.state = StatePtx::Idle;
                     return PtxEvent::None;
                 }
 
-                // Arm both timers (esb-ng lines 238–243).
-                // Retransmit: absolute (clear+start), value = delay - RAMP_UP.
+                // Arm both timers (R8).
                 self.timer.arm_retransmit(self.retransmit_delay_us);
-                // ACK timeout: relative (capture+add), value = timeout + RAMP_UP.
                 self.timer.arm_ack_timeout(self.ack_timeout_us);
 
                 PtxEvent::None
@@ -261,39 +245,20 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 let mut retransmit = false;
 
                 if evts.disabled {
-                    // Got something — check CRC (esb-ng lines 249–259).
                     self.timer.disarm_ack_timeout();
-
-                    // Release the ACK RX buffer
-                    if self.ack_rx_idx != NO_IDX {
-                        pool.release_rx(self.ack_rx_idx);
-                        self.ack_rx_idx = NO_IDX;
-                    }
+                    self.release_ack_rx(pool);
 
                     if self.radio.check_ack() {
-                        // ACK received successfully
                         self.timer.disarm_retransmit();
-
-                        // Release the TX buffer
-                        if self.tx_idx != NO_IDX {
-                            pool.release_tx(self.tx_idx);
-                            self.tx_idx = NO_IDX;
-                        }
-
+                        self.release_tx(pool);
                         self.attempts = 0;
                         self.send_next(pool);
                         return PtxEvent::None;
                     } else {
-                        // CRC mismatch — retransmit
                         retransmit = true;
                     }
                 } else if evts.timer {
-                    // ACK timeout (esb-ng line 263).
-                    // Release the ACK RX buffer
-                    if self.ack_rx_idx != NO_IDX {
-                        pool.release_rx(self.ack_rx_idx);
-                        self.ack_rx_idx = NO_IDX;
-                    }
+                    self.release_ack_rx(pool);
                     retransmit = true;
                 }
 
@@ -304,15 +269,9 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 }
 
                 // Check max attempts (R6: use >= not >).
-                // esb-ng uses `>` which gives one extra attempt.
                 if self.attempts >= self.max_attempts {
                     self.timer.disarm_retransmit();
-
-                    // Drop current TX packet
-                    if self.tx_idx != NO_IDX {
-                        pool.release_tx(self.tx_idx);
-                        self.tx_idx = NO_IDX;
-                    }
+                    self.release_tx(pool);
                     self.attempts = 0;
                     self.send_next(pool);
                     return PtxEvent::MaxAttempts;
@@ -322,7 +281,6 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             }
 
             StatePtx::WaitRetransmit => {
-                // Retransmit timer fired — send again (esb-ng lines 283–291).
                 debug_assert!(evts.timer, "WaitRetransmit: expected timer event");
                 self.retransmit(pool);
                 PtxEvent::None
@@ -331,80 +289,77 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     }
 
     /// Send the next queued packet, or go idle if queue is empty.
-    ///
     /// Ref: esb-ng `src/irq.rs` lines 296–309.
     fn send_next<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
     ) {
         if let Some(idx) = pool.try_dequeue_tx() {
-            // SAFETY: We just dequeued this; it's in TX_QUEUED state.
             let header = unsafe { pool.header_mut(idx) };
             let no_ack = header.no_ack();
             let dma_ptr = unsafe { pool.dma_ptr(idx) };
-
             pool.tx_to_dma(idx);
             self.tx_idx = idx;
-
             self.radio.transmit(self.tx_pipe, dma_ptr, !no_ack);
-
-            if no_ack {
-                self.state = StatePtx::TxNoAck;
-            } else {
-                self.state = StatePtx::Tx;
-            }
+            self.state = if no_ack { StatePtx::TxNoAck } else { StatePtx::Tx };
         } else {
-            // No packet to send — disable interrupt, go idle
-            // (esb-ng lines 306–308).
             self.radio.disable_disabled_interrupt();
             self.state = StatePtx::Idle;
         }
     }
 
     /// Retransmit the current TX packet.
-    ///
-    /// Unlike send_next, this re-sends the same packet that's still
-    /// held in `tx_idx`.
     fn retransmit<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
     ) {
         if self.tx_idx != NO_IDX {
-            // SAFETY: tx_idx is in IN_DMA state, we're re-transmitting.
+            // SAFETY: tx_idx is in IN_DMA state; buffer data is still valid.
             let dma_ptr = unsafe { pool.dma_ptr(self.tx_idx) };
-
-            // Re-transmit on same pipe
             self.radio.transmit(self.tx_pipe, dma_ptr, true);
             self.state = StatePtx::Tx;
         } else {
-            // Shouldn't happen, but recover gracefully
             self.radio.disable_disabled_interrupt();
             self.state = StatePtx::Idle;
         }
     }
 
-    /// Trigger a send from application context (pend RADIO ISR).
-    pub fn trigger_send(&self) {
-        pend_radio_isr();
+    /// Release the current TX buffer back to the pool.
+    fn release_tx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        if self.tx_idx != NO_IDX {
+            pool.release_tx(self.tx_idx);
+            self.tx_idx = NO_IDX;
+        }
     }
 
-    /// Handle TIMER ISR — minimal: clear events, set flag, pend RADIO ISR.
-    ///
+    /// Release the current ACK RX buffer back to the pool.
+    fn release_ack_rx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        if self.ack_rx_idx != NO_IDX {
+            pool.release_rx(self.ack_rx_idx);
+            self.ack_rx_idx = NO_IDX;
+        }
+    }
+
+    /// Handle TIMER ISR — clear events, pend RADIO ISR.
     /// Ref: esb-ng `src/irq.rs` lines 49–66.
     pub fn handle_timer_event(&self) {
-        // Clear timer interrupt events
         if self.timer.is_retransmit_fired() {
             self.timer.disarm_retransmit();
         }
-        // Retransmit might have fired just after ack timeout — clear both.
         if self.timer.is_ack_timeout_fired() {
             self.timer.disarm_ack_timeout();
         }
+        pend_radio_isr();
+    }
 
-        // Set flag for RADIO ISR to read (esb-ng line 63).
-        self.timer_flag.store(true, Ordering::Release);
-
-        // Pend RADIO ISR — all state machine logic runs there (R9).
+    /// Trigger a send from application context (pend RADIO ISR).
+    pub fn trigger_send(&self) {
         pend_radio_isr();
     }
 }
@@ -412,15 +367,12 @@ impl<T: TimerInstance> PtxStateMachine<T> {
 // ---- PRX State Machine ----
 
 /// PRX (Primary Receiver) state machine.
-///
 /// Ref: esb-ng `src/irq.rs` lines 312–425.
 #[allow(dead_code)]
 pub struct PrxStateMachine<T: TimerInstance> {
-    radio: EsbRadio,
-    timer: EsbTimer<T>,
+    pub(crate) radio: EsbRadio,
+    pub(crate) timer: EsbTimer<T>,
     state: StatePrx,
-    /// Shared flag set by TIMER ISR (unused in PRX, kept for API symmetry).
-    timer_flag: &'static AtomicBool,
     /// Enabled pipe bitmask.
     enabled_pipes: u8,
     /// Current RX DMA buffer pool index.
@@ -436,7 +388,6 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         radio: EsbRadio,
         timer: EsbTimer<T>,
         config: &EsbConfig,
-        timer_flag: &'static AtomicBool,
         enabled_pipes: u8,
     ) -> Self {
         let _ = config;
@@ -444,7 +395,6 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             radio,
             timer,
             state: StatePrx::Idle,
-            timer_flag,
             enabled_pipes,
             rx_idx: NO_IDX,
             pending_rx_idx: NO_IDX,
@@ -457,25 +407,15 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     }
 
     /// Check and clear ISR event flags.
-    fn check_events(&mut self) -> IsrEvents {
-        let evts = IsrEvents {
-            disabled: self.radio.check_disabled_event(),
-            timer: self.timer_flag.load(Ordering::Acquire),
-        };
-
-        if evts.disabled {
+    pub fn check_events(&mut self, timer_flag: bool) -> IsrEvents {
+        let disabled = self.radio.check_disabled_event();
+        if disabled {
             self.radio.clear_disabled_event();
         }
-        if evts.timer {
-            self.timer_flag.store(false, Ordering::Release);
-        }
-
-        evts
+        IsrEvents { disabled, timer: timer_flag }
     }
 
     /// Start receiving on enabled pipes.
-    ///
-    /// Allocates an RX buffer from the pool and starts the RADIO.
     /// Ref: esb-ng `src/irq.rs` lines 386–395.
     pub fn start_receiving<const N: usize, const SIZE: usize>(
         &mut self,
@@ -485,28 +425,24 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             return Ok(());
         }
 
-        // Allocate an RX buffer
         let idx = alloc_dma_buffer(pool).ok_or(Error::OutOfMemory)?;
         self.rx_idx = idx;
-        // SAFETY: We just allocated this; it's in IN_DMA state.
         let dma_ptr = unsafe { pool.dma_ptr(idx) };
-
         self.radio.start_receiving(self.enabled_pipes, dma_ptr);
         self.state = StatePrx::Receiver;
         Ok(())
     }
 
     /// Handle a RADIO ISR event.
-    ///
     /// Ref: esb-ng `src/irq.rs` lines 316–383.
     pub fn handle_radio_event<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
+        timer_flag: bool,
     ) -> (PrxEvent, Option<usize>) {
-        let evts = self.check_events();
+        let evts = self.check_events(timer_flag);
 
-        let user_event = !evts.disabled && !evts.timer;
-        if user_event && self.state != StatePrx::Idle {
+        if evts.user_event() && self.state != StatePrx::Idle {
             return (PrxEvent::None, None);
         }
 
@@ -514,12 +450,10 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             StatePrx::Receiver => {
                 debug_assert!(evts.disabled, "Receiver: expected disabled event");
 
-                // Check received packet (esb-ng lines 330–351).
                 match self.radio.check_packet() {
                     RxResult::BadCrc => {
-                        // Bad CRC — radio already restarted RX with the same
-                        // PACKETPTR (esb-ng lines 345–354). Keep using the same
-                        // DMA buffer — RADIO will overwrite it on next RX.
+                        // Bad CRC — radio already restarted with same PACKETPTR.
+                        // Keep using the same DMA buffer.
                         (PrxEvent::BadCrc, None)
                     }
                     RxResult::NewPacket => {
@@ -527,19 +461,16 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                         let crc = self.radio.rx_crc();
                         let rssi = self.radio.rssi_sample();
 
-                        // SAFETY: rx_idx is in IN_DMA state, we read header fields.
                         let rx_idx = self.rx_idx;
                         let header = unsafe { pool.header_mut(rx_idx) };
                         let pid = header.pid();
                         let no_ack = header.no_ack();
 
-                        // Duplicate detection
                         let is_dup = self.radio.check_duplicate(pipe, pid, crc);
 
                         if is_dup {
                             if no_ack {
-                                // Duplicate NoAck — just restart RX
-                                // (esb-ng lines 341–344).
+                                // Duplicate NoAck — restart RX with new buffer
                                 match alloc_dma_buffer(pool) {
                                     Some(new_idx) => {
                                         pool.release_rx(rx_idx);
@@ -555,66 +486,54 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 }
                                 return (PrxEvent::Duplicate, None);
                             } else {
-                                // Duplicate with ACK — send repeated ACK
-                                // (esb-ng line 349).
+                                // Duplicate with ACK — send repeated fallback ACK
                                 self.radio.setup_ack_tx_fallback(pipe as u8);
                                 self.state = StatePrx::TxRepeatedAck;
                                 return (PrxEvent::Duplicate, None);
                             }
                         }
 
-                        // New packet — update detection state
+                        // New packet — update detection, write metadata
                         self.radio.update_detection(pipe, pid, crc);
-
-                        // Write metadata to header
                         let header = unsafe { pool.header_mut(rx_idx) };
                         header.rssi = rssi;
                         header.pipe = pipe as u8;
 
                         if no_ack {
-                            // NoAck: deliver to app but don't send ACK
-                            // (esb-ng lines 335–339).
+                            // NoAck: deliver to app, no ACK
                             pool.rx_complete(rx_idx);
                             self.rx_idx = NO_IDX;
 
-                            // Allocate new RX buffer and restart
                             match alloc_dma_buffer(pool) {
                                 Some(new_idx) => {
                                     self.rx_idx = new_idx;
                                     let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
                                     self.radio.complete_rx_no_ack(dma_ptr);
                                 }
-                                None => {
-                                    self.state = StatePrx::Idle;
-                                }
+                                None => self.state = StatePrx::Idle,
                             }
                             return (PrxEvent::ReceivedNoAck, Some(rx_idx));
                         }
 
-                        // Need ACK — set up ACK TX
+                        // Need ACK
                         self.setup_ack_tx(pool, pipe as u8);
                         self.pending_rx_idx = rx_idx;
                         self.rx_idx = NO_IDX;
                         self.state = StatePrx::TxAck;
                         (PrxEvent::Received, Some(rx_idx))
                     }
-                    // RxResult::Duplicate is never returned by check_packet();
-                    // duplicate detection is done via check_duplicate() above.
                     RxResult::Duplicate => (PrxEvent::None, None),
                 }
             }
 
             StatePrx::TxAck => {
-                // ACK TX completed — set up next RX (esb-ng lines 353–362).
                 debug_assert!(evts.disabled, "TxAck: expected disabled event");
 
-                // Deliver received packet to app
                 if self.pending_rx_idx != NO_IDX {
                     pool.rx_complete(self.pending_rx_idx);
                     self.pending_rx_idx = NO_IDX;
                 }
 
-                // Allocate new RX buffer and restart RX
                 match alloc_dma_buffer(pool) {
                     Some(idx) => {
                         self.rx_idx = idx;
@@ -631,10 +550,8 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             }
 
             StatePrx::TxRepeatedAck => {
-                // Repeated ACK TX completed (esb-ng lines 363–372).
                 debug_assert!(evts.disabled, "TxRepeatedAck: expected disabled event");
 
-                // Allocate new RX buffer and restart RX
                 match alloc_dma_buffer(pool) {
                     Some(idx) => {
                         self.rx_idx = idx;
@@ -651,8 +568,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             }
 
             StatePrx::Idle => {
-                debug_assert!(user_event, "Idle: expected user event");
-                // User triggered — start receiving (esb-ng lines 373–380).
+                debug_assert!(evts.user_event(), "Idle: expected user event");
                 let _ = self.start_receiving(pool);
                 (PrxEvent::None, None)
             }
@@ -660,29 +576,22 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     }
 
     /// Set up ACK TX for a new (non-duplicate) packet.
-    ///
-    /// Checks if there's a queued TX payload to send as ACK. If not,
-    /// uses the fallback empty ACK `[0, 0]` (R11).
     fn setup_ack_tx<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
         pipe: u8,
     ) {
         if let Some(idx) = pool.try_dequeue_tx() {
-            // SAFETY: We just dequeued this; it's ours.
             let dma_ptr = unsafe { pool.dma_ptr(idx) };
             pool.tx_to_dma(idx);
             self.radio.setup_ack_tx(pipe, dma_ptr);
         } else {
-            // No ACK payload queued — use fallback (esb-ng line 377, R11).
             self.radio.setup_ack_tx_fallback(pipe);
         }
     }
 
-    /// Handle TIMER ISR (minimal — PRX doesn't typically use timer).
+    /// Handle TIMER ISR (PRX doesn't typically use timer).
     pub fn handle_timer_event(&self) {
-        // PRX doesn't use the timer in normal operation.
-        // Just clear any pending events.
         if self.timer.is_retransmit_fired() {
             self.timer.disarm_retransmit();
         }
@@ -692,7 +601,6 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     }
 
     /// Stop receiving and go idle.
-    ///
     /// Ref: esb-ng `src/irq.rs` lines 398–406.
     pub fn stop_receiving<const N: usize, const SIZE: usize>(
         &mut self,
@@ -701,9 +609,8 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         self.radio.stop();
         self.timer.disarm_retransmit();
         self.timer.disarm_ack_timeout();
-        let _ = self.check_events();
+        let _ = self.check_events(false);
 
-        // Release any held buffers
         if self.rx_idx != NO_IDX {
             pool.release_rx(self.rx_idx);
             self.rx_idx = NO_IDX;
@@ -712,7 +619,6 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             pool.release_rx(self.pending_rx_idx);
             self.pending_rx_idx = NO_IDX;
         }
-
         self.state = StatePrx::Idle;
     }
 }
@@ -720,9 +626,6 @@ impl<T: TimerInstance> PrxStateMachine<T> {
 // ---- Helpers ----
 
 /// Allocate a free buffer and transition it to DMA state.
-///
-/// Searches for a FREE slot, transitions it to IN_DMA.
-/// Returns the pool index, or None if pool is exhausted.
 #[allow(clippy::manual_find)]
 fn alloc_dma_buffer<const N: usize, const SIZE: usize>(
     pool: &PacketPool<N, SIZE>,
@@ -730,7 +633,7 @@ fn alloc_dma_buffer<const N: usize, const SIZE: usize>(
     (0..N).find(|&i| pool.rx_to_dma(i))
 }
 
-/// Pend the RADIO ISR — used to trigger RADIO ISR from TIMER ISR or app.
+/// Pend the RADIO ISR.
 #[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
 fn pend_radio_isr() {
     cortex_m::peripheral::NVIC::pend(crate::pac::Interrupt::RADIO);
