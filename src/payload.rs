@@ -63,6 +63,7 @@ impl<const SIZE: usize> Packet<SIZE> {
     /// # Safety
     ///
     /// Caller must hold exclusive access (guaranteed by pool state machine).
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn buf_mut(&self) -> &mut [u8; SIZE] {
         unsafe { &mut *self.data.get() }
     }
@@ -81,6 +82,7 @@ impl<const SIZE: usize> Packet<SIZE> {
     /// # Safety
     ///
     /// Caller must hold exclusive access.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn header_mut(&self) -> &mut EsbHeader {
         unsafe {
             let ptr = self.data.get() as *mut EsbHeader;
@@ -112,11 +114,18 @@ pub struct PacketPool<const N: usize, const SIZE: usize> {
 unsafe impl<const N: usize, const SIZE: usize> Send for PacketPool<N, SIZE> {}
 unsafe impl<const N: usize, const SIZE: usize> Sync for PacketPool<N, SIZE> {}
 
+impl<const N: usize, const SIZE: usize> Default for PacketPool<N, SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     /// Create a zeroed pool.
     ///
     /// Must be placed in a `static` (e.g. via `static_cell`).
     pub const fn new() -> Self {
+        #[allow(clippy::declare_interior_mutable_const)]
         const NEW: AtomicU8 = AtomicU8::new(state::FREE);
         Self {
             storage: [const { Packet::new() }; N],
@@ -130,6 +139,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     ///
     /// Returns an index into the pool. Caller should fill the buffer then call
     /// `enqueue_tx()` or `release_tx()`.
+    #[allow(clippy::manual_find)]
     pub fn alloc_tx(&self) -> Option<usize> {
         for i in 0..N {
             if self.state[i]
@@ -237,6 +247,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     /// # Safety
     ///
     /// Caller must ensure exclusive access per state machine.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn buf_mut(&self, index: usize) -> &mut [u8; SIZE] {
         unsafe { self.storage[index].buf_mut() }
     }
@@ -246,6 +257,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     /// # Safety
     ///
     /// Caller must ensure exclusive access per state machine.
+    #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn header_mut(&self, index: usize) -> &mut EsbHeader {
         unsafe { self.storage[index].header_mut() }
     }

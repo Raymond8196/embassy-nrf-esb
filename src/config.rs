@@ -5,7 +5,7 @@ use crate::error::Error;
 /// TX output power.
 ///
 /// Maps to nRF RADIO TXPOWER register values (PS §6.17.10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TxPower {
     Neg40dBm,
@@ -14,6 +14,7 @@ pub enum TxPower {
     Neg12dBm,
     Neg8dBm,
     Neg4dBm,
+    #[default]
     ZeroDbm,
     Pos2dBm,
     Pos3dBm,
@@ -22,12 +23,6 @@ pub enum TxPower {
     Pos6dBm,
     Pos7dBm,
     Pos8dBm,
-}
-
-impl Default for TxPower {
-    fn default() -> Self {
-        Self::ZeroDbm
-    }
 }
 
 impl TxPower {
@@ -59,19 +54,14 @@ pub const RAMP_UP_US: u16 = 140;
 pub const RAMP_UP_FAST_US: u16 = 40;
 
 /// ESB protocol bitrate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Bitrate {
     /// 1 Mbps (longer range, lower current).
     Mbps1,
     /// 2 Mbps (shorter range, higher throughput) — default for ESB.
+    #[default]
     Mbps2,
-}
-
-impl Default for Bitrate {
-    fn default() -> Self {
-        Self::Mbps2
-    }
 }
 
 /// ESB RF channel (0–100, maps to 2400–2500 MHz).
@@ -191,8 +181,11 @@ impl EsbConfig {
         }
 
         // Retransmit delay must be > ack_timeout + 62 µs
+        // AND > RAMP_UP_TIME (radio needs time to re-enable)
         let min_retransmit_delay = self.ack_timeout_us.saturating_add(62);
-        if self.retransmit.delay_us <= min_retransmit_delay {
+        if self.retransmit.delay_us <= min_retransmit_delay
+            || self.retransmit.delay_us <= RAMP_UP_US
+        {
             return Err(Error::InvalidParam);
         }
 

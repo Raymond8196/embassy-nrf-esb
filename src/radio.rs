@@ -440,8 +440,12 @@ impl EsbRadio {
         //
         // SAFETY (Sync wrapper): Access is single-threaded — this method is only
         // called from the RADIO ISR. No concurrent access is possible.
+        //
+        // link_section(".data") guarantees RAM placement — EasyDMA cannot read
+        // from Flash (errata [122], PS §6.17.6).
         struct FallbackAck(UnsafeCell<[u8; 2]>);
         unsafe impl Sync for FallbackAck {}
+        #[unsafe(link_section = ".data")]
         static FALLBACK_ACK: FallbackAck = FallbackAck(UnsafeCell::new([0, 0]));
         // SAFETY: ISR-only access, RADIO reads while in TX mode.
         let ptr = unsafe { (*FALLBACK_ACK.0.get()).as_mut_ptr() };
