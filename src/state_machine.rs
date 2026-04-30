@@ -265,8 +265,9 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                     self.release_ack_rx(pool);
                 } else if evts.timer {
                     // ACK timeout (esb-ng line 263).
+                    // Don't disarm retransmit timer — it's still counting down
+                    // and will trigger the WaitRetransmit state.
                     self.timer.disarm_ack_timeout();
-                    self.timer.disarm_retransmit();
                     self.radio.stop();
                     self.release_ack_rx(pool);
                 } else {
