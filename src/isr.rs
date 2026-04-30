@@ -76,6 +76,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         addresses: &EsbAddresses,
         tx_pipe: u8,
     ) -> Self {
+        config.validate().expect("ESB config invalid");
         let mut radio = EsbRadio::new(crate::pac::RADIO);
         radio.init(config, addresses);
 
@@ -159,7 +160,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         header.set_no_ack(true);
 
         let buf = unsafe { self.pool.buf_mut(idx) };
-        let payload_offset = EsbHeader::DMA_OFFSET + 2;
         buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
 
         self.pool.enqueue_tx(idx).await;
@@ -213,6 +213,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         config: &EsbConfig,
         addresses: &EsbAddresses,
     ) -> Self {
+        config.validate().expect("ESB config invalid");
         let mut radio = EsbRadio::new(crate::pac::RADIO);
         radio.init(config, addresses);
 
@@ -276,10 +277,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         header.set_no_ack(false);
 
         let buf = unsafe { self.pool.buf_mut(idx) };
-        let payload_offset = EsbHeader::DMA_OFFSET + 2;
-        if payload.len() <= 252 && payload_offset + payload.len() <= buf.len() {
-            buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
-        }
+        buf[payload_offset..payload_offset + payload.len()].copy_from_slice(payload);
 
         self.pool.enqueue_tx(idx).await;
         Ok(())

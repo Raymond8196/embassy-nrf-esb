@@ -23,12 +23,9 @@ const NUM_PIPES: usize = 8;
 /// Result of checking a received PRX packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[allow(dead_code)]
 pub(crate) enum RxResult {
     /// New valid packet received on the given pipe.
     NewPacket,
-    /// Duplicate packet (same CRC + PID as last packet on this pipe).
-    Duplicate,
     /// CRC check failed — radio automatically restarted.
     BadCrc,
 }
