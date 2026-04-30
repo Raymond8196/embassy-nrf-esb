@@ -12,8 +12,8 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use crate::addresses::EsbAddresses;
 use crate::config::{Bitrate, EsbConfig};
 
-use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode};
-#[cfg(feature = "fast-rx")]
+use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode, Skipaddr};
+#[cfg(feature = "fast-ru")]
 use crate::pac::radio::vals::Ru;
 use crate::pac::radio::{regs, Radio};
 
@@ -91,7 +91,7 @@ impl EsbRadio {
         });
 
         // Fast ramp-up (PS §6.17.10 MODECNF0.RU).
-        #[cfg(feature = "fast-rx")]
+        #[cfg(feature = "fast-ru")]
         r.modecnf0().modify(|w| w.set_ru(Ru::FAST));
 
         // TX output power (esb-ng line 105).
@@ -115,9 +115,7 @@ impl EsbRadio {
         });
 
         // CRC configuration (esb-ng lines 122–130).
-        // CRCCNF.SKIPADDR not set: reset default INCLUDE is correct for ESB.
-        // Both nRF24L01+ and Nordic ESB SDK include address in CRC calculation.
-        // The x^N MSB bit is implicit in hardware; config stores lower bits only.
+        // SKIPADDR=INCLUDE: address included in CRC (nRF24L01+ compatible).
         let crc_len = match config.crc.length {
             0 => Len::DISABLED,
             1 => Len::ONE,
@@ -128,7 +126,10 @@ impl EsbRadio {
         r.crcinit()
             .write(|w| w.set_crcinit(config.crc.init as u32 & 0x00FF_FFFF));
         r.crcpoly().write(|w| w.set_crcpoly(crc_poly & 0x00FF_FFFF));
-        r.crccnf().write(|w| w.set_len(crc_len));
+        r.crccnf().write(|w| {
+            w.set_len(crc_len);
+            w.set_skipaddr(Skipaddr::INCLUDE);
+        });
 
         // Write addresses (esb-ng lines 132–136).
         r.base0().write_value(base0);

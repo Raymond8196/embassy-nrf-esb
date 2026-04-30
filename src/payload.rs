@@ -89,12 +89,26 @@ impl<const SIZE: usize> Packet<SIZE> {
             &mut *ptr
         }
     }
+
+    /// Read-only access to the header portion.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent mutable access.
+    pub(crate) unsafe fn header(&self) -> &EsbHeader {
+        unsafe {
+            let ptr = self.data.get() as *const EsbHeader;
+            &*ptr
+        }
+    }
 }
 
 // SAFETY: Packet is pub(crate), only constructed by PacketPool::new().
 // The pool's atomic state machine ensures no concurrent access to any Packet.
 unsafe impl<const SIZE: usize> Send for Packet<SIZE> {}
 unsafe impl<const SIZE: usize> Sync for Packet<SIZE> {}
+
+const _: () = assert!(core::mem::align_of::<Packet<1>>() >= 4);
 
 /// A pool of packet buffers with atomic state tracking and async queues.
 ///
@@ -260,6 +274,15 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn header_mut(&self, index: usize) -> &mut EsbHeader {
         unsafe { self.storage[index].header_mut() }
+    }
+
+    /// Get read-only access to a packet header by index.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent mutable access.
+    pub(crate) unsafe fn header(&self, index: usize) -> &EsbHeader {
+        unsafe { self.storage[index].header() }
     }
 
     /// Get read access to a packet buffer by index.

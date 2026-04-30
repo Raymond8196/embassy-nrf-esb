@@ -38,6 +38,9 @@ impl EsbHeader {
     /// Offset from struct start to the hardware DMA fields (length, pid_no_ack).
     pub const DMA_OFFSET: usize = 2;
 
+    /// Offset from struct start to the payload data (after full 4-byte header).
+    pub const PAYLOAD_OFFSET: usize = 4;
+
     /// Maximum ESB payload length.
     pub const MAX_PAYLOAD: u8 = 252;
 

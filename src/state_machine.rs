@@ -410,6 +410,8 @@ pub struct PrxStateMachine<T: TimerInstance> {
     rx_idx: usize,
     /// Current received packet pool index (queued for app after RX).
     pending_rx_idx: usize,
+    /// Current ACK TX buffer pool index (IN_DMA while sending ACK payload).
+    ack_tx_idx: usize,
 }
 
 #[allow(dead_code)]
@@ -429,6 +431,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             enabled_pipes,
             rx_idx: NO_IDX,
             pending_rx_idx: NO_IDX,
+            ack_tx_idx: NO_IDX,
         }
     }
 
@@ -504,7 +507,8 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 // Duplicate NoAck — restart RX with new buffer
                                 match alloc_dma_buffer(pool) {
                                     Some(new_idx) => {
-                                        pool.release_rx(rx_idx);
+                                        // rx_idx is IN_DMA, use release_tx for IN_DMA→FREE
+                                        pool.release_tx(rx_idx);
                                         self.rx_idx = new_idx;
                                         let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
                                         self.radio.complete_rx_no_ack(dma_ptr);
@@ -521,7 +525,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 // The original rx_idx buffer is no longer used by DMA
                                 // (PACKETPTR was changed by setup_ack_tx_fallback).
                                 // Release it before entering TxRepeatedAck.
-                                pool.release_rx(rx_idx);
+                                pool.release_tx(rx_idx);
                                 self.rx_idx = NO_IDX;
                                 self.radio.setup_ack_tx_fallback(pipe as u8);
                                 self.state = StatePrx::TxRepeatedAck;
@@ -572,6 +576,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                     pool.rx_complete(self.pending_rx_idx);
                     self.pending_rx_idx = NO_IDX;
                 }
+                self.release_ack_tx(pool);
 
                 match alloc_dma_buffer(pool) {
                     Some(idx) => {
@@ -592,6 +597,8 @@ impl<T: TimerInstance> PrxStateMachine<T> {
 
             StatePrx::TxRepeatedAck => {
                 debug_assert!(evts.disabled, "TxRepeatedAck: expected disabled event");
+
+                self.release_ack_tx(pool);
 
                 match alloc_dma_buffer(pool) {
                     Some(idx) => {
@@ -619,6 +626,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     }
 
     /// Set up ACK TX for a new (non-duplicate) packet.
+    /// Saves the ACK TX buffer index for release after transmission.
     fn setup_ack_tx<const N: usize, const SIZE: usize>(
         &mut self,
         pool: &PacketPool<N, SIZE>,
@@ -627,9 +635,22 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         if let Some(idx) = pool.try_dequeue_tx() {
             let dma_ptr = unsafe { pool.dma_ptr(idx) };
             pool.tx_to_dma(idx);
+            self.ack_tx_idx = idx;
             self.radio.setup_ack_tx(pipe, dma_ptr);
         } else {
+            self.ack_tx_idx = NO_IDX;
             self.radio.setup_ack_tx_fallback(pipe);
+        }
+    }
+
+    /// Release the current ACK TX buffer back to the pool.
+    fn release_ack_tx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        if self.ack_tx_idx != NO_IDX {
+            pool.release_tx(self.ack_tx_idx);
+            self.ack_tx_idx = NO_IDX;
         }
     }
 
@@ -664,6 +685,10 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         if self.pending_rx_idx != NO_IDX {
             pool.release_rx(self.pending_rx_idx);
             self.pending_rx_idx = NO_IDX;
+        }
+        if self.ack_tx_idx != NO_IDX {
+            pool.release_tx(self.ack_tx_idx);
+            self.ack_tx_idx = NO_IDX;
         }
         self.state = StatePrx::Idle;
     }
