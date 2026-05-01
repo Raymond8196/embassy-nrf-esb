@@ -292,11 +292,23 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
             return saved;
         }
 
-        // Slow path: request ISR to stop after current transaction
+        // Set the flag so ISR will suppress new TX after current transaction.
         self.suspend_signal.reset();
         self.suspend_requested.store(true, Ordering::Release);
 
-        // Wait for ISR to signal idle
+        // Re-check under IRQ-disabled to close the race window where
+        // the ISR completed between try_suspend() fail and the store above.
+        disable_radio_irq();
+        let sm = unsafe { &mut *self.sm.get() };
+        if sm.state() == crate::state_machine::StatePtx::Idle {
+            let saved = sm.do_suspend(self.pool);
+            unpend_radio_irq();
+            self.suspend_requested.store(false, Ordering::Release);
+            return saved;
+        }
+        enable_radio_irq();
+
+        // ISR is running and will see suspend_requested — wait for signal.
         self.suspend_signal.wait().await;
 
         // ISR is done and state is idle — finalize
@@ -317,6 +329,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         // SAFETY: RADIO IRQ is disabled (from suspend), so no ISR concurrency.
         let sm = unsafe { &mut *self.sm.get() };
         sm.do_restore(state, addresses);
+        self.suspend_requested.store(false, Ordering::Release);
         unpend_radio_irq();
         enable_radio_irq();
     }
@@ -492,6 +505,21 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         self.suspend_signal.reset();
         self.suspend_requested.store(true, Ordering::Release);
 
+        // Re-check under IRQ-disabled to close the race window where
+        // the ISR completed between try_suspend() fail and the store above.
+        disable_radio_irq();
+        let sm = unsafe { &mut *self.sm.get() };
+        let state = sm.state();
+        if state == crate::state_machine::StatePrx::Idle
+            || state == crate::state_machine::StatePrx::Receiver
+        {
+            let saved = sm.do_suspend(self.pool);
+            unpend_radio_irq();
+            self.suspend_requested.store(false, Ordering::Release);
+            return saved;
+        }
+        enable_radio_irq();
+
         self.suspend_signal.wait().await;
 
         disable_radio_irq();
@@ -509,6 +537,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
     pub fn restore(&self, state: &EsbSavedState, addresses: &EsbAddresses) {
         let sm = unsafe { &mut *self.sm.get() };
         sm.do_restore(state, addresses);
+        self.suspend_requested.store(false, Ordering::Release);
         unpend_radio_irq();
         enable_radio_irq();
     }
