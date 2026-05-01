@@ -26,13 +26,17 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
+
 use crate::addresses::EsbAddresses;
 use crate::config::EsbConfig;
 use crate::error::Error;
 use crate::header::EsbHeader;
 use crate::payload::PacketPool;
 use crate::radio::EsbRadio;
-use crate::state_machine::{PtxStateMachine, PrxStateMachine};
+use crate::state_machine::{PrxStateMachine, PtxStateMachine};
+use crate::suspend::EsbSavedState;
 use crate::timer::{EsbTimer, TimerInstance};
 
 /// Default pool size (number of packet buffers).
@@ -41,19 +45,48 @@ pub const DEFAULT_POOL_N: usize = 4;
 /// Default buffer size per packet (4-byte header + 252-byte payload).
 pub const DEFAULT_POOL_SIZE: usize = 256;
 
+// ---- NVIC helpers ----
+
+#[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
+fn disable_radio_irq() {
+    cortex_m::peripheral::NVIC::mask(crate::pac::Interrupt::RADIO);
+}
+
+#[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
+fn enable_radio_irq() {
+    // SAFETY: Caller ensures no data races — called only when the driver
+    // owns the radio (after suspend or during restore).
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(crate::pac::Interrupt::RADIO);
+    }
+}
+
+#[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
+fn unpend_radio_irq() {
+    cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::RADIO);
+}
+
 // ---- PTX Driver ----
 
 /// Embassy async PTX (Primary Transmitter) driver.
 ///
 /// Combines radio, timer, packet pool, and PTX state machine.
 /// Place in a `static` via `static_cell`.
-pub struct EsbPtx<T: TimerInstance, const N: usize = DEFAULT_POOL_N, const SIZE: usize = DEFAULT_POOL_SIZE> {
+pub struct EsbPtx<
+    T: TimerInstance,
+    const N: usize = DEFAULT_POOL_N,
+    const SIZE: usize = DEFAULT_POOL_SIZE,
+> {
     sm: UnsafeCell<PtxStateMachine<T>>,
     pool: &'static PacketPool<N, SIZE>,
     /// Shared flag set by TIMER ISR, read/cleared by RADIO ISR.
     timer_flag: AtomicBool,
     /// Set by RADIO ISR when max retransmit attempts reached, cleared by app.
     max_attempts_flag: AtomicBool,
+    /// Set by app to request ISR to stop after current transaction.
+    suspend_requested: AtomicBool,
+    /// Signaled by ISR when it goes idle with suspend_requested set.
+    suspend_signal: Signal<CriticalSectionRawMutex, ()>,
 }
 
 // SAFETY: Placed in static by user. All ISR access is single-threaded.
@@ -91,6 +124,8 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
             pool,
             timer_flag: AtomicBool::new(false),
             max_attempts_flag: AtomicBool::new(false),
+            suspend_requested: AtomicBool::new(false),
+            suspend_signal: Signal::new(),
         }
     }
 
@@ -105,11 +140,16 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         if timer_flag {
             self.timer_flag.store(false, Ordering::Release);
         }
+        let suppress = self.suspend_requested.load(Ordering::Acquire);
         // SAFETY: ISR-only access — no concurrent ISR or app mutation of sm.
         let sm = unsafe { &mut *self.sm.get() };
-        let event = sm.handle_radio_event(self.pool, timer_flag);
+        let event = sm.handle_radio_event(self.pool, timer_flag, suppress);
         if event == crate::state_machine::PtxEvent::MaxAttempts {
             self.max_attempts_flag.store(true, Ordering::Release);
+        }
+
+        if suppress && sm.state() == crate::state_machine::StatePtx::Idle {
+            self.suspend_signal.signal(());
         }
 
         // Clear any latched RADIO pending bit to prevent spurious re-entry
@@ -218,15 +258,85 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     pub fn is_tx_idle(&self) -> bool {
         self.state() == crate::state_machine::StatePtx::Idle
     }
+
+    // ---- Suspend / Resume ----
+
+    /// Non-blocking suspend. Returns `Err(Busy)` if mid-transaction.
+    ///
+    /// After success, RADIO IRQ is disabled and the radio is stopped.
+    /// Call `restore()` to re-initialize and resume operation.
+    pub fn try_suspend(&self) -> Result<EsbSavedState, Error> {
+        disable_radio_irq();
+
+        let sm = unsafe { &mut *self.sm.get() };
+        if sm.state() != crate::state_machine::StatePtx::Idle {
+            enable_radio_irq();
+            return Err(Error::Busy);
+        }
+
+        let saved = sm.do_suspend(self.pool);
+        unpend_radio_irq();
+        Ok(saved)
+    }
+
+    /// Async suspend. Waits for current transaction to complete, then suspends.
+    ///
+    /// If already idle, returns immediately. Otherwise, signals the ISR to
+    /// stop after the current transaction and waits for it to go idle.
+    ///
+    /// After return, RADIO IRQ is disabled and the radio is stopped.
+    /// Call `restore()` to re-initialize and resume operation.
+    pub async fn suspend(&self) -> EsbSavedState {
+        // Fast path: already idle
+        if let Ok(saved) = self.try_suspend() {
+            return saved;
+        }
+
+        // Slow path: request ISR to stop after current transaction
+        self.suspend_signal.reset();
+        self.suspend_requested.store(true, Ordering::Release);
+
+        // Wait for ISR to signal idle
+        self.suspend_signal.wait().await;
+
+        // ISR is done and state is idle — finalize
+        disable_radio_irq();
+        let sm = unsafe { &mut *self.sm.get() };
+        let saved = sm.do_suspend(self.pool);
+        unpend_radio_irq();
+        self.suspend_requested.store(false, Ordering::Release);
+        saved
+    }
+
+    /// Restore ESB from saved state. Full RADIO re-init + PID/CRC restore.
+    ///
+    /// Must be called after `suspend()` or `try_suspend()`. Re-enables RADIO IRQ.
+    /// Does NOT automatically start sending — queued packets will be sent on
+    /// the next `send()` call or if packets are already queued in the channel.
+    pub fn restore(&self, state: &EsbSavedState, addresses: &EsbAddresses) {
+        // SAFETY: RADIO IRQ is disabled (from suspend), so no ISR concurrency.
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.do_restore(state, addresses);
+        unpend_radio_irq();
+        enable_radio_irq();
+    }
 }
 
 // ---- PRX Driver ----
 
 /// Embassy async PRX (Primary Receiver) driver.
-pub struct EsbPrx<T: TimerInstance, const N: usize = DEFAULT_POOL_N, const SIZE: usize = DEFAULT_POOL_SIZE> {
+pub struct EsbPrx<
+    T: TimerInstance,
+    const N: usize = DEFAULT_POOL_N,
+    const SIZE: usize = DEFAULT_POOL_SIZE,
+> {
     sm: UnsafeCell<PrxStateMachine<T>>,
     pool: &'static PacketPool<N, SIZE>,
     timer_flag: AtomicBool,
+    /// Set by app to request ISR to stop after current ACK TX.
+    suspend_requested: AtomicBool,
+    /// Signaled by ISR when it returns to Receiver/Idle with suspend_requested set.
+    suspend_signal: Signal<CriticalSectionRawMutex, ()>,
 }
 
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPrx<T, N, SIZE> {}
@@ -254,6 +364,8 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             sm: UnsafeCell::new(sm),
             pool,
             timer_flag: AtomicBool::new(false),
+            suspend_requested: AtomicBool::new(false),
+            suspend_signal: Signal::new(),
         }
     }
 
@@ -268,6 +380,17 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         // SAFETY: ISR-only access.
         let sm = unsafe { &mut *self.sm.get() };
         sm.handle_radio_event(self.pool, timer_flag);
+
+        // If suspend was requested and we're in a suspendable state
+        // (Idle or Receiver), signal the waiting async task.
+        if self.suspend_requested.load(Ordering::Acquire) {
+            let state = sm.state();
+            if state == crate::state_machine::StatePrx::Idle
+                || state == crate::state_machine::StatePrx::Receiver
+            {
+                self.suspend_signal.signal(());
+            }
+        }
 
         #[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
         cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::RADIO);
@@ -332,6 +455,62 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
     pub fn state(&self) -> crate::state_machine::StatePrx {
         // SAFETY: Read-only access.
         unsafe { &*self.sm.get() }.state()
+    }
+
+    // ---- Suspend / Resume ----
+
+    /// Non-blocking suspend. Returns `Err(Busy)` if mid-ACK-TX.
+    ///
+    /// PRX in `Idle` or `Receiver` state can be suspended immediately.
+    /// `TxAck`/`TxRepeatedAck` states return `Err(Busy)`.
+    pub fn try_suspend(&self) -> Result<EsbSavedState, Error> {
+        disable_radio_irq();
+
+        let sm = unsafe { &mut *self.sm.get() };
+        let state = sm.state();
+        if state != crate::state_machine::StatePrx::Idle
+            && state != crate::state_machine::StatePrx::Receiver
+        {
+            enable_radio_irq();
+            return Err(Error::Busy);
+        }
+
+        let saved = sm.do_suspend(self.pool);
+        unpend_radio_irq();
+        Ok(saved)
+    }
+
+    /// Async suspend. Waits for any in-progress ACK TX to complete.
+    ///
+    /// If in `Idle` or `Receiver` state, returns immediately.
+    /// Otherwise waits for the ISR to finish the ACK TX.
+    pub async fn suspend(&self) -> EsbSavedState {
+        if let Ok(saved) = self.try_suspend() {
+            return saved;
+        }
+
+        self.suspend_signal.reset();
+        self.suspend_requested.store(true, Ordering::Release);
+
+        self.suspend_signal.wait().await;
+
+        disable_radio_irq();
+        let sm = unsafe { &mut *self.sm.get() };
+        let saved = sm.do_suspend(self.pool);
+        unpend_radio_irq();
+        self.suspend_requested.store(false, Ordering::Release);
+        saved
+    }
+
+    /// Restore ESB from saved state. Full RADIO re-init + PID/CRC restore.
+    ///
+    /// Must be called after `suspend()` or `try_suspend()`. Re-enables RADIO IRQ.
+    /// Does NOT automatically start listening — call `start_listening()` after.
+    pub fn restore(&self, state: &EsbSavedState, addresses: &EsbAddresses) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.do_restore(state, addresses);
+        unpend_radio_irq();
+        enable_radio_irq();
     }
 }
 

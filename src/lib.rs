@@ -36,6 +36,7 @@ pub mod header;
 pub mod payload;
 pub(crate) mod radio;
 pub mod state_machine;
+pub mod suspend;
 pub mod timer;
 
 // Re-export driver types from isr module

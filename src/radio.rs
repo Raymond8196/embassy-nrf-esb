@@ -506,6 +506,16 @@ impl EsbRadio {
         self.last_pid = pid;
     }
 
+    /// Save per-pipe CRC state for suspend.
+    pub(crate) fn save_crc_state(&self) -> [u16; NUM_PIPES] {
+        self.last_crc
+    }
+
+    /// Restore per-pipe CRC state after resume.
+    pub(crate) fn restore_crc_state(&mut self, crc: [u16; NUM_PIPES]) {
+        self.last_crc = crc;
+    }
+
     /// Power-cycle the RADIO peripheral (for MPSL timeslot transitions).
     /// PS §6.17: POWER register resets all RADIO registers to initial values.
     pub(crate) fn power_cycle(&mut self) {

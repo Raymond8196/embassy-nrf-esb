@@ -18,4 +18,14 @@ pub enum Error {
     InvalidAddress,
     /// Packet pool exhausted — no free buffers for DMA.
     OutOfMemory,
+    /// Cannot suspend — state machine is mid-transaction.
+    Busy,
 }
+
+const _: () = {
+    const fn _assert_traits()
+    where
+        Error: Copy + Eq,
+    {
+    }
+};

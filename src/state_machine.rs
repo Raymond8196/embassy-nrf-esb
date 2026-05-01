@@ -11,10 +11,12 @@
 //!
 //! Ref: esb-ng `src/irq.rs` lines 155–425.
 
+use crate::addresses::EsbAddresses;
 use crate::config::{EsbConfig, RAMP_UP_US};
 use crate::error::Error;
 use crate::payload::PacketPool;
 use crate::radio::{EsbRadio, RxResult};
+use crate::suspend::{EsbSavedState, SavedProtocolState};
 use crate::timer::EsbTimer;
 use crate::timer::TimerInstance;
 
@@ -120,6 +122,7 @@ const NO_IDX: usize = usize::MAX;
 pub struct PtxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
+    config: EsbConfig,
     state: StatePtx,
     /// Retransmit attempt counter for the current packet.
     attempts: u8,
@@ -151,6 +154,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         Self {
             radio,
             timer,
+            config: config.clone(),
             state: StatePtx::Idle,
             attempts: 0,
             tx_pipe,
@@ -196,6 +200,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         &mut self,
         pool: &PacketPool<N, SIZE>,
         timer_flag: bool,
+        suppress_next_tx: bool,
     ) -> PtxEvent {
         let evts = self.check_events(timer_flag);
 
@@ -207,7 +212,9 @@ impl<T: TimerInstance> PtxStateMachine<T> {
 
         match self.state {
             StatePtx::Idle => {
-                self.send_next(pool);
+                if !suppress_next_tx {
+                    self.send_next(pool);
+                }
                 PtxEvent::None
             }
 
@@ -217,7 +224,11 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 self.radio.finish_tx_no_ack();
                 self.release_tx(pool);
                 self.advance_pid();
-                self.send_next(pool);
+                if suppress_next_tx {
+                    self.go_idle();
+                } else {
+                    self.send_next(pool);
+                }
                 PtxEvent::None
             }
 
@@ -257,7 +268,11 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                         self.release_tx(pool);
                         self.attempts = 0;
                         self.advance_pid();
-                        self.send_next(pool);
+                        if suppress_next_tx {
+                            self.go_idle();
+                        } else {
+                            self.send_next(pool);
+                        }
                         return PtxEvent::None;
                     }
                     // CRC mismatch — stop radio, release ACK buffer, fall through
@@ -282,7 +297,11 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                     self.release_tx(pool);
                     self.attempts = 0;
                     self.advance_pid();
-                    self.send_next(pool);
+                    if suppress_next_tx {
+                        self.go_idle();
+                    } else {
+                        self.send_next(pool);
+                    }
                     return PtxEvent::MaxAttempts;
                 }
 
@@ -298,6 +317,12 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                 PtxEvent::None
             }
         }
+    }
+
+    /// Transition to idle without dequeuing the next packet.
+    fn go_idle(&mut self) {
+        self.radio.disable_disabled_interrupt();
+        self.state = StatePtx::Idle;
     }
 
     /// Send the next queued packet, or go idle if queue is empty.
@@ -393,6 +418,56 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     pub fn trigger_send(&self) {
         pend_radio_isr();
     }
+
+    // ---- Suspend / Resume ----
+
+    /// Save ESB state and stop hardware. Called with RADIO IRQ already disabled.
+    pub(crate) fn do_suspend<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) -> EsbSavedState {
+        let protocol_state = if self.state == StatePtx::Idle {
+            SavedProtocolState::Idle
+        } else {
+            let attempt = self.attempts;
+            self.release_tx(pool);
+            self.release_ack_rx(pool);
+            SavedProtocolState::ForcedIdle {
+                dropped_attempt: attempt,
+            }
+        };
+
+        self.radio.stop();
+        self.timer.stop();
+        self.timer.disarm_retransmit();
+        self.timer.disarm_ack_timeout();
+
+        let saved = EsbSavedState {
+            pid: self.radio.save_pid_state(),
+            last_crc: self.radio.save_crc_state(),
+            tx_pipe: self.tx_pipe,
+            attempts: self.attempts,
+            protocol_state,
+        };
+
+        self.state = StatePtx::Idle;
+        self.attempts = 0;
+        self.tx_idx = NO_IDX;
+        self.ack_rx_idx = NO_IDX;
+
+        saved
+    }
+
+    /// Full re-init and restore from saved state.
+    /// Called with RADIO IRQ disabled; caller re-enables after return.
+    pub(crate) fn do_restore(&mut self, state: &EsbSavedState, addresses: &EsbAddresses) {
+        self.radio.power_cycle();
+        self.radio.init(&self.config, addresses);
+        self.radio.restore_pid_state(state.pid);
+        self.radio.restore_crc_state(state.last_crc);
+        self.tx_pipe = state.tx_pipe;
+        self.state = StatePtx::Idle;
+    }
 }
 
 // ---- PRX State Machine ----
@@ -403,6 +478,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
 pub struct PrxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
+    config: EsbConfig,
     state: StatePrx,
     /// Enabled pipe bitmask.
     enabled_pipes: u8,
@@ -423,10 +499,10 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         config: &EsbConfig,
         enabled_pipes: u8,
     ) -> Self {
-        let _ = config;
         Self {
             radio,
             timer,
+            config: config.clone(),
             state: StatePrx::Idle,
             enabled_pipes,
             rx_idx: NO_IDX,
@@ -699,6 +775,36 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             pool.release_tx(self.ack_tx_idx);
             self.ack_tx_idx = NO_IDX;
         }
+        self.state = StatePrx::Idle;
+    }
+
+    // ---- Suspend / Resume ----
+
+    /// Save ESB state and stop hardware. Called with RADIO IRQ already disabled.
+    pub(crate) fn do_suspend<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) -> EsbSavedState {
+        self.stop_receiving(pool);
+        self.timer.stop();
+
+        EsbSavedState {
+            pid: self.radio.save_pid_state(),
+            last_crc: self.radio.save_crc_state(),
+            tx_pipe: 0,
+            attempts: 0,
+            protocol_state: SavedProtocolState::Idle,
+        }
+    }
+
+    /// Full re-init and restore from saved state.
+    /// Called with RADIO IRQ disabled; caller re-enables after return.
+    pub(crate) fn do_restore(&mut self, state: &EsbSavedState, addresses: &EsbAddresses) {
+        self.radio.power_cycle();
+        self.radio.init(&self.config, addresses);
+        self.radio.restore_pid_state(state.pid);
+        self.radio.restore_crc_state(state.last_crc);
+        self.enabled_pipes = addresses.enabled_mask();
         self.state = StatePrx::Idle;
     }
 }
