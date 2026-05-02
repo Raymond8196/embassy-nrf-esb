@@ -1,6 +1,6 @@
 //! ESB packet buffer pool with word-aligned DMA storage.
 //!
-//! Each packet is a fixed-size buffer preceded by a 4-byte [`EsbHeader`](crate::header::EsbHeader).
+//! Each packet is a fixed-size buffer preceded by a 4-byte [`EsbHeader`].
 //! The layout is `[rssi, pipe, length, pid_no_ack, payload...]` where bytes 2+ are the DMA region.
 //!
 //! Buffer states are tracked with atomic state machines:

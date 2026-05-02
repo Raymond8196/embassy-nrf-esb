@@ -1,8 +1,8 @@
 //! ESB timer abstraction over nRF TIMER peripheral.
 //!
 //! Provides microsecond-precision timing for ESB protocol operations:
-//! - CC[0]: retransmit timeout (absolute, clear + start)
-//! - CC[1]: ACK timeout (relative, capture + add)
+//! - CC\[0\]: retransmit timeout (absolute, clear + start)
+//! - CC\[1\]: ACK timeout (relative, capture + add)
 //!
 //! Uses Embassy generic pattern for timer selection — no feature gates.
 //! TIMER0 is excluded (reserved for MPSL).
