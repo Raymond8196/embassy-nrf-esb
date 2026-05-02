@@ -71,9 +71,10 @@ impl EsbRadio {
         };
         r.mode().write(|w| w.set_mode(mode));
 
-        // LENGTH field bit width: 6 bits for payload ≤ 32, 8 bits otherwise
-        // (esb-ng line 87).
-        let len_bits: u8 = if config.payload_length <= 32 { 6 } else { 8 };
+        // LENGTH field bit width: 8 bits to support dynamic payload up to 252.
+        // esb-ng uses 6 bits when max ≤ 32, but we always use 8 since MAXLEN=252
+        // and send() allows any length up to 252.
+        let len_bits: u8 = 8;
 
         // Convert addresses for nRF24L01+ compatibility (esb-ng lines 89–92).
         // Bit-reversal for base, bytewise bit-swap for prefixes.
@@ -107,8 +108,10 @@ impl EsbRadio {
         });
 
         // PCNF1: max payload, 4-byte base + 1-byte prefix, big-endian (esb-ng lines 112–120).
+        // MAXLEN must be 252 (hardware maximum) so the RADIO never silently
+        // truncates a payload that passed software validation in send().
         r.pcnf1().write(|w| {
-            w.set_maxlen(config.payload_length);
+            w.set_maxlen(crate::header::EsbHeader::MAX_PAYLOAD);
             w.set_balen(4); // 4-byte base address
             w.set_statlen(0);
             w.set_endian(Endian::BIG);
