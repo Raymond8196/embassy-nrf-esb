@@ -24,3 +24,19 @@ fast-ru = []
 defmt = ["dep:defmt", "embassy-nrf/defmt"]
 # Timer selected via generics <T: TimerInstance>, no feature gate needed (A1)
 # PAC accessed via embassy-nrf::pac (unstable-pac feature)
+
+[dev-dependencies]
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
+cortex-m-rt = "0.7"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+
+[[example]]
+name = "ptx_basic"
+required-features = ["nrf52840", "defmt"]
+
+[[example]]
+name = "prx_basic"
+required-features = ["nrf52840", "defmt"]
