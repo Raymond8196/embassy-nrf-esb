@@ -14,6 +14,7 @@ use embassy_usb::UsbDevice;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{EsbPrx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -40,6 +41,10 @@ async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
+
+    // USB requires external HFCLK
+    pac::CLOCK.tasks_hfclkstart().write_value(1);
+    while pac::CLOCK.events_hfclkstarted().read() != 1 {}
 
     // USB CDC setup
     let driver = UsbDriver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
