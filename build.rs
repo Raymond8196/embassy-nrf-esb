@@ -11,7 +11,7 @@ fn main() {
     let memory_x = if env::var("CARGO_FEATURE_BOARD_NICENANO").is_ok() {
         include_str!("memory-nicenano.x")
     } else {
-        include_str!("memory.x")
+        include_str!("memory-dongle.x")
     };
 
     File::create(out.join("memory.x"))
@@ -19,7 +19,7 @@ fn main() {
         .write_all(memory_x.as_bytes())
         .unwrap();
     println!("cargo:rustc-link-search={}", out.display());
-    println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=memory-dongle.x");
     println!("cargo:rerun-if-changed=memory-nicenano.x");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BOARD_NICENANO");
 }
