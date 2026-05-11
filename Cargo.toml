@@ -56,3 +56,7 @@ required-features = ["nrf52840"]
 [[example]]
 name = "usb_minimal"
 required-features = ["nrf52840"]
+
+[[example]]
+name = "usb_hello"
+required-features = ["nrf52840"]

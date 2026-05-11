@@ -17,7 +17,13 @@ use embassy_nrf_esb::isr::{EsbPrx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
 use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 
-use {defmt_rtt as _, panic_probe as _};
+// No defmt_rtt — no debugger attached. Panic handler loops forever.
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {
+        cortex_m::asm::wfe();
+    }
+}
 
 mod interrupt {
     pub use embassy_nrf_esb::pac::Interrupt::*;
@@ -88,8 +94,12 @@ async fn main(spawner: Spawner) {
     unsafe { PRX_REF = Some(prx) };
 
     class.wait_connection().await;
-    let _ = class.write_packet(b"[ESB PRX] Listening...\r\n").await;
+    let _ = class.write_packet(b"[ESB PRX] Init OK\r\n").await;
 
+    // Step 1: Dump RADIO registers via USB CDC
+    dump_radio_regs(&mut class).await;
+
+    let _ = class.write_packet(b"\r\n[ESB PRX] Listening...\r\n").await;
     prx.start_listening().expect("start_listening failed");
 
     let mut rx_count: u32 = 0;
@@ -101,6 +111,37 @@ async fn main(spawner: Spawner) {
         let len = format_packet(&mut buf, rx_count, pkt.pipe(), pkt.len(), pkt.payload());
         let _ = class.write_packet(&buf[..len]).await;
     }
+}
+
+async fn dump_radio_regs(class: &mut CdcAcmClass<'static, MyUsbDriver>) {
+    let r = pac::RADIO;
+
+    let regs: [(&str, u32); 12] = [
+        ("FREQUENCY", r.frequency().read().frequency() as u32),
+        ("MODE", r.mode().read().mode() as u32),
+        ("PCNF0", r.pcnf0().read().0),
+        ("PCNF1", r.pcnf1().read().0),
+        ("CRCCNF", r.crccnf().read().0),
+        ("CRCPOLY", r.crcpoly().read().0),
+        ("CRCINIT", r.crcinit().read().0),
+        ("BASE0", r.base0().read()),
+        ("BASE1", r.base1().read()),
+        ("PREFIX0", r.prefix0().read().0),
+        ("PREFIX1", r.prefix1().read().0),
+        ("TXPOWER", r.txpower().read().0),
+    ];
+
+    let _ = class.write_packet(b"--- RADIO Registers ---\r\n").await;
+    let mut buf = [0u8; 64];
+    for (name, val) in regs {
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "  {}: 0x{:08X}\r\n", name, val);
+            w.pos
+        };
+        let _ = class.write_packet(&buf[..len]).await;
+    }
+    let _ = class.write_packet(b"--- End ---\r\n").await;
 }
 
 fn format_packet(buf: &mut [u8], count: u32, pipe: u8, len: usize, data: &[u8]) -> usize {
