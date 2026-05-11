@@ -68,3 +68,84 @@ impl EsbHeader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_header_is_zeroed() {
+        let h = EsbHeader::default();
+        assert_eq!(h.rssi, 0);
+        assert_eq!(h.pipe, 0);
+        assert_eq!(h.length, 0);
+        assert_eq!(h.pid_no_ack, 0);
+    }
+
+    #[test]
+    fn pid_roundtrip() {
+        let mut h = EsbHeader::default();
+        for pid in 0..4u8 {
+            h.set_pid(pid);
+            assert_eq!(h.pid(), pid, "pid roundtrip failed for {}", pid);
+        }
+    }
+
+    #[test]
+    fn pid_wraps_to_2_bits() {
+        let mut h = EsbHeader::default();
+        h.set_pid(0xFF);
+        assert_eq!(h.pid(), 3);
+    }
+
+    #[test]
+    fn no_ack_roundtrip() {
+        let mut h = EsbHeader::default();
+        assert!(!h.no_ack());
+        h.set_no_ack(true);
+        assert!(h.no_ack());
+        h.set_no_ack(false);
+        assert!(!h.no_ack());
+    }
+
+    #[test]
+    fn pid_and_no_ack_independent() {
+        let mut h = EsbHeader::default();
+        h.set_pid(2);
+        h.set_no_ack(true);
+        assert_eq!(h.pid(), 2);
+        assert!(h.no_ack());
+
+        h.set_no_ack(false);
+        assert_eq!(h.pid(), 2);
+        assert!(!h.no_ack());
+
+        h.set_pid(0);
+        assert_eq!(h.pid(), 0);
+        assert!(!h.no_ack());
+    }
+
+    #[test]
+    fn s1_field_bit_layout() {
+        let mut h = EsbHeader::default();
+        h.set_pid(0b11);
+        h.set_no_ack(true);
+        assert_eq!(h.pid_no_ack & 0x07, 0b111);
+
+        h.set_pid(0b10);
+        h.set_no_ack(false);
+        assert_eq!(h.pid_no_ack & 0x07, 0b100);
+    }
+
+    #[test]
+    fn consts() {
+        assert_eq!(EsbHeader::DMA_OFFSET, 2);
+        assert_eq!(EsbHeader::PAYLOAD_OFFSET, 4);
+        assert_eq!(EsbHeader::MAX_PAYLOAD, 252);
+    }
+
+    #[test]
+    fn struct_size_and_alignment() {
+        assert_eq!(core::mem::size_of::<EsbHeader>(), 4);
+    }
+}

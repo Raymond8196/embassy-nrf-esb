@@ -156,3 +156,113 @@ impl Default for EsbAddresses {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_valid_pipe_counts() {
+        for count in 1..=8u8 {
+            assert!(EsbAddresses::new(
+                [0; 4], [0; 4], [0; 8], count
+            ).is_ok());
+        }
+    }
+
+    #[test]
+    fn new_rejects_zero_pipes() {
+        let r = EsbAddresses::new([0; 4], [0; 4], [0; 8], 0);
+        assert_eq!(r.unwrap_err(), AddressError::InvalidPipeCount(0));
+    }
+
+    #[test]
+    fn new_rejects_too_many_pipes() {
+        let r = EsbAddresses::new([0; 4], [0; 4], [0; 8], 9);
+        assert_eq!(r.unwrap_err(), AddressError::InvalidPipeCount(9));
+    }
+
+    #[test]
+    fn enabled_mask_all_pipes() {
+        let addr = EsbAddresses::default();
+        assert_eq!(addr.enabled_mask(), 0xFF);
+    }
+
+    #[test]
+    fn enabled_mask_partial() {
+        let addr = EsbAddresses::new(
+            [0; 4], [0; 4], [0; 8], 3
+        ).unwrap();
+        assert_eq!(addr.enabled_mask(), 0b111);
+    }
+
+    #[test]
+    fn enabled_mask_single_pipe() {
+        let addr = EsbAddresses::new(
+            [0; 4], [0; 4], [0; 8], 1
+        ).unwrap();
+        assert_eq!(addr.enabled_mask(), 0b1);
+    }
+
+    #[test]
+    fn prefix_for_valid_pipe() {
+        let addr = EsbAddresses::default();
+        assert_eq!(addr.prefix_for_pipe(0).unwrap(), 0xE7);
+        assert_eq!(addr.prefix_for_pipe(1).unwrap(), 0xC2);
+        assert_eq!(addr.prefix_for_pipe(7).unwrap(), 0xC8);
+    }
+
+    #[test]
+    fn prefix_for_invalid_pipe() {
+        let addr = EsbAddresses::new(
+            [0; 4], [0; 4], [0; 8], 3
+        ).unwrap();
+        assert_eq!(
+            addr.prefix_for_pipe(3).unwrap_err(),
+            AddressError::InvalidPipe(3)
+        );
+    }
+
+    #[test]
+    fn default_matches_nordic_sdk() {
+        let addr = EsbAddresses::default();
+        assert_eq!(addr.pipe_count(), 8);
+        assert_eq!(addr.prefix_for_pipe(0).unwrap(), 0xE7);
+        assert_eq!(addr.prefix_for_pipe(1).unwrap(), 0xC2);
+    }
+
+    #[test]
+    fn reverse_bits_known_values() {
+        assert_eq!(reverse_bits(0x00000000), 0x00000000);
+        assert_eq!(reverse_bits(0xFFFFFFFF), 0xFFFFFFFF);
+        assert_eq!(reverse_bits(0x80000000), 0x00000001);
+        assert_eq!(reverse_bits(0x00000001), 0x80000000);
+    }
+
+    #[test]
+    fn bytewise_bit_swap_identity() {
+        assert_eq!(bytewise_bit_swap(0x00000000), 0x00000000);
+        assert_eq!(bytewise_bit_swap(0xFFFFFFFF), 0xFFFFFFFF);
+    }
+
+    #[test]
+    fn bytewise_bit_swap_reverses_within_bytes() {
+        let val = u32::from_le_bytes([0x80, 0x00, 0x00, 0x00]);
+        let swapped = bytewise_bit_swap(val);
+        let bytes = swapped.to_le_bytes();
+        assert_eq!(bytes[0], 0x01);
+    }
+
+    #[test]
+    fn base_reg_is_bit_reversed() {
+        let addr = EsbAddresses::new(
+            [0x01, 0x02, 0x03, 0x04],
+            [0; 4],
+            [0; 8],
+            1,
+        ).unwrap();
+        let reg = addr.base0_reg();
+        let expected = reverse_bits(u32::from_le_bytes([0x01, 0x02, 0x03, 0x04]));
+        assert_eq!(reg, expected);
+    }
+}

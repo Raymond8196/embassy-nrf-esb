@@ -41,7 +41,10 @@ pub enum SavedProtocolState {
     Idle,
     /// Was mid-transaction when forced to suspend.
     /// Packet was dropped; attempt count preserved for diagnostics.
-    ForcedIdle { dropped_attempt: u8 },
+    ForcedIdle {
+        /// Retransmit attempt counter at the time the packet was dropped.
+        dropped_attempt: u8,
+    },
 }
 
 const _: () = {

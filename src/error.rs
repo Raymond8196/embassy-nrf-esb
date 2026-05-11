@@ -29,3 +29,36 @@ const _: () = {
     {
     }
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_variants_are_distinct() {
+        let variants = [
+            Error::TxFull,
+            Error::RxEmpty,
+            Error::InvalidParam,
+            Error::MaxRetransmit,
+            Error::NotReady,
+            Error::InvalidAddress,
+            Error::OutOfMemory,
+            Error::Busy,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn error_is_copy() {
+        let e = Error::TxFull;
+        let e2 = e;
+        assert_eq!(e, e2);
+    }
+}
