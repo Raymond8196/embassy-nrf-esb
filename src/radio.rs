@@ -34,7 +34,6 @@ pub(crate) enum RxResult {
 ///
 /// Wraps `pac::radio::Radio` (Copy pointer). Tracks per-pipe CRC and PID
 /// for duplicate detection (PRX).
-#[allow(dead_code)]
 pub(crate) struct EsbRadio {
     radio: Radio,
     /// Last received CRC per pipe, for duplicate detection.
@@ -43,7 +42,7 @@ pub(crate) struct EsbRadio {
     last_pid: [u8; NUM_PIPES],
 }
 
-#[allow(dead_code)]
+
 impl EsbRadio {
     /// Create a new radio layer from the PAC RADIO instance.
     pub(crate) const fn new(radio: Radio) -> Self {
@@ -494,6 +493,7 @@ impl EsbRadio {
     // ---- Suspend / Resume helpers ----
 
     /// Reset duplicate detection state (for suspend/resume across MPSL timeslots).
+    #[allow(dead_code)]
     pub(crate) fn reset_detection_state(&mut self) {
         self.last_crc = [0; NUM_PIPES];
         self.last_pid = [0; NUM_PIPES];
@@ -530,6 +530,7 @@ impl EsbRadio {
     /// Get the underlying PAC Radio reference (for direct register access
     /// in exceptional cases, e.g., MPSL integration).
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn regs(&self) -> Radio {
         self.radio
     }

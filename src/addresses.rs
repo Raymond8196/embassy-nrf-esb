@@ -36,7 +36,7 @@ pub struct EsbAddresses {
     pipe_count: u8,
 }
 
-#[allow(dead_code)]
+
 impl EsbAddresses {
     /// Create a new address configuration.
     ///

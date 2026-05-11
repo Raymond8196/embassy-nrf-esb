@@ -118,7 +118,6 @@ const NO_IDX: usize = usize::MAX;
 /// ISR context only (R9).
 ///
 /// Ref: esb-ng `src/irq.rs` lines 191–310.
-#[allow(dead_code)]
 pub struct PtxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
@@ -142,7 +141,7 @@ pub struct PtxStateMachine<T: TimerInstance> {
     ack_rx_idx: usize,
 }
 
-#[allow(dead_code)]
+
 impl<T: TimerInstance> PtxStateMachine<T> {
     /// Create a new PTX state machine.
     pub(crate) fn new(
@@ -474,7 +473,6 @@ impl<T: TimerInstance> PtxStateMachine<T> {
 
 /// PRX (Primary Receiver) state machine.
 /// Ref: esb-ng `src/irq.rs` lines 312–425.
-#[allow(dead_code)]
 pub struct PrxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
@@ -490,7 +488,7 @@ pub struct PrxStateMachine<T: TimerInstance> {
     ack_tx_idx: usize,
 }
 
-#[allow(dead_code)]
+
 impl<T: TimerInstance> PrxStateMachine<T> {
     /// Create a new PRX state machine.
     pub(crate) fn new(

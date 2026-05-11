@@ -63,7 +63,7 @@ impl_timer_instance!(TIMER2, TIMER2);
 impl_timer_instance!(TIMER3, TIMER3);
 impl_timer_instance!(TIMER4, TIMER4);
 
-#[allow(dead_code)]
+
 impl<T: TimerInstance> EsbTimer<T> {
     /// Create a new ESB timer, consuming the Embassy peripheral token.
     ///
@@ -94,6 +94,7 @@ impl<T: TimerInstance> EsbTimer<T> {
     ///
     /// `pub(crate)` — not exposed outside this crate.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn regs(&self) -> Timer {
         T::regs()
     }
@@ -196,6 +197,7 @@ impl<T: TimerInstance> EsbTimer<T> {
     /// Uses CC[2] to avoid interfering with CC[0]/CC[1] which are
     /// reserved for retransmit and ACK timeout respectively.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn now(&self) -> u32 {
         let t = T::regs();
         t.tasks_capture(2).write_value(1);

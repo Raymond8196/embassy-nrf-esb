@@ -94,7 +94,7 @@ pub struct EsbPtx<
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPtx<T, N, SIZE> {}
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Sync for EsbPtx<T, N, SIZE> {}
 
-#[allow(dead_code)]
+
 impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Create a new PTX driver.
     ///
@@ -355,7 +355,7 @@ pub struct EsbPrx<
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPrx<T, N, SIZE> {}
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Sync for EsbPrx<T, N, SIZE> {}
 
-#[allow(dead_code)]
+
 impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
     /// Create a new PRX driver.
     pub fn new(
@@ -554,7 +554,7 @@ pub struct ReceivedPacket<'a, const N: usize, const SIZE: usize> {
     idx: usize,
 }
 
-#[allow(dead_code)]
+
 impl<const N: usize, const SIZE: usize> ReceivedPacket<'_, N, SIZE> {
     /// Get the pipe number.
     pub fn pipe(&self) -> u8 {

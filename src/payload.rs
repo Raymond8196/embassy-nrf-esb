@@ -44,7 +44,7 @@ pub(crate) struct Packet<const SIZE: usize> {
     data: UnsafeCell<[u8; SIZE]>,
 }
 
-#[allow(dead_code)]
+
 impl<const SIZE: usize> Packet<SIZE> {
     /// Create a zeroed packet buffer.
     pub(crate) const fn new() -> Self {
@@ -245,7 +245,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     }
 }
 
-#[allow(dead_code)]
+
 impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     /// Get the DMA pointer for a packet by index.
     ///
