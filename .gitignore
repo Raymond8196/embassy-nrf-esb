@@ -1,1 +1,4 @@
 /target
+*.hex
+*.uf2
+*_dfu.zip
