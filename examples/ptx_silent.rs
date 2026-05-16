@@ -3,6 +3,7 @@
 
 use embassy_executor::Spawner;
 use embassy_nrf::peripherals::TIMER1;
+use embassy_nrf_esb::pac;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{EsbPtx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
@@ -19,6 +20,10 @@ static mut PTX_REF: Option<&'static EsbPtx<TIMER1>> = None;
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
+
+    // RADIO requires external HFCLK
+    pac::CLOCK.tasks_hfclkstart().write_value(1);
+    while pac::CLOCK.events_hfclkstarted().read() != 1 {}
 
     let config = EsbConfig::default();
     let addresses = EsbAddresses::default();

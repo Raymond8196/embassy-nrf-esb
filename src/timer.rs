@@ -29,6 +29,8 @@ mod sealed {
 pub trait TimerInstance: sealed::Sealed + PeripheralType + 'static {
     /// Returns the PAC Timer handle (Copy pointer).
     fn regs() -> Timer;
+    /// Returns the NVIC interrupt for this timer instance.
+    fn interrupt() -> crate::pac::Interrupt;
 }
 
 /// ESB timer driver.
@@ -44,24 +46,26 @@ pub struct EsbTimer<T: TimerInstance> {
 // Ref: embassy-nrf `src/timer.rs` lines 33–52.
 
 macro_rules! impl_timer_instance {
-    ($type:ident, $pac_type:ident) => {
+    ($type:ident, $pac_type:ident, $irq:ident) => {
         impl sealed::Sealed for embassy_nrf::peripherals::$type {}
         impl TimerInstance for embassy_nrf::peripherals::$type {
             #[inline]
             fn regs() -> Timer {
-                // Same pattern as embassy-nrf's SealedInstance:
-                // convert Embassy peripheral to PAC const via from_ptr().
                 unsafe { Timer::from_ptr(crate::pac::$pac_type.as_ptr()) }
+            }
+            #[inline]
+            fn interrupt() -> crate::pac::Interrupt {
+                crate::pac::Interrupt::$irq
             }
         }
     };
 }
 
 // TIMER0 intentionally excluded — reserved for MPSL (PS §6.24).
-impl_timer_instance!(TIMER1, TIMER1);
-impl_timer_instance!(TIMER2, TIMER2);
-impl_timer_instance!(TIMER3, TIMER3);
-impl_timer_instance!(TIMER4, TIMER4);
+impl_timer_instance!(TIMER1, TIMER1, TIMER1);
+impl_timer_instance!(TIMER2, TIMER2, TIMER2);
+impl_timer_instance!(TIMER3, TIMER3, TIMER3);
+impl_timer_instance!(TIMER4, TIMER4, TIMER4);
 
 #[allow(dead_code)]
 impl<T: TimerInstance> EsbTimer<T> {
