@@ -2,32 +2,45 @@
 
 ## Hardware
 
-- **PTX (键盘侧)**: nice!nano v2 (nRF52840)
-- **PRX (Dongle 侧)**: E104-BT5040U (nRF52840)
-- **调试**: probe-rs (`probe-rs run --chip nRF52840_xxAA`)
-- **日志**: defmt RTT
+- **PTX**: E104-BT5040U (nRF52840) — serial DFU flashing
+- **PRX**: E104-BT5040U (nRF52840) — serial DFU flashing + USB CDC output
+- **调试**: USB CDC serial (无 probe-rs)
+- **日志**: defmt RTT + USB CDC 串口输出
 
-## 前置工作：Example 基础设施
+## 验证结果汇总
 
-当前项目是纯 lib crate，缺少运行 example 所需的依赖。需要补充：
+| Step | 内容 | 结果 | 备注 |
+|------|------|------|------|
+| 0-1 | 骨架 + 寄存器 | ✓ | |
+| 2 | 单包 PTX→PRX | ✓ | pipe=0, len=4, counter 递增 |
+| 3 | ACK payload 往返 | ✓ | 修复了 ACK payload 丢弃 bug |
+| 4 | 千包流 (10ms) | ✓ | 20s 5800+ 包, 0% 丢包 |
+| 5 | 重传/MaxAttempts | ✓ | PTX 拔掉后恢复通信正常 |
+| 6 | 多 pipe (0+1) | ✓ | 交替发送, 0% 丢包 |
+| 7 | Suspend/Resume | ✓ | 100 包发送 → 500ms 挂起 → 恢复, 0 丢包 |
+| 8 | 长时间稳定性 | 待做 | |
 
-### Cargo.toml 新增 dev-dependencies
+## 发现并修复的 Bug
 
-```toml
-[dev-dependencies]
-embassy-executor = { version = "0.8", features = ["arch-cortex-m", "executor-thread"] }
-cortex-m-rt = "0.7"
-defmt-rtt = "0.4"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
-static_cell = "2"
-```
+1. **RAM 起始地址** (memory-dongle.x): `0x20000000` → `0x20000008`，bootloader 保留前 8 字节
+2. **HFCLK 未启动** (ptx_silent): RADIO 需要外部高频晶振
+3. **RADIO NVIC 未 unmask** (src/isr.rs): `trigger_send()` pend 了中断但从未 enable
+4. **TIMER NVIC 未 unmask** (src/timer.rs): ACK/重传定时器中断无法触发
+5. **ACK payload 丢弃** (src/state_machine.rs): PTX 收到 ACK 后直接释放缓冲，未检查是否有 payload 数据
 
-### Example 文件结构
+## Example 文件
 
 ```
 examples/
-├── ptx_basic.rs       — Step 1-3: 基础 PTX 发送 + ACK
-├── prx_basic.rs       — Step 1-3: 基础 PRX 接收 + ACK 响应
+├── ptx_basic.rs       — Step 1-3: 基础 PTX 发送 (defmt)
+├── prx_basic.rs       — Step 1-3: 基础 PRX 接收 (defmt)
+├── ptx_silent.rs      — Stress test: 10ms 间隔发包 (无 USB)
+├── prx_usb.rs         — Stress test: USB CDC 统计输出 + ACK echo
+├── ptx_ack_echo.rs    — ACK 回环测试: USB CDC 显示收到的 ACK payload
+├── ptx_multipipe.rs   — 多 pipe 测试: pipe 0/1 交替发送
+├── ptx_suspend.rs     — Suspend/Resume 测试: 100 包发送 + 500ms 挂起循环
+└── usb_minimal.rs     — USB CDC 冒烟测试
+```
 ├── ptx_stress.rs      — Step 4-5: 千包流 + 重传测试
 ├── prx_stress.rs      — Step 4-5: 千包流 PRX 侧
 └── common.rs          — 共享地址/配置常量

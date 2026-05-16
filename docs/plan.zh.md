@@ -975,6 +975,62 @@ M0 ─→ M1 ─→ M2 ─→ M3 ─→ M4 ─→ M5 ─→ M6 ─→ M7 ─→ 
 
 > 注：硬件调试（M9）和 MPSL 集成（M10）是最大不确定性来源。如果独占模式一次通过，可能快很多；如果有隐蔽的时序 bug，可能远超估计。
 
+---
+
+## M10: MPSL 时隙适配器 — 调研结果
+
+### Rust 生态现状
+
+已有成熟的 MPSL Rust 绑定，**不需要自己写 FFI**：
+
+| Crate | 版本 | 功能 | 来源 |
+|-------|------|------|------|
+| `nrf-mpsl` | 0.3.0 | 高层 async Rust 绑定，timeslot session 管理 | [alexmoon/nrf-sdc](https://github.com/alexmoon/nrf-sdc) |
+| `nrf-mpsl-sys` | 0.2.x | bindgen 生成的底层 FFI 绑定 | 同上 |
+| `nrf-sdc` | — | BLE SoftDevice Controller 绑定 | 同上 |
+
+关键类型：
+- `SessionMem<N>` — timeslot session 所需的内存缓冲
+- `MultiprotocolServiceLayer::with_timeslots()` — 启用 timeslot 支持
+- 占用外设：RTC0, TIMER0, TEMP, PPI_CH19/30/31
+
+### 关键发现
+
+1. **没有任何 Rust 项目做过 ESB+BLE 并发** — 我们会是第一个
+2. **MPSL 是预编译闭源二进制** — 需要 nRF Connect SDK (NCS) 工具链来链接 `.a` 文件
+3. **时隙调度层需要从头写** — 参考 C 实现移植
+
+### C 参考实现
+
+| 参考 | 关键内容 |
+|------|----------|
+| [too1/ncs-esb-ble-mpsl-demo](https://github.com/too1/ncs-esb-ble-mpsl-demo) | 最直接相关。`timeslot_handler.c` 管理 session open/close、signal 处理、RADIO 仲裁 |
+| [inductivekickback/ncs_ble_esb_demo](https://github.com/inductivekickback/ncs_ble_esb_demo) | 固定长度时隙 + BLE radio notification 同步 |
+| [inductivekickback/timeslot](https://github.com/inductivekickback/timeslot) | 独立 C wrapper 库，可作设计参考 |
+
+### M10 实现路径
+
+1. 依赖 `nrf-mpsl` + `nrf-sdc`（BLE），安装 NCS 工具链
+2. 移植 `too1/timeslot_handler.c` 的调度逻辑到 Rust
+3. 在 timeslot callback 中调用 embassy-nrf-esb 的 suspend/resume API 驱动 ESB
+4. 验证 BLE 广播 + ESB 数据包在时隙内成功并发
+
+### 风险
+
+| 风险 | 可能性 | 影响 | 缓解 |
+|------|--------|------|------|
+| `nrf-mpsl` API 不完整或版本不兼容 | 中 | 高 | 先 prototype 验证基本 timeslot 请求 |
+| NCS 工具链配置复杂 | 中 | 中 | 参考 nrf-sdc 项目的 CI 配置 |
+| ZLI (priority 0) callback 与 Embassy 冲突 | 高 | 高 | 用 `Signal<RawMutex>` 从 ZLI 通知 async 任务，不调任何 Embassy API |
+| 时隙太短无法完成 ESB 事务 | 低 | 中 | TX ramp-up(140us) + payload + ACK ≈ 530us，5ms 时隙可做 9+ 事务 |
+
+### RMK 部署策略
+
+- **Dongle (PRX)**: 独占模式 — USB 专用，不需要 BLE
+- **Keyboard (PTX)**: MPSL timeslot 模式 — BLE + ESB 并发
+
+---
+
 ## 验证检查清单（每个里程碑）
 
 - [ ] `cargo fmt --all -- --check`
