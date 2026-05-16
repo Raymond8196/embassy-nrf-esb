@@ -127,7 +127,7 @@ pub struct PtxStateMachine<T: TimerInstance> {
     /// Retransmit attempt counter for the current packet.
     attempts: u8,
     /// TX pipe (typically 0 for PTX).
-    tx_pipe: u8,
+    pub(crate) tx_pipe: u8,
     /// Retransmit delay in µs (from config, minus ramp-up).
     retransmit_delay_us: u16,
     /// ACK timeout in µs (from config, plus ramp-up).
@@ -264,7 +264,18 @@ impl<T: TimerInstance> PtxStateMachine<T> {
                     if self.radio.check_ack() {
                         self.timer.disarm_retransmit();
                         self.radio.stop();
-                        self.release_ack_rx(pool);
+
+                        // Check if ACK contains payload data
+                        if self.ack_rx_idx != NO_IDX {
+                            let header = unsafe { pool.header(self.ack_rx_idx) };
+                            if header.length > 0 {
+                                // ACK has payload — deliver to app via rx_queue
+                                pool.rx_complete(self.ack_rx_idx);
+                            } else {
+                                self.release_ack_rx(pool);
+                            }
+                        }
+
                         self.release_tx(pool);
                         self.attempts = 0;
                         self.advance_pid();

@@ -243,6 +243,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
     }
 
+    /// Set the TX pipe for subsequent transmissions.
+    pub fn set_pipe(&self, pipe: u8) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.tx_pipe = pipe;
+    }
+
     /// Get current PTX state.
     pub fn state(&self) -> crate::state_machine::StatePtx {
         // SAFETY: Read-only access, state is updated atomically by ISR.

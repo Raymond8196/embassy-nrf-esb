@@ -1,0 +1,165 @@
+#![no_std]
+#![no_main]
+
+use core::fmt::Write as FmtWrite;
+
+use embassy_executor::Spawner;
+use embassy_nrf::peripherals::TIMER1;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
+use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::{bind_interrupts, peripherals, usb};
+use embassy_time::Timer;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::UsbDevice;
+
+use embassy_nrf_esb::addresses::EsbAddresses;
+use embassy_nrf_esb::config::EsbConfig;
+use embassy_nrf_esb::isr::{EsbPtx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::pac;
+use embassy_nrf_esb::payload::PacketPool;
+
+use {defmt_rtt as _, panic_probe as _};
+
+mod interrupt {
+    pub use embassy_nrf_esb::pac::Interrupt::*;
+}
+
+bind_interrupts!(struct Irqs {
+    USBD => usb::InterruptHandler<peripherals::USBD>;
+    CLOCK_POWER => usb::vbus_detect::InterruptHandler;
+});
+
+static POOL: PacketPool<DEFAULT_POOL_N, DEFAULT_POOL_SIZE> = PacketPool::new();
+static mut PTX_REF: Option<&'static EsbPtx<TIMER1>> = None;
+
+type MyUsbDriver = UsbDriver<'static, HardwareVbusDetect>;
+
+#[embassy_executor::task]
+async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
+    device.run().await;
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_nrf::init(Default::default());
+
+    pac::CLOCK.tasks_hfclkstart().write_value(1);
+    while pac::CLOCK.events_hfclkstarted().read() != 1 {}
+
+    let driver = UsbDriver::new(p.USBD, Irqs, HardwareVbusDetect::new(Irqs));
+
+    let mut usb_config = embassy_usb::Config::new(0x1209, 0x0001);
+    usb_config.manufacturer = Some("ESB Test");
+    usb_config.product = Some("PTX ACK Echo");
+    usb_config.serial_number = Some("PTX00002");
+    usb_config.max_power = 100;
+    usb_config.max_packet_size_0 = 64;
+
+    static CONFIG_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
+    static BOS_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
+    static MSOS_DESC: static_cell::StaticCell<[u8; 256]> = static_cell::StaticCell::new();
+    static CONTROL_BUF: static_cell::StaticCell<[u8; 64]> = static_cell::StaticCell::new();
+    static CDC_STATE: static_cell::StaticCell<State<'static>> = static_cell::StaticCell::new();
+
+    let mut builder = embassy_usb::Builder::new(
+        driver,
+        usb_config,
+        CONFIG_DESC.init([0; 256]),
+        BOS_DESC.init([0; 256]),
+        MSOS_DESC.init([0; 256]),
+        CONTROL_BUF.init([0; 64]),
+    );
+
+    let mut class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
+    let usb = builder.build();
+    spawner.spawn(usb_task(usb).unwrap());
+
+    let config = EsbConfig::default();
+    let addresses = EsbAddresses::default();
+
+    let ptx = {
+        static ESB: static_cell::StaticCell<EsbPtx<TIMER1>> = static_cell::StaticCell::new();
+        &*ESB.init(EsbPtx::new(
+            p.TIMER1, p.RADIO, &POOL, &config, &addresses, 0,
+        ))
+    };
+    unsafe { PTX_REF = Some(ptx) };
+
+    class.wait_connection().await;
+    let _ = class.write_packet(b"[PTX ACK] Ready\r\n").await;
+
+    let mut counter: u32 = 0;
+    let mut ack_count: u32 = 0;
+    let mut buf = [0u8; 128];
+
+    loop {
+        let payload = counter.to_le_bytes();
+        let _ = ptx.send(&payload).await;
+
+        // Check for ACK payload from PRX
+        if let Some(ack) = ptx.try_receive() {
+            ack_count += 1;
+            let ack_data = ack.payload();
+            if counter % 50 == 0 {
+                let len = {
+                    let mut w = WriteBuf::new(&mut buf);
+                    let _ = write!(w, "[ACK] #{}: data=", ack_count);
+                    for &b in ack_data.iter().take(8) {
+                        let _ = write!(w, "{:02x}", b);
+                    }
+                    let _ = write!(w, "\r\n");
+                    w.pos
+                };
+                let _ = class.write_packet(&buf[..len]).await;
+            }
+        }
+
+        if counter % 200 == 0 && counter > 0 {
+            let len = {
+                let mut w = WriteBuf::new(&mut buf);
+                let _ = write!(w, "[PTX] tx={} ack_rx={}\r\n", counter, ack_count);
+                w.pos
+            };
+            let _ = class.write_packet(&buf[..len]).await;
+        }
+
+        counter = counter.wrapping_add(1);
+        Timer::after_millis(10).await;
+    }
+}
+
+#[cortex_m_rt::interrupt]
+fn RADIO() {
+    if let Some(ptx) = unsafe { PTX_REF } {
+        ptx.on_radio_interrupt();
+    }
+}
+
+#[cortex_m_rt::interrupt]
+fn TIMER1() {
+    if let Some(ptx) = unsafe { PTX_REF } {
+        ptx.on_timer_interrupt();
+    }
+}
+
+struct WriteBuf<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+}
+
+impl<'a> WriteBuf<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+}
+
+impl core::fmt::Write for WriteBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = (self.pos + bytes.len()).min(self.buf.len());
+        let count = end - self.pos;
+        self.buf[self.pos..end].copy_from_slice(&bytes[..count]);
+        self.pos = end;
+        Ok(())
+    }
+}

@@ -3,10 +3,10 @@
 
 use embassy_executor::Spawner;
 use embassy_nrf::peripherals::TIMER1;
-use embassy_nrf_esb::pac;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{EsbPtx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -37,11 +37,24 @@ async fn main(_spawner: Spawner) {
     unsafe { PTX_REF = Some(ptx) };
 
     let mut counter: u32 = 0;
+
     loop {
-        let payload = counter.to_le_bytes();
-        let _ = ptx.send(&payload).await;
-        counter = counter.wrapping_add(1);
-        embassy_time::Timer::after_millis(10).await;
+        // Send 100 packets
+        for _ in 0..100 {
+            let payload = counter.to_le_bytes();
+            let _ = ptx.send(&payload).await;
+            counter = counter.wrapping_add(1);
+            embassy_time::Timer::after_millis(10).await;
+        }
+
+        // Suspend ESB
+        let saved = ptx.suspend().await;
+
+        // Radio off for 500ms
+        embassy_time::Timer::after_millis(500).await;
+
+        // Restore and resume
+        ptx.restore(&saved, &addresses);
     }
 }
 

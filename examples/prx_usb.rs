@@ -8,6 +8,8 @@ use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
 
@@ -30,12 +32,29 @@ bind_interrupts!(struct Irqs {
 
 static POOL: PacketPool<DEFAULT_POOL_N, DEFAULT_POOL_SIZE> = PacketPool::new();
 static mut PRX_REF: Option<&'static EsbPrx<TIMER1>> = None;
+static STATS_CH: Channel<CriticalSectionRawMutex, [u32; 3], 2> = Channel::new();
 
 type MyUsbDriver = UsbDriver<'static, HardwareVbusDetect>;
 
 #[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
     device.run().await;
+}
+
+#[embassy_executor::task]
+async fn stats_reporter(mut class: CdcAcmClass<'static, MyUsbDriver>) {
+    let mut buf = [0u8; 128];
+    loop {
+        let [rx_count, lost, _] = STATS_CH.receive().await;
+        let loss_pct = if rx_count + lost > 0 { lost as u32 * 10000 / (rx_count + lost) } else { 0 };
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "[STAT] rx={} lost={} loss={}.{}%\r\n",
+                rx_count, lost, loss_pct / 100, loss_pct % 100);
+            w.pos
+        };
+        let _ = class.write_packet(&buf[..len]).await;
+    }
 }
 
 #[embassy_executor::main]
@@ -89,28 +108,41 @@ async fn main(spawner: Spawner) {
 
     class.wait_connection().await;
     let _ = class.write_packet(b"[ESB PRX] Listening...\r\n").await;
+    spawner.spawn(stats_reporter(class).unwrap());
 
     prx.start_listening().expect("start_listening failed");
 
     let mut rx_count: u32 = 0;
-    let mut buf = [0u8; 128];
+    let mut lost: u32 = 0;
+    let mut last_counter: Option<u32> = None;
+    let mut report_interval: u32 = 0;
     loop {
         let pkt = prx.receive().await;
         rx_count += 1;
+        report_interval += 1;
 
-        let len = format_packet(&mut buf, rx_count, pkt.pipe(), pkt.len(), pkt.payload());
-        let _ = class.write_packet(&buf[..len]).await;
-    }
-}
+        let data = pkt.payload();
+        let pipe = pkt.pipe();
+        if data.len() >= 4 {
+            let counter = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+            if let Some(prev) = last_counter {
+                let gap = counter.wrapping_sub(prev);
+                if gap > 1 && gap < 0x8000_0000 {
+                    lost += gap - 1;
+                }
+            }
+            last_counter = Some(counter);
 
-fn format_packet(buf: &mut [u8], count: u32, pipe: u8, len: usize, data: &[u8]) -> usize {
-    let mut w = WriteBuf::new(buf);
-    let _ = write!(w, "[RX] #{}: pipe={} len={} data=", count, pipe, len);
-    for &b in data.iter().take(32) {
-        let _ = write!(w, "{:02x}", b);
+            // Echo counter back as ACK payload
+            let ack_payload = counter.to_le_bytes();
+            let _ = prx.send_ack_payload(pipe, &ack_payload).await;
+        }
+
+        if report_interval >= 200 {
+            report_interval = 0;
+            let _ = STATS_CH.try_send([rx_count, lost, 0]);
+        }
     }
-    let _ = write!(w, "\r\n");
-    w.pos
 }
 
 struct WriteBuf<'a> {

@@ -38,7 +38,12 @@ async fn main(_spawner: Spawner) {
 
     let mut counter: u32 = 0;
     loop {
-        let payload = counter.to_le_bytes();
+        let pipe = (counter % 2) as u8;
+        ptx.set_pipe(pipe);
+        // payload: [pipe_byte, 0, 0, 0, counter_le_bytes..]
+        let mut payload = [0u8; 8];
+        payload[0] = pipe;
+        payload[4..8].copy_from_slice(&counter.to_le_bytes());
         let _ = ptx.send(&payload).await;
         counter = counter.wrapping_add(1);
         embassy_time::Timer::after_millis(10).await;
