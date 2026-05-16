@@ -119,6 +119,9 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         let esb_timer = EsbTimer::new(timer);
         let sm = PtxStateMachine::new(radio, esb_timer, config, tx_pipe);
 
+        enable_radio_irq();
+        unsafe { cortex_m::peripheral::NVIC::unmask(T::interrupt()) };
+
         Self {
             sm: UnsafeCell::new(sm),
             pool,
@@ -372,6 +375,9 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         let esb_timer = EsbTimer::new(timer);
         let enabled_pipes = addresses.enabled_mask();
         let sm = PrxStateMachine::new(radio, esb_timer, config, enabled_pipes);
+
+        enable_radio_irq();
+        unsafe { cortex_m::peripheral::NVIC::unmask(T::interrupt()) };
 
         Self {
             sm: UnsafeCell::new(sm),
