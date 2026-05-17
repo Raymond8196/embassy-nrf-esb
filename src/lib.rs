@@ -39,6 +39,9 @@ pub mod state_machine;
 pub mod suspend;
 pub mod timer;
 
+#[cfg(feature = "mpsl")]
+pub mod mpsl_timeslot;
+
 // Re-export driver types from isr module
 pub mod isr;
 

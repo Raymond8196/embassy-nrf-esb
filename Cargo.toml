@@ -13,7 +13,10 @@ embassy-nrf = { version = "0.10", features = ["unstable-pac"] }
 embassy-sync = "0.8"
 cortex-m = { version = "0.7", default-features = false }
 defmt = { version = "0.3", optional = true }
-nrf-mpsl = { version = "0.3", optional = true, default-features = false }
+# nrf-mpsl: tracked via git because crates.io 0.3.0 still pins embassy-nrf 0.7,
+# while this crate uses 0.10. The git head migrated nrf-mpsl to embassy-nrf 0.10.
+# Pin to a known-good SHA for reproducibility.
+nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
 
 [features]
 # Chip selection (only nrf52840 implemented initially, others reserved)
@@ -26,15 +29,21 @@ board-nicenano = []
 # Functional options
 fast-ru = []
 defmt = ["dep:defmt", "embassy-nrf/defmt", "nrf-mpsl?/defmt"]
-# MPSL timeslot integration (M10) — gated; off by default
-mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section"]
+# MPSL timeslot integration (M10) — gated; off by default.
+# Brings nrf-mpsl's critical-section impl; mutually exclusive with `_cs-cortex`.
+mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section-impl"]
+# Internal: enables cortex-m's critical-section-single-core impl for examples
+# that do NOT use mpsl. Library code does not depend on this; required by the
+# M9 example binaries (ptx_basic, prx_basic, etc.) so they link a cs provider.
+# Mutually exclusive with `mpsl`.
+_cs-cortex = ["cortex-m/critical-section-single-core"]
 
 [dev-dependencies]
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { version = "0.10", features = ["nrf52840", "unstable-pac", "time", "time-driver-rtc1"] }
 embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
 embassy-usb = "0.6"
-cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m = { version = "0.7", default-features = false }
 cortex-m-rt = "0.7"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
@@ -42,20 +51,48 @@ static_cell = "2"
 
 [[example]]
 name = "ptx_basic"
-required-features = ["nrf52840", "defmt"]
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
 
 [[example]]
 name = "prx_basic"
-required-features = ["nrf52840", "defmt"]
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
 
 [[example]]
 name = "prx_usb"
-required-features = ["nrf52840"]
+required-features = ["nrf52840", "_cs-cortex"]
 
 [[example]]
 name = "ptx_silent"
-required-features = ["nrf52840"]
+required-features = ["nrf52840", "_cs-cortex"]
 
 [[example]]
 name = "usb_minimal"
-required-features = ["nrf52840"]
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "ptx_ack_echo"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "ptx_multipipe"
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
+
+[[example]]
+name = "ptx_suspend"
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
+
+[[example]]
+name = "mpsl_smoke"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_request_basic"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_request_chained"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_ptx_in_slot"
+required-features = ["nrf52840", "defmt", "mpsl"]

@@ -28,10 +28,12 @@
 //! ```
 
 use core::cell::UnsafeCell;
+#[allow(unused_imports)]
+use core::future::poll_fn;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::Poll;
 
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
+use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::addresses::EsbAddresses;
 use crate::config::EsbConfig;
@@ -89,8 +91,8 @@ pub struct EsbPtx<
     max_attempts_flag: AtomicBool,
     /// Set by app to request ISR to stop after current transaction.
     suspend_requested: AtomicBool,
-    /// Signaled by ISR when it goes idle with suspend_requested set.
-    suspend_signal: Signal<CriticalSectionRawMutex, ()>,
+    /// Woken by ISR when it goes idle with suspend_requested set.
+    suspend_signal: AtomicWaker,
 }
 
 // SAFETY: Placed in static by user. All ISR access is single-threaded.
@@ -132,7 +134,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
             timer_flag: AtomicBool::new(false),
             max_attempts_flag: AtomicBool::new(false),
             suspend_requested: AtomicBool::new(false),
-            suspend_signal: Signal::new(),
+            suspend_signal: AtomicWaker::new(),
         }
     }
 
@@ -156,7 +158,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
 
         if suppress && sm.state() == crate::state_machine::StatePtx::Idle {
-            self.suspend_signal.signal(());
+            self.suspend_signal.wake();
         }
 
         // Clear any latched RADIO pending bit to prevent spurious re-entry
@@ -306,7 +308,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
 
         // Set the flag so ISR will suppress new TX after current transaction.
-        self.suspend_signal.reset();
         self.suspend_requested.store(true, Ordering::Release);
 
         // Re-check under IRQ-disabled to close the race window where
@@ -321,8 +322,19 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
         enable_radio_irq();
 
-        // ISR is running and will see suspend_requested — wait for signal.
-        self.suspend_signal.wait().await;
+        // ISR is running and will see suspend_requested — wait for wake.
+        core::future::poll_fn(|cx| {
+            self.suspend_signal.register(cx.waker());
+            // SAFETY: Read-only state check, ISR may be updating concurrently
+            // but the read is atomic-ish for the purpose of detecting idle.
+            let sm = unsafe { &*self.sm.get() };
+            if sm.state() == crate::state_machine::StatePtx::Idle {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
 
         // ISR is done and state is idle — finalize
         disable_radio_irq();
@@ -361,8 +373,8 @@ pub struct EsbPrx<
     timer_flag: AtomicBool,
     /// Set by app to request ISR to stop after current ACK TX.
     suspend_requested: AtomicBool,
-    /// Signaled by ISR when it returns to Receiver/Idle with suspend_requested set.
-    suspend_signal: Signal<CriticalSectionRawMutex, ()>,
+    /// Woken by ISR when it returns to Receiver/Idle with suspend_requested set.
+    suspend_signal: AtomicWaker,
 }
 
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPrx<T, N, SIZE> {}
@@ -394,7 +406,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             pool,
             timer_flag: AtomicBool::new(false),
             suspend_requested: AtomicBool::new(false),
-            suspend_signal: Signal::new(),
+            suspend_signal: AtomicWaker::new(),
         }
     }
 
@@ -411,13 +423,13 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         sm.handle_radio_event(self.pool, timer_flag);
 
         // If suspend was requested and we're in a suspendable state
-        // (Idle or Receiver), signal the waiting async task.
+        // (Idle or Receiver), wake the waiting async task.
         if self.suspend_requested.load(Ordering::Acquire) {
             let state = sm.state();
             if state == crate::state_machine::StatePrx::Idle
                 || state == crate::state_machine::StatePrx::Receiver
             {
-                self.suspend_signal.signal(());
+                self.suspend_signal.wake();
             }
         }
 
@@ -518,7 +530,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             return saved;
         }
 
-        self.suspend_signal.reset();
         self.suspend_requested.store(true, Ordering::Release);
 
         // Re-check under IRQ-disabled to close the race window where
@@ -536,7 +547,19 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         }
         enable_radio_irq();
 
-        self.suspend_signal.wait().await;
+        core::future::poll_fn(|cx| {
+            self.suspend_signal.register(cx.waker());
+            let sm = unsafe { &*self.sm.get() };
+            let state = sm.state();
+            if state == crate::state_machine::StatePrx::Idle
+                || state == crate::state_machine::StatePrx::Receiver
+            {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
 
         disable_radio_irq();
         let sm = unsafe { &mut *self.sm.get() };
