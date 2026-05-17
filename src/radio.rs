@@ -3,6 +3,9 @@
 //! Thin abstraction over nRF RADIO peripheral registers, adapted from
 //! esb-ng `src/peripherals.rs` for nrf-pac 0.3.
 //!
+//! Portions adapted from [esb-ng](https://github.com/jamesmunns/esb)
+//! (MIT OR Apache-2.0). See `NOTICE.md` for attribution.
+//!
 //! This module handles raw register I/O only. Protocol logic (state machine,
 //! duplicate detection, grant management) lives in `state_machine.rs`.
 

@@ -61,4 +61,36 @@ buffer ────────────────────────�
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+
+### Third-party notices
+
+Portions of `src/timer.rs`, `src/radio.rs`, and `src/isr.rs` are adapted from
+the [esb-ng](https://github.com/jamesmunns/esb) crate (MIT OR Apache-2.0).
+See [NOTICE.md](NOTICE.md) for full attribution.
+
+The optional `mpsl` Cargo feature links against `libmpsl.a`, a pre-compiled
+binary library provided by Nordic Semiconductor under the Nordic-5-Clause
+license. This restricts use to Nordic Semiconductor integrated circuits
+(the nRF52 series). Without the `mpsl` feature, this crate is pure Rust under
+MIT OR Apache-2.0.
+
+### Trademarks
+
+"Enhanced ShockBurst" and "ESB" are trademarks of Nordic Semiconductor ASA.
+This library is an independent implementation compatible with Nordic's ESB
+radio protocol and is not affiliated with or endorsed by Nordic Semiconductor
+ASA.

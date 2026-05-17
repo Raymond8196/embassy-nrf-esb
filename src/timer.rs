@@ -7,6 +7,9 @@
 //! Uses Embassy generic pattern for timer selection — no feature gates.
 //! TIMER0 is excluded (reserved for MPSL).
 //!
+//! Portions adapted from [esb-ng](https://github.com/jamesmunns/esb)
+//! (MIT OR Apache-2.0). See `NOTICE.md` for attribution.
+//!
 //! Ref: esb-ng `src/peripherals.rs` lines 500–684.
 //! Ref: nRF52840 PS §6.24 TIMER.
 

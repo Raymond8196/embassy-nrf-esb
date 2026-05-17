@@ -5,6 +5,10 @@
 //! - `EsbPrx`: async PRX driver with `receive().await`
 //! - ISR handler methods called from `#[interrupt]` handlers
 //!
+//! The RADIO ISR re-entry guard and TIMER → RADIO pending pattern are adapted
+//! from [esb-ng](https://github.com/jamesmunns/esb) (MIT OR Apache-2.0).
+//! See `NOTICE.md` for attribution.
+//!
 //! # Single-ISR-context architecture (R9)
 //!
 //! All ESB state machine logic runs in the RADIO ISR. The TIMER ISR is
