@@ -376,6 +376,11 @@ pub async fn run_chained_slots(
 
 // ---- PTX-in-timeslot ----
 
+use crate::addresses::EsbAddresses;
+use crate::config::EsbConfig;
+use crate::header::EsbHeader;
+use crate::radio::EsbRadio;
+
 use core::cell::UnsafeCell;
 
 /// Result of a PTX timeslot session.
@@ -768,5 +773,429 @@ pub async fn run_ptx_slots(
         counters: state.counters,
         tx_count: state.tx_count,
         ack_ok_count: state.ack_ok_count,
+    })
+}
+
+// ---- PRX-in-timeslot ----
+
+const NUM_PIPES: usize = 8;
+
+/// Result of a PRX timeslot session.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PrxSlotResult {
+    pub counters: SignalCounters,
+    pub rx_count: u32,
+    pub dup_count: u32,
+    pub bad_crc_count: u32,
+}
+
+/// Phase within a single PRX timeslot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrxPhase {
+    Idle,
+    Receiving,
+    TxAck,
+    TxRepeatedAck,
+}
+
+struct PrxInnerState {
+    counters: SignalCounters,
+    done: bool,
+    waker: WakerRegistration,
+    request: raw::mpsl_timeslot_request_t,
+    return_param: raw::mpsl_timeslot_signal_return_param_t,
+    in_slot_match_us: u32,
+    target_count: u32,
+    config: Option<EsbConfig>,
+    addresses: Option<EsbAddresses>,
+    phase: PrxPhase,
+    rx_count: u32,
+    dup_count: u32,
+    bad_crc_count: u32,
+    last_pid: [u8; NUM_PIPES],
+    last_crc: [u16; NUM_PIPES],
+    enabled_pipes: u8,
+    slot_active: bool,
+}
+
+unsafe impl Send for PrxInnerState {}
+unsafe impl Sync for PrxInnerState {}
+
+struct PrxState {
+    inner: Mutex<Timer0RawMutex, RefCell<PrxInnerState>>,
+}
+
+static PRX_STATE: PrxState = PrxState::new();
+
+#[repr(C, align(4))]
+struct PrxBuffers {
+    rx: UnsafeCell<[u8; 256]>,
+    ack_tx: UnsafeCell<[u8; 256]>,
+}
+unsafe impl Sync for PrxBuffers {}
+
+#[unsafe(link_section = ".data")]
+static PRX_BUFS: PrxBuffers = PrxBuffers {
+    rx: UnsafeCell::new([0u8; 256]),
+    ack_tx: UnsafeCell::new([0u8; 256]),
+};
+
+impl PrxState {
+    const fn new() -> Self {
+        Self {
+            inner: Mutex::new(RefCell::new(PrxInnerState {
+                counters: SignalCounters::ZERO,
+                done: false,
+                waker: WakerRegistration::new(),
+                request: raw::mpsl_timeslot_request_t {
+                    request_type: raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8,
+                    params: raw::mpsl_timeslot_request_t__bindgen_ty_1 {
+                        earliest: raw::mpsl_timeslot_request_earliest_t {
+                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8,
+                            priority: raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8,
+                            length_us: 0,
+                            timeout_us: 1_000_000,
+                        },
+                    },
+                },
+                return_param: raw::mpsl_timeslot_signal_return_param_t {
+                    callback_action: 0,
+                    params: raw::mpsl_timeslot_signal_return_param_t__bindgen_ty_1 {
+                        request: raw::mpsl_timeslot_signal_return_param_t__bindgen_ty_1__bindgen_ty_1 {
+                            p_next: core::ptr::null_mut(),
+                        },
+                    },
+                },
+                in_slot_match_us: 5500,
+                target_count: 0,
+                config: None,
+                addresses: None,
+                phase: PrxPhase::Idle,
+                rx_count: 0,
+                dup_count: 0,
+                bad_crc_count: 0,
+                last_pid: [0; NUM_PIPES],
+                last_crc: [0; NUM_PIPES],
+                enabled_pipes: 0x01,
+                slot_active: false,
+            })),
+        }
+    }
+
+    fn with_inner<F: FnOnce(&mut PrxInnerState) -> R, R>(&self, f: F) -> R {
+        self.inner.lock(|inner| {
+            let mut inner = inner.borrow_mut();
+            f(&mut inner)
+        })
+    }
+}
+
+unsafe extern "C" fn prx_timeslot_callback(
+    session_id: u8,
+    signal: u32,
+) -> *mut raw::mpsl_timeslot_signal_return_param_t {
+    match signal {
+        raw::MPSL_TIMESLOT_SIGNAL_START => PRX_STATE.with_inner(|state| {
+            state.counters.start += 1;
+            state.slot_active = true;
+
+            let r = pac::RADIO;
+            r.power().write(|w| w.set_power(false));
+            r.power().write(|w| w.set_power(true));
+
+            let mut radio = EsbRadio::new(pac::RADIO);
+            radio.init(state.config.as_ref().unwrap(), state.addresses.as_ref().unwrap());
+            radio.restore_pid_state(state.last_pid);
+            radio.restore_crc_state(state.last_crc);
+
+            // Set up RX with disabled_txen shortcut (auto ACK after receive).
+            let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+            let dma_ptr = unsafe { rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
+            radio.start_receiving(state.enabled_pipes, dma_ptr);
+
+            // Arm TIMER0 for slot end.
+            let t = pac::TIMER0;
+            t.events_compare(0).write_value(0);
+            t.cc(0).write_value(state.in_slot_match_us);
+            t.intenset().write(|w| w.set_compare(0, true));
+
+            state.phase = PrxPhase::Receiving;
+
+            unsafe {
+                cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
+            }
+
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+            &mut state.return_param as *mut _
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_RADIO => PRX_STATE.with_inner(|state| {
+            state.counters.radio += 1;
+
+            let r = pac::RADIO;
+            let disabled = r.events_disabled().read() == 1;
+
+            match state.phase {
+                PrxPhase::Receiving if disabled => {
+                    r.events_disabled().write_value(0);
+                    compiler_fence(Ordering::Acquire);
+
+                    // Check CRC.
+                    if r.crcstatus().read().crcstatus()
+                        == pac::radio::vals::Crcstatus::CRCERROR
+                    {
+                        state.bad_crc_count += 1;
+                        // Restart RX: stop radio, re-enable shortcuts, start RX again.
+                        let mut radio = EsbRadio::new(pac::RADIO);
+                        radio.stop();
+                        let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                        let dma_ptr = unsafe {
+                            rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                        };
+                        radio.start_receiving(state.enabled_pipes, dma_ptr);
+                    } else {
+                        // CRC OK — read metadata from DMA buffer.
+                        let rx_buf = unsafe { &*PRX_BUFS.rx.get() };
+                        let pid_no_ack = rx_buf[EsbHeader::DMA_OFFSET + 1];
+                        let pid = (pid_no_ack >> 1) & 0x03;
+                        let no_ack = (pid_no_ack & 0x01) != 0;
+                        let pipe = r.rxmatch().read().rxmatch() as usize;
+                        let crc = r.rxcrc().read().rxcrc() as u16;
+
+                        let is_dup = pipe < NUM_PIPES
+                            && state.last_crc[pipe] == crc
+                            && state.last_pid[pipe] == pid;
+
+                        if is_dup {
+                            state.dup_count += 1;
+                            if no_ack {
+                                // Dup NoAck — stop TX ramp, restart RX.
+                                let mut radio = EsbRadio::new(pac::RADIO);
+                                radio.stop();
+                                let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                                let dma_ptr = unsafe {
+                                    rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                                };
+                                radio.start_receiving(state.enabled_pipes, dma_ptr);
+                            } else {
+                                // Dup with ACK — send fallback ACK.
+                                let mut radio = EsbRadio::new(pac::RADIO);
+                                radio.setup_ack_tx_fallback(pipe as u8);
+                                state.phase = PrxPhase::TxRepeatedAck;
+                            }
+                        } else {
+                            // New packet.
+                            if pipe < NUM_PIPES {
+                                state.last_pid[pipe] = pid;
+                                state.last_crc[pipe] = crc;
+                            }
+                            state.rx_count += 1;
+
+                            if no_ack {
+                                // NoAck — stop TX ramp, restart RX.
+                                let mut radio = EsbRadio::new(pac::RADIO);
+                                radio.stop();
+                                let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                                let dma_ptr = unsafe {
+                                    rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                                };
+                                radio.start_receiving(state.enabled_pipes, dma_ptr);
+                            } else {
+                                // Need ACK — send fallback empty ACK.
+                                let mut radio = EsbRadio::new(pac::RADIO);
+                                radio.setup_ack_tx_fallback(pipe as u8);
+                                state.phase = PrxPhase::TxAck;
+                            }
+                        }
+                    }
+                }
+
+                PrxPhase::TxAck if disabled => {
+                    r.events_disabled().write_value(0);
+                    compiler_fence(Ordering::Acquire);
+
+                    // ACK sent — restart RX.
+                    let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                    let dma_ptr = unsafe {
+                        rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                    };
+                    let mut radio = EsbRadio::new(pac::RADIO);
+                    radio.complete_rx_ack(dma_ptr);
+                    state.phase = PrxPhase::Receiving;
+                }
+
+                PrxPhase::TxRepeatedAck if disabled => {
+                    r.events_disabled().write_value(0);
+                    compiler_fence(Ordering::Acquire);
+
+                    // Repeated ACK sent — restart RX.
+                    let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                    let dma_ptr = unsafe {
+                        rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                    };
+                    let mut radio = EsbRadio::new(pac::RADIO);
+                    radio.complete_rx_ack(dma_ptr);
+                    state.phase = PrxPhase::Receiving;
+                }
+
+                _ => {}
+            }
+
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+            &mut state.return_param as *mut _
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_TIMER0 => PRX_STATE.with_inner(|state| {
+            state.counters.timer0 += 1;
+            state.slot_active = false;
+
+            let t = pac::TIMER0;
+            t.events_compare(0).write_value(0);
+            t.intenclr().write(|w| w.set_compare(0, true));
+
+            // Stop RADIO cleanly.
+            let mut radio = EsbRadio::new(pac::RADIO);
+            radio.stop();
+
+            // Save duplicate detection state for next slot.
+            state.last_pid = radio.save_pid_state();
+            state.last_crc = radio.save_crc_state();
+
+            state.phase = PrxPhase::Idle;
+
+            let chain = state.target_count > 0 && state.counters.start < state.target_count;
+            if chain {
+                state.return_param.callback_action =
+                    raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                state.return_param.params.request.p_next =
+                    core::ptr::from_mut(&mut state.request);
+            } else {
+                state.done = true;
+                state.waker.wake();
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+            }
+            &mut state.return_param as *mut _
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_SESSION_IDLE => PRX_STATE.with_inner(|state| {
+            state.counters.session_idle += 1;
+            state.waker.wake();
+            core::ptr::null_mut()
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_BLOCKED | raw::MPSL_TIMESLOT_SIGNAL_CANCELLED => {
+            let request = PRX_STATE.with_inner(|state| {
+                if signal == raw::MPSL_TIMESLOT_SIGNAL_BLOCKED {
+                    state.counters.blocked += 1;
+                } else {
+                    state.counters.cancelled += 1;
+                }
+                state.request.params.earliest.priority =
+                    raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
+                state.request.params.earliest.timeout_us =
+                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
+                core::ptr::from_ref(&state.request)
+            });
+            let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+            assert!(ret == 0);
+            core::ptr::null_mut()
+        }
+
+        raw::MPSL_TIMESLOT_SIGNAL_SESSION_CLOSED => PRX_STATE.with_inner(|state| {
+            state.counters.session_closed += 1;
+            state.done = true;
+            state.waker.wake();
+            core::ptr::null_mut()
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => {
+            panic!("PRX timeslot overstayed");
+        }
+
+        _ => PRX_STATE.with_inner(|state| {
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+            &mut state.return_param as *mut _
+        }),
+    }
+}
+
+/// Run PRX reception inside chained timeslots.
+///
+/// Each timeslot power-cycles the RADIO, inits ESB, and listens for
+/// incoming packets. ACK is sent automatically for each received packet.
+/// After `count` slots, returns cumulative results.
+/// Duplicate detection state is preserved across slot boundaries.
+pub async fn run_prx_slots(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_length_us: u32,
+    in_slot_match_us: u32,
+    count: u32,
+    enabled_pipes: u8,
+) -> PrxSlotResult {
+    let mut session_id: u8 = 0;
+    let ret = unsafe {
+        raw::mpsl_timeslot_session_open(
+            Some(prx_timeslot_callback),
+            (&mut session_id) as *mut _,
+        )
+    };
+    RetVal::from(ret).to_result().unwrap();
+
+    let _drop = OnDrop::new(|| {
+        let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
+    });
+
+    PRX_STATE.with_inner(|state| {
+        state.counters = SignalCounters::ZERO;
+        state.done = false;
+        state.target_count = count;
+        state.in_slot_match_us = in_slot_match_us;
+        state.config = Some(config.clone());
+        state.addresses = Some(addresses.clone());
+        state.phase = PrxPhase::Idle;
+        state.rx_count = 0;
+        state.dup_count = 0;
+        state.bad_crc_count = 0;
+        state.last_pid = [0; NUM_PIPES];
+        state.last_crc = [0; NUM_PIPES];
+        state.enabled_pipes = enabled_pipes;
+        state.slot_active = false;
+        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+        state.request.params.earliest.length_us = slot_length_us;
+        state.request.params.earliest.timeout_us = 1_000_000;
+    });
+
+    let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+    let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+    RetVal::from(ret).to_result().unwrap();
+
+    poll_fn(|cx| {
+        PRX_STATE.with_inner(|state| {
+            state.waker.register(cx.waker());
+            if state.done {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+    })
+    .await;
+
+    _drop.defuse();
+    unsafe {
+        let ret = raw::mpsl_timeslot_session_close(session_id);
+        RetVal::from(ret).to_result().unwrap();
+    }
+
+    PRX_STATE.with_inner(|state| PrxSlotResult {
+        counters: state.counters,
+        rx_count: state.rx_count,
+        dup_count: state.dup_count,
+        bad_crc_count: state.bad_crc_count,
     })
 }

@@ -137,6 +137,23 @@ impl<'d, ...> EsbTimeslotPrx<'d, ...> {
 
 **关键语义**：`receive()` 在 slot 关闭期间挂起；slot 开窗后恢复监听；收到包立即唤醒。对调用方完全透明。
 
+### 3.4 Wrap/Unwrap 可逆生命周期
+
+```rust
+// wrap：独占 → timeslot 模式
+let esb_ts = EsbTimeslot::wrap(esb, &mpsl, cfg);
+
+// unwrap：timeslot → 独占模式（三模热切换场景）
+let esb = esb_ts.unwrap();  // session_close + RADIO 恢复 → 返还原始 EsbPtx/EsbPrx
+esb.send(&payload).await?;  // 回到独占模式，零开销
+```
+
+**设计约束**：
+- `unwrap()` 必须等当前 timeslot 结束（如有活跃 slot），执行 `session_close`，恢复 RADIO 到独占状态。
+- `unwrap()` 后返还的 `EsbPtx`/`EsbPrx` 行为与 wrap 前完全一致——PID、地址配置、pipe 状态均保留。
+- wrap/unwrap 可多次调用（BLE↔USB 热切换场景），无资源泄漏。
+- `EsbTimeslot` 采用 move 语义持有 `EsbPtx`/`EsbPrx`，wrap 后原始实例不可用，unwrap 后 `EsbTimeslot` 不可用——编译期保证同一时刻只有一种模式活跃。
+
 ### 3.4 Observable Hints
 
 参考 [`embassy-net::Stack::is_link_up()`](https://docs.embassy.dev/embassy-net/git/default/struct.Stack.html#method.is_link_up) 的设计哲学：库暴露状态，不强加 policy。
@@ -343,7 +360,7 @@ examples/
 5. **Observable hints 实现**：`slot_started.signal()` 在 SIGNAL_START 末尾；`slot_ended.signal()` 在 SIGNAL_TIMER0 入口。这两个 signal 用 atomic flag + waker（不用 Embassy Signal，避免 P0 critical section）。
 6. `mpsl_prx_in_slot.rs` example：PRX 在 timeslot 内监听，每收一包通过 USB CDC 报告 + 包内计数器。对侧用 M9 `ptx_silent.rs`（独占）每 10 ms 发一包。
 
-**测试验证**：
+**测试验证（功能验证层——见 §5.1 两层指标）**：
 - **基础接收**：60 秒（6000 个副手包）主手收到 ≥ 4000（67%）。注：这个数字反映 timeslot 占空比（slot 6ms / 周期 10ms = 60% 窗口），不是丢包率。
 - **窗口内丢包率**：只统计 slot_active 时段内的包，丢包率 < 1%（与独占模式相当）。
 - **窗口外丢包**：BLE 段（slot 外）副手发的包，PRX 显式不接收（验证 slot 关闭后 RADIO 确实 disable）。
@@ -351,6 +368,8 @@ examples/
   - `slot_active()` 在 SIGNAL_START 与 SIGNAL_TIMER0 之间返回 true。
   - `slot_started/slot_ended` Signal 边沿与 GPIO 探针同步。
 - **回归**：M9 `prx_usb` 独占模式 5 分钟流测仍 100% 通过。
+
+> 键盘场景指标（端到端 0 按键丢失、< 15ms 延迟）在 Step 8 验证。
 
 **失败排查**：
 1. 主手完全收不到：`SIGNAL_START` 内 `tasks_rxen = 1` 没触发——逻辑分析仪测 RADIO STATE 寄存器；可能 RADIO POWER cycle 后 base/prefix 地址寄存器需重写。
@@ -399,11 +418,13 @@ examples/
 3. 设 BLE connection interval 30 ms、slave latency 3。
 4. ESB timeslot 用 `Chained` 模式 + Normal 优先级（BLE 用 HIGH 自动抢占）。
 
-**测试验证**：
+**测试验证（功能验证层——保守 BLE 参数 CI=30ms/SL=3，见 §5.1）**：
 - 用 nRF Connect mobile app 扫到广告、连上、订阅 GATT echo 特征——**1 分钟稳定无断连**。
-- **GATT echo 延迟**：发字节回字节，平均往返 < 100 ms。
+- **GATT echo 往返延迟** < 100 ms（功能验证门槛，非键盘目标）。
 - **ESB 接收率**：与 Step 5 / 6 相比下降 ≤ 30%（绝对值 ≥ 50% 副手发出量；剩余靠副手重传补齐）。
 - **0 panic、0 OVERSTAYED、0 assert**：连续跑 30 分钟。
+
+> 键盘场景 BLE 参数（CI=7.5ms/SL=0）和延迟指标在 Step 8 切换验证。
 
 **失败排查**：
 1. BLE 广告不可见：检查 nrf-sdc 与 nrf-mpsl 版本兼容（同 repo `Cargo.toml` workspace 看一致版本）。
@@ -412,21 +433,28 @@ examples/
 
 ---
 
-### Step 8: 端到端分体场景（1 天）
+### Step 8: 端到端分体场景（1.5 天）
 
-**目标**：复现真实使用——副手独占 PTX → 主手 timeslot PRX + BLE 连接 PC。
+**目标**：复现真实键盘使用——副手独占 PTX → 主手 timeslot PRX + BLE 连接 PC。**切换到键盘级 BLE 参数，验证 §5.1 键盘场景指标。**
 
 **做什么**：
 1. **副手**：M9 `ptx_silent.rs`，每 10 ms 发计数器递增 payload（独占 ESB，无 BLE）。
-2. **主手**：Step 7 的 `mpsl_prx_ble.rs`，PRX 输出经 USB CDC + GATT notify 双通道转发。
-3. **PC**：USB CDC 监控丢包率 + nRF Connect 监控 GATT notify。
+2. **主手**：Step 7 的 `mpsl_prx_ble.rs`，**BLE 参数切换为 CI=7.5ms / SL=0**，PRX 输出经 USB CDC + GATT notify 双通道转发。
+3. **PC**：USB CDC 监控丢包率 + nRF Connect 监控 GATT notify + 延迟测量。
 
-**测试验证**：
+**测试验证——功能验证层**：
 - 60 秒（6000 副手包）：
   - 主手通过 USB CDC 收到 ≥ 4000（占空比基线）。
   - GATT notify 接收 ≥ 90% 主手已收的包（BLE 通路也工作）。
 - 主动断开 BLE 连接：ESB 接收率应**回升到接近 Step 5/6 水平**（BLE idle 占用变小）。
 - 主动重连 BLE：ESB 接收率回到 Step 7 水平。
+
+**测试验证——键盘场景层（§5.1 指标，须优于全 BLE 基线）**：
+- **端到端 0 按键丢失**：副手以 10ms 间隔发 1000 个递增序号包（模拟按键），主手端到端交付后序号无缺失（ESB 重传 + 应用层确认兜底）。
+- **GATT 单程延迟 < 8 ms**：主手收到 ESB 包后打时间戳，GATT notify 到 PC 后打时间戳，CI=7.5ms 下平均 < 8ms。
+- **GATT 往返延迟 < 16 ms**：PC 发 echo → 主手回 → PC 收到，CI=7.5ms 下平均 < 16ms。
+- **ESB 副手→主手单程 < 2 ms**：GPIO 探针测副手 TX trigger → 主手 RX complete 间隔（全 BLE 基线 3.75ms avg，ESB 须明显优于此）。
+- **端到端按键延迟 avg < 8 ms / worst < 12 ms**：副手按键扫描 → 主手 BLE notify 到达 PC（全 BLE 基线 avg ~8.5ms / worst ~16ms，ESB+BLE 方案须全面优于）。
 
 ---
 
@@ -439,10 +467,61 @@ examples/
 - 每 10 万包 defmt 一次累积统计（USB CDC log 到文件）。
 
 **测试验证**：
-- ≥ 99.5% 副手包被主手接收（含上层重试视角）。
+- **端到端 0 按键丢失**（8 小时持续，应用层确认交付 100%）。
 - 0 panic、0 OVERSTAYED、0 INVALID_RETURN。
 - buffer pool 自由数量稳定（仿 M9 Step 8）。
 - BLE 连接全程不断（或断了能 < 5 s 重连）。
+- GATT notify 延迟 8 小时内无漂移（P99 < 15 ms，CI=7.5ms）。
+
+---
+
+## 5.1 验证指标分层：功能验证 vs 键盘场景
+
+> Step 0–4 属基础设施验证，指标只需"能工作、不崩"。
+> Step 5–9 涉及 PRX + BLE 共存，需区分**功能验证指标**（证明 adapter 正确）和**键盘场景指标**（证明满足应用需求）。
+
+### 方案对比：ESB+BLE vs 全 BLE
+
+| | 全 BLE（基线） | ESB+BLE（本方案） | 优势 |
+|--|---------------|-------------------|------|
+| 副手→主手平均延迟 | 3.75 ms (BLE CI=7.5ms) | **1–2 ms** (ESB) | 延迟砍半 |
+| 副手→主手最坏延迟 | 7.5 ms | **~2 ms** + slot 等待 | 抖动更小 |
+| 主手→PC 延迟 | 3.75 ms (BLE) | 3.75 ms (BLE) | 相同 |
+| **端到端平均** | **~8.5 ms** | **~6–7 ms** | 快 ~2 ms |
+| **端到端最坏** | **~16 ms** | **~11 ms** | 快 ~5 ms |
+| 副手功耗 | 需维持 BLE CI 心跳 | ESB 仅有键时发包 | 显著更低 |
+| 副手 Flash/RAM | BLE 协议栈 ~60KB/~20KB | 无需 BLE 协议栈 | 简化固件 |
+| 主手 radio 调度 | 双 BLE 连接（Central+Peripheral） | ESB timeslot + 单 BLE | 更简单可控 |
+| 重传延迟 | 等下一个 CI (7.5ms) | ESB auto-retransmit ~250µs | 快 30x |
+
+> ESB+BLE 方案的核心价值：用 ESB 替代副手链路的 BLE，在延迟、功耗、固件复杂度三个维度同时优于全 BLE。
+> 主手→PC 段仍用 BLE（兼容性需要），瓶颈在 BLE CI 下限 7.5ms，两个方案相同。
+
+### 典型延迟参考
+
+| 环节 | 全 BLE | ESB+BLE |
+|------|--------|---------|
+| 按键矩阵扫描 | ~1 ms | ~1 ms |
+| 副手→主手 | 3.75 ms avg / 7.5 ms worst | **1–2 ms** avg / **~2 ms** worst |
+| 主手→PC (BLE CI=7.5ms) | 3.75 ms avg / 7.5 ms worst | 3.75 ms avg / 7.5 ms worst |
+| **端到端** | **~8.5 ms avg / ~16 ms worst** | **~6–7 ms avg / ~11 ms worst** |
+
+人体感知阈值 ~30–50ms；< 10ms 端到端为优秀，< 15ms 良好，< 30ms 可接受。
+
+### 两层指标定义
+
+| 指标 | 功能验证（Step 5–7 当前定位） | 键盘场景（Step 8 必须达标） | 全 BLE 基线 |
+|------|-------------------------------|----------------------------|------------|
+| BLE conn interval | 30 ms（保守测共存） | **7.5 ms** | 7.5 ms |
+| BLE slave latency | 3 | **0** | 0 |
+| GATT 单程延迟 | < 50 ms | **< 8 ms** | < 8 ms |
+| GATT 往返延迟 | < 100 ms | **< 16 ms** | < 16 ms |
+| ESB 按键交付 | slot 内丢包 < 1%（射频层） | **端到端 0 按键丢失** | — |
+| 副手→主手单程 | 不考核 | **< 2 ms**（须优于 BLE 的 3.75ms avg） | 3.75 ms avg |
+| 端到端按键延迟 | 不考核 | **avg < 8 ms / worst < 12 ms**（须优于全 BLE 的 8.5/16ms） | avg ~8.5 ms / worst ~16 ms |
+
+> **注**：slot 内丢包率是射频物理层指标，反映信道质量；键盘 0 丢失靠 ESB auto-retransmit + 应用层重试兜底，两者不矛盾。
+> 占空比导致的"slot 外丢包"不是丢包——副手在主手 slot 外发的包本就不期望被收到，由副手重传机制补偿。
 
 ---
 
@@ -457,10 +536,10 @@ examples/
 | T4 | PTX-in-timeslot + PID save/restore | Step 3-4 通过 | 2 天 |
 | T5 | PRX-in-timeslot + Observable hints | Step 5 通过 | 1.5 天 |
 | T6 | PRX multi-pipe + ACK payload | Step 6 通过 | 1 天 |
-| T7 | nrf-sdc 接入 + BLE 共存 | Step 7-8 通过 | 2 天 |
+| T7 | nrf-sdc 接入 + BLE 共存 + 键盘场景指标 | Step 7-8 通过 | 2.5 天 |
 | T8 | 过夜 + `docs/m10-verification.md` 收尾 | — | 1.5 天 |
 
-**累计 11 天**。原 plan.md 估 5–7 天是范围只覆盖 PTX 单向的估算；本计划扩到 PRX 双向 + 真实 BLE 共存，对应**乐观 10 / 悲观 14 / 最可能 11–12 天**。
+**累计 11.5 天**。原 plan.md 估 5–7 天是范围只覆盖 PTX 单向的估算；本计划扩到 PRX 双向 + 真实 BLE 共存 + 键盘场景指标验证，对应**乐观 10 / 悲观 14 / 最可能 11–12 天**。
 
 ---
 
@@ -476,6 +555,7 @@ examples/
 8. RADIO ISR 等价物（处理 SIGNAL_RADIO）可重入，无静态可变状态（除 STATE）。
 9. Observable hints（slot_started / slot_ended / slot_active）只在 STATE.with_inner 内更新。
 10. 独占模式编译路径必须与 `mpsl` feature 完全解耦——`#[cfg(not(feature = "mpsl"))]` 守护所有 mpsl-only 代码；M9 examples 不带 mpsl feature 仍 100% 通过。
+11. `EsbTimeslot` wrap/unwrap 必须可逆——`unwrap()` 后返还的 `EsbPtx`/`EsbPrx` 状态（PID、地址、pipe 配置）与 wrap 前一致；多次 wrap/unwrap 循环无资源泄漏。这是三模热切换（BLE↔USB）的基础约束。
 
 ---
 

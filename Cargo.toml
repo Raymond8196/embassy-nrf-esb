@@ -96,3 +96,15 @@ required-features = ["nrf52840", "defmt", "mpsl"]
 [[example]]
 name = "mpsl_ptx_in_slot"
 required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_prx_in_slot"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "ptx_debug"
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
+
+[[example]]
+name = "prx_debug"
+required-features = ["nrf52840", "defmt", "_cs-cortex"]
