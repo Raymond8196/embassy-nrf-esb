@@ -412,6 +412,8 @@ struct PtxInnerState {
     ack_ok_count: u32,
     tx_pipe: u8,
     payload_byte: u8,
+    packets_per_slot: u32,
+    packets_sent_this_slot: u32,
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -472,6 +474,8 @@ impl PtxState {
                 ack_ok_count: 0,
                 tx_pipe: 0,
                 payload_byte: 0,
+                packets_per_slot: 1,
+                packets_sent_this_slot: 0,
             })),
         }
     }
@@ -503,19 +507,17 @@ unsafe extern "C" fn ptx_timeslot_callback(
             radio.init(state.config.as_ref().unwrap(), state.addresses.as_ref().unwrap());
             radio.restore_pid_state([state.pid; 8]);
 
-            // Prepare TX buffer.
+            // Prepare TX buffer — payload is a u32 packet counter (LE).
             let tx_buf = unsafe { &mut *PTX_BUFS.tx.get() };
-            let payload_len: usize = 4;
             let dma_off = crate::header::EsbHeader::DMA_OFFSET;
-            tx_buf[0] = 0;
-            tx_buf[1] = 0;
-            tx_buf[dma_off] = payload_len as u8;
-            tx_buf[dma_off + 1] = (state.pid << 1) & 0x06;
             let p_off = crate::header::EsbHeader::PAYLOAD_OFFSET;
-            tx_buf[p_off] = state.payload_byte;
-            tx_buf[p_off + 1] = state.payload_byte;
-            tx_buf[p_off + 2] = state.payload_byte;
-            tx_buf[p_off + 3] = state.payload_byte;
+            let counter = state.tx_count;
+            tx_buf[dma_off] = 4;
+            tx_buf[dma_off + 1] = (state.pid << 1) & 0x06;
+            tx_buf[p_off] = counter as u8;
+            tx_buf[p_off + 1] = (counter >> 8) as u8;
+            tx_buf[p_off + 2] = (counter >> 16) as u8;
+            tx_buf[p_off + 3] = (counter >> 24) as u8;
 
             // Arm TIMER0 for slot end.
             let t = pac::TIMER0;
@@ -527,6 +529,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
             let dma_ptr = unsafe { tx_buf.as_mut_ptr().add(dma_off) };
             radio.transmit(state.tx_pipe, dma_ptr, true);
             state.tx_count += 1;
+            state.packets_sent_this_slot = 1;
 
             // Ensure RADIO NVIC is unmasked so MPSL delivers SIGNAL_RADIO.
             unsafe {
@@ -572,19 +575,53 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
                     state.pid = (state.pid + 1) & 0x03;
                     state.payload_byte = state.payload_byte.wrapping_add(1);
+                    state.packets_sent_this_slot += 1;
 
-                    // Stop radio.
-                    r.shorts().modify(|w| {
-                        w.set_ready_start(false);
-                        w.set_end_disable(false);
-                    });
-                    r.intenclr().write(|w| w.set_disabled(true));
-                    r.tasks_disable().write_value(1);
-                    while r.events_disabled().read() == 0 {}
-                    r.events_disabled().write_value(0);
-                    compiler_fence(Ordering::Acquire);
+                    if state.packets_sent_this_slot < state.packets_per_slot {
+                        // Send next packet within this slot.
+                        state.phase = PtxPhase::Tx;
+                        let counter = state.tx_count;
+                        state.tx_count += 1;
 
-                    state.phase = PtxPhase::Done;
+                        let tx_buf = unsafe { &mut *PTX_BUFS.tx.get() };
+                        let dma_off = crate::header::EsbHeader::DMA_OFFSET;
+                        let p_off = crate::header::EsbHeader::PAYLOAD_OFFSET;
+                        tx_buf[dma_off] = 4;
+                        tx_buf[dma_off + 1] = (state.pid << 1) & 0x06;
+                        tx_buf[p_off] = counter as u8;
+                        tx_buf[p_off + 1] = (counter >> 8) as u8;
+                        tx_buf[p_off + 2] = (counter >> 16) as u8;
+                        tx_buf[p_off + 3] = (counter >> 24) as u8;
+
+                        r.shorts().modify(|w| w.set_disabled_rxen(true));
+                        r.intenset().write(|w| w.set_disabled(true));
+                        r.txaddress().write(|w| w.set_txaddress(state.tx_pipe));
+                        r.rxaddresses().write_value(pac::radio::regs::Rxaddresses(
+                            1 << state.tx_pipe,
+                        ));
+                        let dma_ptr = unsafe { tx_buf.as_mut_ptr().add(dma_off) };
+                        r.packetptr().write_value(dma_ptr as u32);
+                        r.events_address().write_value(0);
+                        r.events_disabled().write_value(0);
+                        r.events_ready().write_value(0);
+                        r.events_end().write_value(0);
+                        r.events_payload().write_value(0);
+                        compiler_fence(Ordering::Release);
+                        r.tasks_txen().write_value(1);
+                    } else {
+                        // All packets for this slot done — stop radio.
+                        r.shorts().modify(|w| {
+                            w.set_ready_start(false);
+                            w.set_end_disable(false);
+                        });
+                        r.intenclr().write(|w| w.set_disabled(true));
+                        r.tasks_disable().write_value(1);
+                        while r.events_disabled().read() == 0 {}
+                        r.events_disabled().write_value(0);
+                        compiler_fence(Ordering::Acquire);
+
+                        state.phase = PtxPhase::Done;
+                    }
                 }
                 _ => {}
             }
@@ -600,7 +637,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
             t.events_compare(0).write_value(0);
             t.intenclr().write(|w| w.set_compare(0, true));
 
-            let chain = state.target_count > 0 && state.tx_count < state.target_count;
+            let chain = state.target_count > 0 && state.counters.start < state.target_count;
             if chain {
                 state.return_param.callback_action =
                     raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
@@ -669,6 +706,7 @@ pub async fn run_ptx_slots(
     in_slot_match_us: u32,
     count: u32,
     tx_pipe: u8,
+    packets_per_slot: u32,
 ) -> PtxSlotResult {
     let mut session_id: u8 = 0;
     let ret = unsafe {
@@ -695,6 +733,8 @@ pub async fn run_ptx_slots(
         state.ack_ok_count = 0;
         state.tx_pipe = tx_pipe;
         state.payload_byte = 0;
+        state.packets_per_slot = packets_per_slot;
+        state.packets_sent_this_slot = 0;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;

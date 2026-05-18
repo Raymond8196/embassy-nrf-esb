@@ -1,13 +1,13 @@
-//! M10 Step 3: PTX transmission inside MPSL timeslots (USB CDC).
+//! M10 Step 3+4: PTX transmission inside MPSL timeslots (USB CDC).
 //!
 //! Each 6 ms timeslot power-cycles the RADIO, inits ESB registers,
-//! sends 1 ACK packet, and waits for ACK. Runs 2000 chained slots
-//! (~12 s at 6 ms each).
+//! sends up to 10 ACK packets back-to-back, and waits for ACKs.
+//! Runs 100 chained slots (~600 ms at 6 ms each), 1000 total packets.
 //!
-//! Pass criteria (docs/m10-plan.md Step 3):
-//!   - 2000 slots completed, tx_count == 2000.
-//!   - ack_ok_count > 0 if a PRX is listening (else 0 is expected).
-//!   - 0 OVERSTAYED.
+//! Pass criteria (docs/m10-plan.md Step 4):
+//!   - 100 slots completed, tx_count >= 900, 0 OVERSTAYED.
+//!   - PID continuity across slot boundaries verified by PRX.
+//!   - PRX duplicates == 0 (requires M9 prx_usb on second board).
 
 #![no_std]
 #![no_main]
@@ -177,8 +177,8 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    // Run 100 PTX timeslots (6 ms each, chained).
-    let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 6000, 5500, 100, 0).await;
+    // Run 100 PTX timeslots (6 ms each, chained), 10 packets per slot.
+    let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 6000, 5500, 100, 0, 10).await;
 
     {
         let mut buf = [0u8; 256];
