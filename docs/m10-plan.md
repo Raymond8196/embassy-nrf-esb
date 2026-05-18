@@ -398,6 +398,20 @@ examples/
 - 每个副手收到 ACK payload ≥ 700 / 500 自己发的包（注：副手按 timeslot 占空比也会丢一部分）。
 - ACK payload 内容正确（counter 单调）。
 
+**实测结果（两 dongle，单 PTX 顺序跑 pipe 0 / pipe 1 各 50 slot × 10 pkt，slot=9ms / match=8.5ms）**：
+
+```
+pipe=0 tx=400 ack=350 ackpl=350 ctr=350 inv=0 blk=0 can=0
+pipe=1 tx=351 ack=300 ackpl=300 ctr=349 inv=0 blk=0 can=0
+```
+
+- **功能项全过**：多 pipe RX（两 pipe 都收到并发回 ACK）、ACK payload TX（`ack == ackpl`）、counter 单调（`inv == 0`、PRX 端跨 slot 持续递增）、0 panic / OVERSTAYED。
+- **slot 容量低于 plan 估算**：实测 ESB cycle ≈ 1ms（plan 假设 ~500us），9ms slot 仅装 ~8 cycle。剩余的 ~50 个 TX 最后一个 cycle 的 ACK 在 `TIMER0` 切 slot 时被切掉（已加 TIMER0 wind-down，状态干净但 ACK 丢）。
+- **通用化收尾**：
+  - PRX example 改为单次 `run_prx_slots(count=u32::MAX)`，外层不再 `loop {}`，避免 `ack_counter` 周期重置。
+  - PTX adapter 在 `SIGNAL_TIMER0` 里增加 in-flight radio wind-down（若 `phase != Idle/Done` 则 `tasks_disable` + 等 `events_disabled`），保证 slot 边界 RADIO 状态干净。
+- **cycle ≈ 1ms 偏长**遗留为后续优化（怀疑 SIGNAL_RADIO 派发延迟 / 慢 ramp-up），不影响 Step 6 功能验收。
+
 ---
 
 ### Step 7: BLE 共存（nrf-sdc 真实广告 + 连接）（2 天）

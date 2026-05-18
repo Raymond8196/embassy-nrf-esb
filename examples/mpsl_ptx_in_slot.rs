@@ -177,20 +177,23 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    // Run 100 PTX timeslots (6 ms each, chained), 10 packets per slot.
-    let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 6000, 5500, 100, 0, 10).await;
+    // Two phases: pipe 0 then pipe 1, 50 slots × 10 pkts = 500 per pipe.
+    // Slot is sized so 10 ESB cycles fit with margin before in_slot_match_us;
+    // last cycle's ACK lands before TIMER0 chains the next slot.
+    for pipe in 0u8..2 {
+        let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 9000, 8500, 50, pipe, 10).await;
 
-    {
         let mut buf = [0u8; 256];
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "tx={} ack={} st={} t0={} radio={} blk={} can={}\r\n",
+            "pipe={} tx={} ack={} ackpl={} ctr={} inv={} blk={} can={}\r\n",
+            pipe,
             r.tx_count,
             r.ack_ok_count,
-            r.counters.start,
-            r.counters.timer0,
-            r.counters.radio,
+            r.ack_payload_count,
+            r.last_ack_counter,
+            r.ack_inversions,
             r.counters.blocked,
             r.counters.cancelled,
         );

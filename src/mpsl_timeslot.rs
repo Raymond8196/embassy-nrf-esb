@@ -390,6 +390,9 @@ pub struct PtxSlotResult {
     pub counters: SignalCounters,
     pub tx_count: u32,
     pub ack_ok_count: u32,
+    pub ack_payload_count: u32,
+    pub ack_inversions: u32,
+    pub last_ack_counter: u32,
 }
 
 /// Phase within a single PTX timeslot.
@@ -419,6 +422,9 @@ struct PtxInnerState {
     payload_byte: u8,
     packets_per_slot: u32,
     packets_sent_this_slot: u32,
+    ack_payload_count: u32,
+    ack_inversions: u32,
+    last_ack_counter: u32,
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -481,6 +487,9 @@ impl PtxState {
                 payload_byte: 0,
                 packets_per_slot: 1,
                 packets_sent_this_slot: 0,
+                ack_payload_count: 0,
+                ack_inversions: 0,
+                last_ack_counter: 0,
             })),
         }
     }
@@ -576,6 +585,23 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
                     if crc_ok {
                         state.ack_ok_count += 1;
+
+                        let rx_buf = unsafe { &*PTX_BUFS.rx.get() };
+                        let length = rx_buf[EsbHeader::DMA_OFFSET] as usize;
+                        if length >= 4 {
+                            let p = EsbHeader::PAYLOAD_OFFSET;
+                            let counter = u32::from_le_bytes([
+                                rx_buf[p],
+                                rx_buf[p + 1],
+                                rx_buf[p + 2],
+                                rx_buf[p + 3],
+                            ]);
+                            state.ack_payload_count += 1;
+                            if counter < state.last_ack_counter {
+                                state.ack_inversions += 1;
+                            }
+                            state.last_ack_counter = counter;
+                        }
                     }
 
                     state.pid = (state.pid + 1) & 0x03;
@@ -641,6 +667,25 @@ unsafe extern "C" fn ptx_timeslot_callback(
             let t = pac::TIMER0;
             t.events_compare(0).write_value(0);
             t.intenclr().write(|w| w.set_compare(0, true));
+
+            // Wind down any in-flight radio op so the slot ends in a clean
+            // state. Otherwise mid-cycle RX (waiting for ACK) would be
+            // clobbered by the next slot's power_cycle.
+            if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
+                let r = pac::RADIO;
+                r.shorts().modify(|w| {
+                    w.set_ready_start(false);
+                    w.set_end_disable(false);
+                    w.set_disabled_rxen(false);
+                    w.set_disabled_txen(false);
+                });
+                r.intenclr().write(|w| w.set_disabled(true));
+                r.tasks_disable().write_value(1);
+                while r.events_disabled().read() == 0 {}
+                r.events_disabled().write_value(0);
+                compiler_fence(Ordering::Acquire);
+                state.phase = PtxPhase::Done;
+            }
 
             let chain = state.target_count > 0 && state.counters.start < state.target_count;
             if chain {
@@ -736,6 +781,9 @@ pub async fn run_ptx_slots(
         state.phase = PtxPhase::Idle;
         state.tx_count = 0;
         state.ack_ok_count = 0;
+        state.ack_payload_count = 0;
+        state.ack_inversions = 0;
+        state.last_ack_counter = 0;
         state.tx_pipe = tx_pipe;
         state.payload_byte = 0;
         state.packets_per_slot = packets_per_slot;
@@ -773,6 +821,9 @@ pub async fn run_ptx_slots(
         counters: state.counters,
         tx_count: state.tx_count,
         ack_ok_count: state.ack_ok_count,
+        ack_payload_count: state.ack_payload_count,
+        ack_inversions: state.ack_inversions,
+        last_ack_counter: state.last_ack_counter,
     })
 }
 
@@ -788,6 +839,7 @@ pub struct PrxSlotResult {
     pub rx_count: u32,
     pub dup_count: u32,
     pub bad_crc_count: u32,
+    pub rx_per_pipe: [u32; NUM_PIPES],
 }
 
 /// Phase within a single PRX timeslot.
@@ -817,6 +869,8 @@ struct PrxInnerState {
     last_crc: [u16; NUM_PIPES],
     enabled_pipes: u8,
     slot_active: bool,
+    ack_counter: [u32; NUM_PIPES],
+    rx_per_pipe: [u32; NUM_PIPES],
 }
 
 unsafe impl Send for PrxInnerState {}
@@ -879,6 +933,8 @@ impl PrxState {
                 last_crc: [0; NUM_PIPES],
                 enabled_pipes: 0x01,
                 slot_active: false,
+                ack_counter: [0; NUM_PIPES],
+                rx_per_pipe: [0; NUM_PIPES],
             })),
         }
     }
@@ -979,9 +1035,24 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 };
                                 radio.start_receiving(state.enabled_pipes, dma_ptr);
                             } else {
-                                // Dup with ACK — send fallback ACK.
+                                // Dup with ACK — re-send same counter (retransmit).
+                                let counter = if pipe < NUM_PIPES {
+                                    state.ack_counter[pipe]
+                                } else {
+                                    0
+                                };
+                                let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
+                                ack_buf[EsbHeader::DMA_OFFSET] = 4;
+                                ack_buf[EsbHeader::DMA_OFFSET + 1] = 0;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET] = counter as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 1] = (counter >> 8) as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 2] = (counter >> 16) as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 3] = (counter >> 24) as u8;
+                                let dma_ptr = unsafe {
+                                    ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                                };
                                 let mut radio = EsbRadio::new(pac::RADIO);
-                                radio.setup_ack_tx_fallback(pipe as u8);
+                                radio.setup_ack_tx(pipe as u8, dma_ptr);
                                 state.phase = PrxPhase::TxRepeatedAck;
                             }
                         } else {
@@ -989,6 +1060,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                             if pipe < NUM_PIPES {
                                 state.last_pid[pipe] = pid;
                                 state.last_crc[pipe] = crc;
+                                state.rx_per_pipe[pipe] += 1;
                             }
                             state.rx_count += 1;
 
@@ -1002,9 +1074,25 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 };
                                 radio.start_receiving(state.enabled_pipes, dma_ptr);
                             } else {
-                                // Need ACK — send fallback empty ACK.
+                                // Need ACK — send monotonic counter as payload.
+                                let counter = if pipe < NUM_PIPES {
+                                    state.ack_counter[pipe] += 1;
+                                    state.ack_counter[pipe]
+                                } else {
+                                    0
+                                };
+                                let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
+                                ack_buf[EsbHeader::DMA_OFFSET] = 4;
+                                ack_buf[EsbHeader::DMA_OFFSET + 1] = 0;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET] = counter as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 1] = (counter >> 8) as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 2] = (counter >> 16) as u8;
+                                ack_buf[EsbHeader::PAYLOAD_OFFSET + 3] = (counter >> 24) as u8;
+                                let dma_ptr = unsafe {
+                                    ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
+                                };
                                 let mut radio = EsbRadio::new(pac::RADIO);
-                                radio.setup_ack_tx_fallback(pipe as u8);
+                                radio.setup_ack_tx(pipe as u8, dma_ptr);
                                 state.phase = PrxPhase::TxAck;
                             }
                         }
@@ -1163,6 +1251,8 @@ pub async fn run_prx_slots(
         state.last_crc = [0; NUM_PIPES];
         state.enabled_pipes = enabled_pipes;
         state.slot_active = false;
+        state.ack_counter = [0; NUM_PIPES];
+        state.rx_per_pipe = [0; NUM_PIPES];
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
@@ -1197,5 +1287,6 @@ pub async fn run_prx_slots(
         rx_count: state.rx_count,
         dup_count: state.dup_count,
         bad_crc_count: state.bad_crc_count,
+        rx_per_pipe: state.rx_per_pipe,
     })
 }
