@@ -95,6 +95,43 @@ Pass criteria for the current first pass:
 - PTX reports nonzero `ack` and `ackpl` counts against the PRX running `mpsl_prx_ble`.
 - No panic, MPSL assert, or overstay reset during a 5 minute smoke run.
 
+## Hardware Results
+
+Date: 2026-05-19
+
+Hardware: two E104-BT5040U nRF52840 dongles, serial DFU via `nrfutil`.
+
+Flashing notes:
+
+- Built `mpsl_prx_ble` and `mpsl_ptx_in_slot` with `nrf52840,defmt,mpsl`.
+- Converted ELF outputs to Intel HEX with `arm-none-eabi-objcopy`.
+- Packaged unsigned app-only DFU zips with `nrfutil pkg generate --hw-version 52 --sd-req 0x00`.
+- Flashed over `/dev/ttyACM*` using `nrfutil dfu serial --baud-rate 115200 --flow-control 0`.
+
+Step 7 observations:
+
+- Advertising-only diagnostic build of `mpsl_prx_ble` was visible as `ESB M10` in nRF Connect.
+- Full `mpsl_prx_ble` with PRX timeslot session also remained visible as `ESB M10`.
+- `mpsl_ptx_in_slot` USB CDC output against full `mpsl_prx_ble`:
+
+```text
+pipe=0 tx=418 ack=414 ackpl=414 ctr=1 inv=0 blk=0 can=0
+pipe=1 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+DONE
+```
+
+Result:
+
+- BLE advertising + ESB PRX timeslot coexistence is partially validated.
+- Pipe 0 ACK payload works while BLE advertising remains visible.
+- Pipe 1 failed in this run, so multi-pipe Step 7 is not passed yet.
+
+Follow-up:
+
+- Re-run PTX/PRX with pipe 0 only to establish a clean coexistence baseline.
+- Investigate why pipe 1 gets `ack=0` against `mpsl_prx_ble`; compare with prior `mpsl_prx_in_slot` Step 6 behavior.
+- Keep BLE advertising visible during the next PTX run to confirm coexistence over a longer window.
+
 ## Pending Work
 
 - Extend Step 7 from advertising-only coexistence to BLE connection stability.
