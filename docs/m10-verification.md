@@ -217,9 +217,32 @@ DONE
 
 - Result: advertising-only BLE coexistence is visible and both ESB pipes ACK with payloads. Throughput is lower than the prior 12 ms manual-ACK tuning run, but pipe 1 no longer fails completely.
 
+BLE-only connectable diagnostic:
+
+- Added `mpsl_ble_connectable`, a diagnostic example that runs MPSL + nrf-sdc connectable advertising without ESB timeslots.
+- Initial `ADV_IND` + SDC peripheral support advertised as `ESB CONN` but did not stay connected from nRF Connect.
+- Adding `peripheral_count(1)` and minimal ATT/SMP/L2CAP handlers made the device connect, but nRF Connect repeatedly issued Read By Group Type requests until ATT discovery responses were completed.
+- After adding Generic Access service discovery and Device Name characteristic responses, `ESB CONN` connected and stayed connected in nRF Connect.
+- Conclusion: SDC connectable advertising requires at least a small host-side ATT/L2CAP responder for the nRF Connect smoke test. The next Step 7 increment is to merge this minimal responder into `mpsl_prx_ble` before reintroducing ESB PRX timeslots under a BLE connection.
+
+Connectable PRX + ESB timeslot combined run:
+
+- Merged the minimal responder into `mpsl_prx_ble`: `ADV_IND`, SDC peripheral support, `peripheral_count(1)`, event masks, and minimal ATT/SMP/L2CAP handling for Generic Access + Device Name discovery.
+- Flashed `mpsl_prx_ble` and `mpsl_ptx_in_slot`.
+- nRF Connect connected to `ESB M10` and stayed connected.
+- `mpsl_ptx_in_slot` USB CDC output while BLE stayed connected:
+
+```text
+pipe=0 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+pipe=1 tx=67 ack=15 ackpl=15 ctr=29 inv=0 blk=0 can=0
+DONE
+```
+
+- Result: BLE connection stability first pass is achieved, but ESB PRX timeslot throughput regressed severely under an active BLE connection. This is expected to need timeslot duty-cycle tuning or connection interval/latency changes before Step 7 passes the ESB receive-rate target.
+
 ## Pending Work
 
-- Extend Step 7 from advertising-only coexistence to BLE connection stability.
+- Tune BLE connection parameters and ESB timeslot scheduling so `ESB M10` remains connected while `mpsl_ptx_in_slot` gets useful ACK coverage on both pipes.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.

@@ -1,35 +1,90 @@
-//! M10 Step 7 first pass: PRX-in-timeslot plus nrf-sdc BLE advertising.
+//! M10 Step 7 diagnostic: nrf-sdc connectable advertising without ESB.
 //!
-//! This is intentionally smaller than the final Step 7 target. It proves the
-//! same MPSL instance can service both ESB PRX timeslots and the Nordic
-//! SoftDevice Controller. Use nRF Connect to scan for the `ESB M10` advertiser
-//! while a second board runs `mpsl_ptx_in_slot`.
+//! This isolates BLE peripheral setup from ESB timeslot activity. Use nRF
+//! Connect to scan for `ESB CONN` and connect. Defmt logs report the SDC memory
+//! requirement, advertising enable status, and basic HCI connection events.
 
 #![no_std]
 #![no_main]
 
+use core::fmt::Write as FmtWrite;
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use bt_hci::cmd::SyncCmd;
-use bt_hci::cmd::controller_baseband::SetEventMask;
 use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
+use bt_hci::cmd::controller_baseband::SetEventMask;
+use bt_hci::event::EventPacket;
 use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, EventMask, LeEventMask};
+use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::mode::Blocking;
-use embassy_nrf::{bind_interrupts, pac, peripherals, rng};
-use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
+use embassy_nrf::{bind_interrupts, pac, peripherals, rng, usb};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_usb::UsbDevice;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals, SessionMem};
 use nrf_sdc::vendor::ZephyrWriteBdAddr;
 use nrf_sdc::{self as sdc, SoftdeviceController};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use embassy_nrf_esb::addresses::EsbAddresses;
-use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::run_prx_slots;
-
 type Rng = rng::Rng<'static, Blocking>;
+
+static CONN_HANDLE: AtomicU16 = AtomicU16::new(0xffff);
+static LOGS: Channel<ThreadModeRawMutex, LogLine, 16> = Channel::new();
+
+#[derive(Clone, Copy)]
+struct LogLine {
+    len: usize,
+    bytes: [u8; 96],
+}
+
+impl LogLine {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+struct WriteBuf {
+    buf: [u8; 96],
+    pos: usize,
+}
+
+impl WriteBuf {
+    fn new() -> Self {
+        Self { buf: [0; 96], pos: 0 }
+    }
+
+    fn finish(self) -> LogLine {
+        LogLine { len: self.pos, bytes: self.buf }
+    }
+}
+
+impl core::fmt::Write for WriteBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = (self.pos + bytes.len()).min(self.buf.len());
+        let count = end - self.pos;
+        self.buf[self.pos..end].copy_from_slice(&bytes[..count]);
+        self.pos = end;
+        Ok(())
+    }
+}
+
+macro_rules! usb_log {
+    ($($arg:tt)*) => {{
+        let mut w = WriteBuf::new();
+        let _ = writeln!(w, $($arg)*);
+        let _ = LOGS.try_send(w.finish());
+    }};
+}
 
 bind_interrupts!(struct Irqs {
     RNG => rng::InterruptHandler<peripherals::RNG>;
+    USBD => usb::InterruptHandler<peripherals::USBD>;
     EGU0_SWI0 => nrf_mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_mpsl::ClockInterruptHandler;
     RADIO => nrf_mpsl::HighPrioInterruptHandler;
@@ -43,13 +98,69 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 }
 
 #[embassy_executor::task]
+async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>) {
+    device.run().await
+}
+
+#[embassy_executor::task]
+async fn log_task(mut class: CdcAcmClass<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>) {
+    class.wait_connection().await;
+    loop {
+        let line = LOGS.receive().await;
+        for chunk in line.as_slice().chunks(64) {
+            let _ = class.write_packet(chunk).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
 async fn sdc_task(sdc: &'static SoftdeviceController<'static>) -> ! {
     let mut evt_buf = [0u8; sdc::raw::HCI_MSG_BUFFER_MAX_SIZE as usize];
     loop {
         match sdc.hci_get(&mut evt_buf).await {
+            Ok(bt_hci::PacketKind::Event) => log_hci_event(&evt_buf),
             Ok(bt_hci::PacketKind::AclData) => handle_acl(sdc, &evt_buf),
-            Ok(_) => {}
+            Ok(kind) => defmt::debug!("HCI packet kind={:?}", kind),
             Err(e) => defmt::warn!("sdc hci_get error: {:?}", e),
+        }
+    }
+}
+
+fn log_hci_event(buf: &[u8]) {
+    match <EventPacket<'_> as bt_hci::FromHciBytes>::from_hci_bytes(buf) {
+        Ok((packet, _)) => {
+            let event_len = packet.data.len() + 2;
+            log_hci_event_packet(packet, event_len);
+        }
+        Err(_) => defmt::warn!("failed to parse HCI event"),
+    }
+}
+
+fn log_hci_event_packet(packet: EventPacket<'_>, event_len: usize) {
+    match packet.kind.0 {
+        code if code == 0x3e && packet.data.len() >= 2 => {
+            let subevent = packet.data[0];
+            let status = packet.data[1];
+            usb_log!("LE event subevent={} status={}", subevent, status);
+            if status == 0 && (subevent == 1 || subevent == 10) && packet.data.len() >= 4 {
+                let handle = u16::from_le_bytes([packet.data[2], packet.data[3]]) & 0x0fff;
+                CONN_HANDLE.store(handle, Ordering::Relaxed);
+                defmt::info!("LE connected subevent={} handle={}", subevent, handle);
+                usb_log!("LE connected subevent={} handle={}", subevent, handle);
+                return;
+            }
+            defmt::info!("LE event subevent={} status={}", subevent, status);
+        }
+        0x05 if packet.data.len() >= 4 => {
+            let handle = u16::from_le_bytes([packet.data[1], packet.data[2]]) & 0x0fff;
+            let reason = packet.data[3];
+            CONN_HANDLE.store(0xffff, Ordering::Relaxed);
+            defmt::info!("disconnected handle={} reason={}", handle, reason);
+            usb_log!("disconnected handle={} reason={}", handle, reason);
+        }
+        code => {
+            defmt::debug!("HCI event code={} len={}", code, event_len);
+            usb_log!("HCI event code={} len={}", code, event_len);
         }
     }
 }
@@ -73,10 +184,19 @@ fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
 
     let payload = &buf[8..8 + l2cap_len];
     match cid {
-        0x0004 => handle_att(sdc, handle, payload),
-        0x0005 => handle_l2cap_control(sdc, handle, payload),
-        0x0006 => handle_smp(sdc, handle, payload),
-        _ => {}
+        0x0004 => {
+            usb_log!("ACL ATT len={} opcode={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            handle_att(sdc, handle, payload);
+        }
+        0x0005 => {
+            usb_log!("ACL L2CAP len={} code={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            handle_l2cap_control(sdc, handle, payload);
+        }
+        0x0006 => {
+            usb_log!("ACL SMP len={} code={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            handle_smp(sdc, handle, payload);
+        }
+        _ => defmt::debug!("ACL cid={} len={}", cid, l2cap_len),
     }
 }
 
@@ -86,14 +206,26 @@ fn handle_att(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) {
     }
 
     match pdu[0] {
+        // Exchange MTU Request -> 23-byte MTU response.
         0x02 => send_l2cap(sdc, handle, 0x0004, &[0x03, 23, 0]),
+
+        // Find Information Request.
         0x04 => handle_find_information(sdc, handle, pdu),
+
+        // Read By Type Request. Expose a single Device Name characteristic.
         0x08 => handle_read_by_type(sdc, handle, pdu),
+
+        // Read Request for Device Name value handle.
         0x0a if pdu.len() >= 3 && u16::from_le_bytes([pdu[1], pdu[2]]) == 3 => {
-            send_l2cap(sdc, handle, 0x0004, b"\x0bESB M10");
+            send_l2cap(sdc, handle, 0x0004, b"\x0bESB CONN");
         }
+
+        // Read By Group Type Request. Expose Generic Access primary service.
         0x10 => handle_read_by_group_type(sdc, handle, pdu),
+
+        // Write Request -> Write Response.
         0x12 => send_l2cap(sdc, handle, 0x0004, &[0x13]),
+
         opcode => send_att_error(sdc, handle, opcode, req_handle(pdu), 0x06),
     }
 }
@@ -122,7 +254,7 @@ fn handle_read_by_type(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) 
     if pdu.len() >= 7 && pdu[5] == 0x03 && pdu[6] == 0x28 && start <= 2 && end >= 2 {
         send_l2cap(sdc, handle, 0x0004, &[0x09, 7, 2, 0, 0x02, 3, 0, 0x00, 0x2a]);
     } else if pdu.len() >= 7 && pdu[5] == 0x00 && pdu[6] == 0x2a && start <= 3 && end >= 3 {
-        send_l2cap(sdc, handle, 0x0004, b"\x09\x0a\x03\x00ESB M10");
+        send_l2cap(sdc, handle, 0x0004, b"\x09\x0b\x03\x00ESB CONN");
     } else {
         send_att_error(sdc, handle, 0x08, start, 0x0a);
     }
@@ -154,13 +286,19 @@ fn handle_l2cap_control(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8])
     }
 
     match code {
+        // Connection Parameter Update Request -> accepted.
         0x12 => send_l2cap(sdc, handle, 0x0005, &[0x13, ident, 2, 0, 0, 0]),
         _ => send_l2cap(sdc, handle, 0x0005, &[0x01, ident, 2, 0, code, 0]),
     }
 }
 
 fn handle_smp(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) {
-    if !pdu.is_empty() && pdu[0] == 0x01 {
+    if pdu.is_empty() {
+        return;
+    }
+
+    // Pairing Failed: Pairing Not Supported.
+    if pdu[0] == 0x01 {
         send_l2cap(sdc, handle, 0x0006, &[0x05, 0x05]);
     }
 }
@@ -224,14 +362,17 @@ fn build_sdc<'d, const N: usize>(
     mpsl: &'d MultiprotocolServiceLayer<'d>,
     mem: &'d mut sdc::Mem<N>,
 ) -> Result<sdc::SoftdeviceController<'d>, sdc::Error> {
-    sdc::Builder::new()?
+    let builder = sdc::Builder::new()?
         .support_adv()
         .support_peripheral()
-        .peripheral_count(1)?
-        .build(p, rng, mpsl, mem)
+        .peripheral_count(1)?;
+    let required = builder.required_memory()?;
+    defmt::info!("SDC connectable required memory={} configured={}", required, N);
+    usb_log!("SDC memory required={} configured={}", required, N);
+    builder.build(p, rng, mpsl, mem)
 }
 
-async fn start_advertising(sdc: &SoftdeviceController<'_>) {
+async fn start_connectable_advertising(sdc: &SoftdeviceController<'_>) {
     let event_mask = EventMask::new().enable_le_meta(true).enable_disconnection_complete(true);
     SetEventMask::new(event_mask).exec(sdc).await.unwrap();
 
@@ -260,7 +401,7 @@ async fn start_advertising(sdc: &SoftdeviceController<'_>) {
 
     let adv_data = &[
         0x02, 0x01, 0x06, // Flags: LE general discoverable, BR/EDR unsupported.
-        0x08, 0x09, b'E', b'S', b'B', b' ', b'M', b'1', b'0', // Complete name.
+        0x09, 0x09, b'E', b'S', b'B', b' ', b'C', b'O', b'N', b'N', // Complete name.
     ];
     let mut data = [0u8; 31];
     data[..adv_data.len()].copy_from_slice(adv_data);
@@ -268,7 +409,10 @@ async fn start_advertising(sdc: &SoftdeviceController<'_>) {
         .exec(sdc)
         .await
         .unwrap();
+
     LeSetAdvEnable::new(true).exec(sdc).await.unwrap();
+    defmt::info!("connectable advertising enabled as ESB CONN");
+    usb_log!("connectable advertising enabled as ESB CONN");
 }
 
 #[embassy_executor::main]
@@ -300,6 +444,34 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(mpsl_task(mpsl).unwrap());
 
+    static VBUS: StaticCell<SoftwareVbusDetect> = StaticCell::new();
+    let vbus: &'static SoftwareVbusDetect = VBUS.init(SoftwareVbusDetect::new(true, true));
+    let driver = UsbDriver::new(p.USBD, Irqs, vbus);
+
+    let mut config = embassy_usb::Config::new(0x1209, 0x0002);
+    config.manufacturer = Some("embassy-nrf-esb");
+    config.product = Some("MPSL BLE connectable");
+
+    static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    static CDC_STATE: StaticCell<State<'static>> = StaticCell::new();
+
+    let mut builder = embassy_usb::Builder::new(
+        driver,
+        config,
+        CONFIG_DESC.init([0; 256]),
+        BOS_DESC.init([0; 256]),
+        MSOS_DESC.init([0; 256]),
+        CONTROL_BUF.init([0; 64]),
+    );
+
+    let class = CdcAcmClass::new(&mut builder, CDC_STATE.init(State::new()), 64);
+    let usb = builder.build();
+    spawner.spawn(usb_task(usb).unwrap());
+    spawner.spawn(log_task(class).unwrap());
+
     let sdc_p = sdc::Peripherals::new(
         p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
         p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
@@ -312,19 +484,10 @@ async fn main(spawner: Spawner) {
     static SDC: StaticCell<SoftdeviceController> = StaticCell::new();
     let sdc = SDC.init(build_sdc(sdc_p, rng, mpsl, SDC_MEM.init(sdc::Mem::new())).unwrap());
 
-    start_advertising(sdc).await;
+    start_connectable_advertising(sdc).await;
     spawner.spawn(sdc_task(sdc).unwrap());
-    defmt::info!("BLE advertising started; entering ESB PRX timeslots");
 
-    let esb_cfg = EsbConfig::default();
-    let esb_addr = EsbAddresses::new(
-        [0xE7, 0xE7, 0xE7, 0xE7],
-        [0xC2, 0xC2, 0xC2, 0xC2],
-        [0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
-        8,
-    )
-    .unwrap();
-
-    let r = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03).await;
-    defmt::warn!("PRX timeslot session ended unexpectedly: {:?}", r);
+    loop {
+        embassy_time::Timer::after_secs(60).await;
+    }
 }
