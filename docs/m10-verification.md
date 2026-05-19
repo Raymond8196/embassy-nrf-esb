@@ -203,6 +203,20 @@ DONE
 
 - Keep the manual-ACK code only if the next iteration can explain and fix the slot-boundary loss. Otherwise prefer a smaller targeted fix or revert before merging.
 
+Advertising baseline re-run:
+
+- Tried a connectable-advertising variant locally (`ADV_IND` + SDC peripheral support), but `ESB M10` was not visible in nRF Connect after flashing. Reverted to the advertising-only baseline.
+- Reflashed `mpsl_prx_ble` advertising-only baseline and confirmed `ESB M10` is visible in nRF Connect.
+- Reflashed `mpsl_ptx_in_slot` and captured USB CDC output against `mpsl_prx_ble`:
+
+```text
+pipe=0 tx=294 ack=271 ackpl=271 ctr=271 inv=0 blk=0 can=0
+pipe=1 tx=359 ack=341 ackpl=341 ctr=342 inv=0 blk=0 can=0
+DONE
+```
+
+- Result: advertising-only BLE coexistence is visible and both ESB pipes ACK with payloads. Throughput is lower than the prior 12 ms manual-ACK tuning run, but pipe 1 no longer fails completely.
+
 ## Pending Work
 
 - Extend Step 7 from advertising-only coexistence to BLE connection stability.
