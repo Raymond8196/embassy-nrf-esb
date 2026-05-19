@@ -361,6 +361,26 @@ Rule:
 
 - Do not keep adding ATT/GATT behavior until the radio duty-cycle problem is measured.
 
+### Relaxed BLE Connection Parameters Restore ESB Budget
+
+Requesting relaxed BLE connection parameters after connection complete materially improved ESB ACK coverage.
+
+Measured run with requested CI=100 ms, latency=4, supervision timeout=6 s:
+
+```text
+pipe=0 tx=446 ack=444 ackpl=444 ctr=444 inv=0 blk=0 can=0
+pipe=1 tx=258 ack=233 ackpl=233 ctr=234 inv=0 blk=0 can=0
+DONE
+```
+
+Compared to the earlier active-connection run, pipe 0 recovered to near baseline and pipe 1 became useful again.
+
+Rule:
+
+- After BLE link establishment, request relaxed connection parameters for coexistence smoke tests before changing ESB radio logic.
+- Treat connection interval and slave latency as first-class radio budget controls.
+- Pipe 1 still needs tuning even after relaxed BLE parameters, so do not consider this final Step 7 throughput.
+
 ## USB / DFU / Hardware Workflow Lessons
 
 ### DFU Serial Names Change After Flashing

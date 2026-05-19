@@ -240,9 +240,24 @@ DONE
 
 - Result: BLE connection stability first pass is achieved, but ESB PRX timeslot throughput regressed severely under an active BLE connection. This is expected to need timeslot duty-cycle tuning or connection interval/latency changes before Step 7 passes the ESB receive-rate target.
 
+Connection-parameter tuning run:
+
+- Added HCI LE Connection Update request after BLE connection complete, asking for CI=100 ms, latency=4, supervision timeout=6 s.
+- Reflashed `mpsl_prx_ble` and `mpsl_ptx_in_slot`.
+- nRF Connect connected to `ESB M10` and stayed connected.
+- `mpsl_ptx_in_slot` USB CDC output while BLE stayed connected:
+
+```text
+pipe=0 tx=446 ack=444 ackpl=444 ctr=444 inv=0 blk=0 can=0
+pipe=1 tx=258 ack=233 ackpl=233 ctr=234 inv=0 blk=0 can=0
+DONE
+```
+
+- Result: relaxing BLE connection parameters restores useful ESB ACK coverage under an active BLE connection. Pipe 0 is near baseline; pipe 1 still loses more packets than advertising-only and needs further scheduling/slot tuning.
+
 ## Pending Work
 
-- Tune BLE connection parameters and ESB timeslot scheduling so `ESB M10` remains connected while `mpsl_ptx_in_slot` gets useful ACK coverage on both pipes.
+- Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.

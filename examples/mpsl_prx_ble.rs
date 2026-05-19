@@ -8,10 +8,10 @@
 #![no_std]
 #![no_main]
 
-use bt_hci::cmd::SyncCmd;
+use bt_hci::cmd::{AsyncCmd, SyncCmd};
 use bt_hci::cmd::controller_baseband::SetEventMask;
-use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, EventMask, LeEventMask};
+use bt_hci::cmd::le::{LeConnUpdate, LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
+use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask};
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::mode::Blocking;
@@ -48,10 +48,46 @@ async fn sdc_task(sdc: &'static SoftdeviceController<'static>) -> ! {
     loop {
         match sdc.hci_get(&mut evt_buf).await {
             Ok(bt_hci::PacketKind::AclData) => handle_acl(sdc, &evt_buf),
+            Ok(bt_hci::PacketKind::Event) => handle_hci_event(sdc, &evt_buf).await,
             Ok(_) => {}
             Err(e) => defmt::warn!("sdc hci_get error: {:?}", e),
         }
     }
+}
+
+async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
+    if buf.len() < 2 {
+        return;
+    }
+
+    let event_code = buf[0];
+    let event_len = buf[1] as usize;
+    if event_code != 0x3e || buf.len() < 2 + event_len || event_len < 2 {
+        return;
+    }
+
+    let data = &buf[2..2 + event_len];
+    let subevent = data[0];
+    let status = data[1];
+    if status == 0 && (subevent == 1 || subevent == 10) && data.len() >= 4 {
+        let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
+        defmt::info!("BLE connected; requesting relaxed conn params handle={}", handle);
+        request_relaxed_conn_params(sdc, handle).await;
+    }
+}
+
+async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16) {
+    let _ = LeConnUpdate::new(
+        ConnHandle::new(handle),
+        bt_hci::param::Duration::from_millis(100),
+        bt_hci::param::Duration::from_millis(100),
+        4,
+        bt_hci::param::Duration::from_millis(6000),
+        bt_hci::param::Duration::from_millis(0),
+        bt_hci::param::Duration::from_millis(0),
+    )
+    .exec(sdc)
+    .await;
 }
 
 fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
