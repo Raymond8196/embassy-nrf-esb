@@ -187,13 +187,17 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "pipe={} tx={} ack={} ackpl={} ctr={} inv={} blk={} can={}\r\n",
+            "pipe={} tx={} ack={} ackpl={} ctr={} inv={} start={} t0={} radio={} idle={} blk={} can={}\r\n",
             pipe,
             r.tx_count,
             r.ack_ok_count,
             r.ack_payload_count,
             r.last_ack_counter,
             r.ack_inversions,
+            r.counters.start,
+            r.counters.timer0,
+            r.counters.radio,
+            r.counters.session_idle,
             r.counters.blocked,
             r.counters.cancelled,
         );
