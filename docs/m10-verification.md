@@ -132,6 +132,36 @@ Follow-up:
 - Investigate why pipe 1 gets `ack=0` against `mpsl_prx_ble`; compare with prior `mpsl_prx_in_slot` Step 6 behavior.
 - Keep BLE advertising visible during the next PTX run to confirm coexistence over a longer window.
 
+Follow-up run:
+
+- Re-ran `mpsl_prx_in_slot` without BLE against `mpsl_ptx_in_slot`.
+- Result matched the BLE run: pipe 0 ACKs, pipe 1 gets no ACK.
+
+```text
+pipe=0 tx=450 ack=450 ackpl=450 ctr=1 inv=0 blk=0 can=0
+pipe=1 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+DONE
+```
+
+- Conclusion: pipe 1 failure is not caused by BLE coexistence. It is in the MPSL PRX/PTX multi-pipe path.
+- Experimental manual-ACK PRX path, where software waits for RXMATCH before starting ACK TX, made pipe 1 ACKs appear but regressed pipe 0/burst reliability:
+
+```text
+pipe=0 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+pipe=1 tx=186 ack=153 ackpl=153 ctr=153 inv=0 blk=0 can=0
+DONE
+```
+
+and with RXADDRESSES clearing before ACK TX:
+
+```text
+pipe=0 tx=150 ack=100 ackpl=100 ctr=149 inv=0 blk=0 can=0
+pipe=1 tx=100 ack=50 ackpl=50 ctr=50 inv=0 blk=0 can=0
+DONE
+```
+
+- Working hypothesis: PRX ACK TXADDRESS timing is wrong in the current hardware-auto-ACK MPSL path. For multi-pipe ACK, software must know RXMATCH before selecting TXADDRESS, but the `disabled_txen` shortcut can start TX before software updates it. The manual-ACK experiment supports this but needs a cleaner implementation/timing model before landing.
+
 ## Pending Work
 
 - Extend Step 7 from advertising-only coexistence to BLE connection stability.
