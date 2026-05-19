@@ -93,7 +93,7 @@ async fn main(spawner: Spawner) {
 
     // Single long-lived PRX session; never re-enter so per-pipe ack_counter
     // stays monotonic for the entire run.
-    let _ = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 9000, 8500, u32::MAX, 0x03).await;
+    let _ = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03).await;
     loop {
         embassy_time::Timer::after_secs(60).await;
     }

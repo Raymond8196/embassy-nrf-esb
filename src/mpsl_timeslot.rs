@@ -965,10 +965,10 @@ unsafe extern "C" fn prx_timeslot_callback(
             radio.restore_pid_state(state.last_pid);
             radio.restore_crc_state(state.last_crc);
 
-            // Set up RX with disabled_txen shortcut (auto ACK after receive).
+            // Manual ACK lets us program TXADDRESS from RXMATCH before ACK TX.
             let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
             let dma_ptr = unsafe { rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
-            radio.start_receiving(state.enabled_pipes, dma_ptr);
+            radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
 
             // Arm TIMER0 for slot end.
             let t = pac::TIMER0;
@@ -1009,7 +1009,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                         let dma_ptr = unsafe {
                             rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                         };
-                        radio.start_receiving(state.enabled_pipes, dma_ptr);
+                        radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
                     } else {
                         // CRC OK — read metadata from DMA buffer.
                         let rx_buf = unsafe { &*PRX_BUFS.rx.get() };
@@ -1033,7 +1033,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 let dma_ptr = unsafe {
                                     rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                                 };
-                                radio.start_receiving(state.enabled_pipes, dma_ptr);
+                                radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
                             } else {
                                 // Dup with ACK — re-send same counter (retransmit).
                                 let counter = if pipe < NUM_PIPES {
@@ -1052,7 +1052,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                                 };
                                 let mut radio = EsbRadio::new(pac::RADIO);
-                                radio.setup_ack_tx(pipe as u8, dma_ptr);
+                                radio.transmit_ack_manual(pipe as u8, dma_ptr);
                                 state.phase = PrxPhase::TxRepeatedAck;
                             }
                         } else {
@@ -1072,7 +1072,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 let dma_ptr = unsafe {
                                     rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                                 };
-                                radio.start_receiving(state.enabled_pipes, dma_ptr);
+                                radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
                             } else {
                                 // Need ACK — send monotonic counter as payload.
                                 let counter = if pipe < NUM_PIPES {
@@ -1092,7 +1092,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                                 };
                                 let mut radio = EsbRadio::new(pac::RADIO);
-                                radio.setup_ack_tx(pipe as u8, dma_ptr);
+                                radio.transmit_ack_manual(pipe as u8, dma_ptr);
                                 state.phase = PrxPhase::TxAck;
                             }
                         }
@@ -1109,7 +1109,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                         rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                     };
                     let mut radio = EsbRadio::new(pac::RADIO);
-                    radio.complete_rx_ack(dma_ptr);
+                    radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
                     state.phase = PrxPhase::Receiving;
                 }
 
@@ -1123,7 +1123,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                         rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET)
                     };
                     let mut radio = EsbRadio::new(pac::RADIO);
-                    radio.complete_rx_ack(dma_ptr);
+                    radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
                     state.phase = PrxPhase::Receiving;
                 }
 

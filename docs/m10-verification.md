@@ -162,6 +162,47 @@ DONE
 
 - Working hypothesis: PRX ACK TXADDRESS timing is wrong in the current hardware-auto-ACK MPSL path. For multi-pipe ACK, software must know RXMATCH before selecting TXADDRESS, but the `disabled_txen` shortcut can start TX before software updates it. The manual-ACK experiment supports this but needs a cleaner implementation/timing model before landing.
 
+Clean manual-ACK implementation attempt:
+
+- Added a PRX path that disables hardware RX->TX auto-ACK, reads RXMATCH, prepares ACK payload, sets TXADDRESS, then manually starts ACK TX.
+- Burst run result:
+
+```text
+pipe=0 tx=450 ack=400 ackpl=400 ctr=449 inv=0 blk=0 can=0
+pipe=1 tx=394 ack=344 ackpl=344 ctr=344 inv=0 blk=0 can=0
+DONE
+```
+
+- This confirms both pipe 0 and pipe 1 can ACK with software-selected TXADDRESS, but it still drops one slot worth of packets per phase.
+- Changing PTX to one packet per slot produced no ACKs in that setup, so the issue is not solved by lowering in-slot packet density alone.
+- Trying an ADDRESS-event preselect approach, where hardware auto-ACK remains enabled and software writes TXADDRESS on RADIO ADDRESS, did not improve pipe 1:
+
+```text
+pipe=0 tx=450 ack=450 ackpl=450 ctr=1 inv=0 blk=0 can=0
+pipe=1 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+DONE
+```
+
+- Reducing the manual-ACK burst to 9 packets per slot also failed in this setup:
+
+```text
+pipe=0 tx=100 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+pipe=1 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
+DONE
+```
+
+- Increasing both PTX and PRX timeslots to 12 ms with an 11.5 ms in-slot match improved the manual-ACK path substantially:
+
+```text
+pipe=0 tx=450 ack=450 ackpl=450 ctr=450 inv=0 blk=0 can=0
+pipe=1 tx=444 ack=442 ackpl=442 ctr=442 inv=0 blk=0 can=0
+DONE
+```
+
+- This strongly suggests the manual-ACK approach is correct, but the old 9 ms slot is too tight for dense 10-packet bursts. The examples currently use 14 ms slots as a pending-validation smoke parameter while the MPSL PRX timing is being tuned.
+
+- Keep the manual-ACK code only if the next iteration can explain and fix the slot-boundary loss. Otherwise prefer a smaller targeted fix or revert before merging.
+
 ## Pending Work
 
 - Extend Step 7 from advertising-only coexistence to BLE connection stability.

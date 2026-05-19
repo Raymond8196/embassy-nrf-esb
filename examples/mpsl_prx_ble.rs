@@ -152,6 +152,6 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let r = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 9000, 8500, u32::MAX, 0x03).await;
+    let r = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03).await;
     defmt::warn!("PRX timeslot session ended unexpectedly: {:?}", r);
 }

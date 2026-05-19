@@ -181,7 +181,7 @@ async fn main(spawner: Spawner) {
     // Slot is sized so 10 ESB cycles fit with margin before in_slot_match_us;
     // last cycle's ACK lands before TIMER0 chains the next slot.
     for pipe in 0u8..2 {
-        let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 9000, 8500, 50, pipe, 10).await;
+        let r = run_ptx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, 50, pipe, 10).await;
 
         let mut buf = [0u8; 256];
         let mut w = WriteBuf::new(&mut buf);

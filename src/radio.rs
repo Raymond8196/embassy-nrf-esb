@@ -336,6 +336,57 @@ impl EsbRadio {
         r.tasks_rxen().write_value(1);
     }
 
+    /// Start listening without the automatic RX->TX ACK shortcut.
+    ///
+    /// The MPSL PRX path uses this for multi-pipe ACKs: it must read RXMATCH
+    /// and program TXADDRESS before starting ACK TX. With disabled_txen, the
+    /// radio can begin ACK TX before software switches away from pipe 0.
+    #[cfg(feature = "mpsl")]
+    pub(crate) fn start_receiving_manual_ack(&mut self, enabled_pipes: u8, dma_ptr: *mut u8) {
+        let r = self.radio;
+
+        r.shorts().modify(|w| {
+            w.set_disabled_txen(false);
+            w.set_disabled_rxen(false);
+        });
+        r.intenset().write(|w| w.set_disabled(true));
+        r.rxaddresses()
+            .write_value(regs::Rxaddresses(enabled_pipes as u32));
+        r.packetptr().write_value(dma_ptr as u32);
+
+        r.events_address().write_value(0);
+        self.clear_disabled_event();
+        self.clear_ready_event();
+        self.clear_end_event();
+        r.events_payload().write_value(0);
+
+        compiler_fence(Ordering::Release);
+        r.tasks_rxen().write_value(1);
+    }
+
+    /// Start ACK TX after RXMATCH has selected the ACK pipe.
+    #[cfg(feature = "mpsl")]
+    pub(crate) fn transmit_ack_manual(&mut self, pipe: u8, ack_dma_ptr: *mut u8) {
+        let r = self.radio;
+
+        r.txaddress().write(|w| w.set_txaddress(pipe));
+        r.shorts().modify(|w| {
+            w.set_disabled_txen(false);
+            w.set_disabled_rxen(false);
+        });
+        r.intenset().write(|w| w.set_disabled(true));
+        r.packetptr().write_value(ack_dma_ptr as u32);
+
+        r.events_address().write_value(0);
+        self.clear_disabled_event();
+        self.clear_ready_event();
+        self.clear_end_event();
+        r.events_payload().write_value(0);
+
+        compiler_fence(Ordering::Release);
+        r.tasks_txen().write_value(1);
+    }
+
     /// Check received PRX packet CRC and read metadata.
     ///
     /// Returns `RxResult::BadCrc` if CRC failed (radio auto-restarted).
