@@ -38,7 +38,8 @@ mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section-impl"]
 # Mutually exclusive with `mpsl`.
 _cs-cortex = ["cortex-m/critical-section-single-core"]
 
-[dev-dependencies]
+[target.'cfg(target_arch = "arm")'.dev-dependencies]
+bt-hci = { version = "0.8", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { version = "0.10", features = ["nrf52840", "unstable-pac", "time", "time-driver-rtc1"] }
 embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
@@ -46,6 +47,7 @@ embassy-usb = "0.6"
 cortex-m = { version = "0.7", default-features = false }
 cortex-m-rt = "0.7"
 defmt-rtt = "1"
+nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", features = ["nrf52840", "peripheral", "defmt"], default-features = false }
 panic-probe = { version = "1", features = ["print-defmt"] }
 static_cell = "2"
 
@@ -99,4 +101,8 @@ required-features = ["nrf52840", "defmt", "mpsl"]
 
 [[example]]
 name = "mpsl_prx_in_slot"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_prx_ble"
 required-features = ["nrf52840", "defmt", "mpsl"]

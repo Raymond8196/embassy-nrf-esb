@@ -48,6 +48,86 @@ impl TxPower {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{Channel, CrcConfig, EsbConfig, RetransmitConfig};
+    use crate::error::Error;
+
+    #[test]
+    fn default_config_is_valid() {
+        assert_eq!(EsbConfig::default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn payload_length_must_be_in_supported_range() {
+        let mut config = EsbConfig::default();
+
+        config.payload_length = 0;
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config.payload_length = 253;
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config.payload_length = 252;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn ack_timeout_has_minimum() {
+        let mut config = EsbConfig::default();
+
+        config.ack_timeout_us = 43;
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config.ack_timeout_us = 44;
+        config.retransmit.delay_us = 141;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn retransmit_delay_must_exceed_ack_timeout_plus_guard_and_ramp_up() {
+        let mut config = EsbConfig {
+            ack_timeout_us: 120,
+            retransmit: RetransmitConfig {
+                count: 3,
+                delay_us: 182,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config.retransmit.delay_us = 183;
+        assert_eq!(config.validate(), Ok(()));
+
+        config.ack_timeout_us = 44;
+        config.retransmit.delay_us = 140;
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config.retransmit.delay_us = 141;
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn channel_retransmit_count_and_crc_length_are_bounded() {
+        let mut config = EsbConfig::default();
+
+        config.channel = Channel(101);
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config = EsbConfig::default();
+        config.retransmit.count = 16;
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+
+        config = EsbConfig::default();
+        config.crc = CrcConfig {
+            length: 3,
+            ..Default::default()
+        };
+        assert_eq!(config.validate(), Err(Error::InvalidParam));
+    }
+}
+
 /// Radio ramp-up time in microseconds (normal mode).
 pub const RAMP_UP_US: u16 = 140;
 /// Radio ramp-up time in microseconds (fast ramp-up mode).

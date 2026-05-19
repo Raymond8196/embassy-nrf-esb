@@ -23,11 +23,17 @@
 
 #![no_std]
 
-// Chip feature guard
-#[cfg(not(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832")))]
+// Chip feature guard. Host-side unit tests intentionally compile without a chip.
+#[cfg(all(
+    not(test),
+    not(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))
+))]
 compile_error!(
     "One chip feature must be enabled: nrf52840, nrf52833, or nrf52832"
 );
+
+#[cfg(all(feature = "mpsl", feature = "_cs-cortex"))]
+compile_error!("features `mpsl` and `_cs-cortex` are mutually exclusive");
 
 pub mod addresses;
 pub mod config;

@@ -68,3 +68,46 @@ impl EsbHeader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::EsbHeader;
+
+    #[test]
+    fn pid_uses_bits_one_and_two_only() {
+        let mut header = EsbHeader::default();
+
+        for pid in 0u8..=7 {
+            header.pid_no_ack = 0b1111_1001;
+            header.set_pid(pid);
+
+            assert_eq!(header.pid(), pid & 0x03);
+            assert_eq!(header.pid_no_ack & 0x01, 0x01);
+            assert_eq!(header.pid_no_ack & 0b1111_1000, 0b1111_1000);
+        }
+    }
+
+    #[test]
+    fn no_ack_uses_bit_zero_only() {
+        let mut header = EsbHeader {
+            pid_no_ack: 0b1010_0110,
+            ..Default::default()
+        };
+
+        header.set_no_ack(true);
+        assert!(header.no_ack());
+        assert_eq!(header.pid_no_ack, 0b1010_0111);
+
+        header.set_no_ack(false);
+        assert!(!header.no_ack());
+        assert_eq!(header.pid_no_ack, 0b1010_0110);
+    }
+
+    #[test]
+    fn dma_and_payload_offsets_match_layout() {
+        assert_eq!(EsbHeader::DMA_OFFSET, 2);
+        assert_eq!(EsbHeader::PAYLOAD_OFFSET, 4);
+        assert_eq!(core::mem::size_of::<EsbHeader>(), 4);
+        assert_eq!(core::mem::align_of::<EsbHeader>(), 1);
+    }
+}

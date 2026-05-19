@@ -156,3 +156,63 @@ impl Default for EsbAddresses {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AddressError, EsbAddresses};
+
+    fn sample_addresses(pipe_count: u8) -> EsbAddresses {
+        EsbAddresses::new(
+            [0x01, 0x23, 0x45, 0x67],
+            [0x89, 0xAB, 0xCD, 0xEF],
+            [0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
+            pipe_count,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_invalid_pipe_counts() {
+        assert!(matches!(
+            EsbAddresses::new([0; 4], [0; 4], [0; 8], 0),
+            Err(AddressError::InvalidPipeCount(0))
+        ));
+        assert!(matches!(
+            EsbAddresses::new([0; 4], [0; 4], [0; 8], 9),
+            Err(AddressError::InvalidPipeCount(9))
+        ));
+    }
+
+    #[test]
+    fn enabled_mask_matches_pipe_count() {
+        assert_eq!(sample_addresses(1).enabled_mask(), 0x01);
+        assert_eq!(sample_addresses(2).enabled_mask(), 0x03);
+        assert_eq!(sample_addresses(7).enabled_mask(), 0x7F);
+        assert_eq!(sample_addresses(8).enabled_mask(), 0xFF);
+    }
+
+    #[test]
+    fn prefix_lookup_checks_configured_pipe_count() {
+        let addresses = sample_addresses(3);
+
+        assert_eq!(addresses.prefix_for_pipe(0), Ok(0x10));
+        assert_eq!(addresses.prefix_for_pipe(2), Ok(0x54));
+        assert_eq!(addresses.prefix_for_pipe(3), Err(AddressError::InvalidPipe(3)));
+    }
+
+    #[test]
+    fn base_registers_are_bit_reversed_little_endian_words() {
+        let addresses = sample_addresses(8);
+
+        assert_eq!(addresses.base0_reg(), u32::from_le_bytes([0x01, 0x23, 0x45, 0x67]).reverse_bits());
+        assert_eq!(addresses.base1_reg(), u32::from_le_bytes([0x89, 0xAB, 0xCD, 0xEF]).reverse_bits());
+    }
+
+    #[test]
+    fn prefix_registers_bit_reverse_each_byte_without_reordering_pipes() {
+        let addresses = sample_addresses(8);
+
+        assert_eq!(addresses.prefix0_reg(), u32::from_le_bytes([0x08, 0x4C, 0x2A, 0x6E]));
+        assert_eq!(addresses.prefix1_reg(), u32::from_le_bytes([0x19, 0x5D, 0x3B, 0x7F]));
+    }
+}
