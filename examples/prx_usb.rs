@@ -5,17 +5,17 @@ use core::fmt::Write as FmtWrite;
 
 use embassy_executor::Spawner;
 use embassy_nrf::peripherals::TIMER1;
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::isr::{EsbPrx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPrx};
 use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 
@@ -46,11 +46,21 @@ async fn stats_reporter(mut class: CdcAcmClass<'static, MyUsbDriver>) {
     let mut buf = [0u8; 128];
     loop {
         let [rx_count, lost, _] = STATS_CH.receive().await;
-        let loss_pct = if rx_count + lost > 0 { lost as u32 * 10000 / (rx_count + lost) } else { 0 };
+        let loss_pct = if rx_count + lost > 0 {
+            lost as u32 * 10000 / (rx_count + lost)
+        } else {
+            0
+        };
         let len = {
             let mut w = WriteBuf::new(&mut buf);
-            let _ = write!(w, "[STAT] rx={} lost={} loss={}.{}%\r\n",
-                rx_count, lost, loss_pct / 100, loss_pct % 100);
+            let _ = write!(
+                w,
+                "[STAT] rx={} lost={} loss={}.{}%\r\n",
+                rx_count,
+                lost,
+                loss_pct / 100,
+                loss_pct % 100
+            );
             w.pos
         };
         let _ = class.write_packet(&buf[..len]).await;
@@ -100,9 +110,7 @@ async fn main(spawner: Spawner) {
 
     let prx = {
         static ESB: static_cell::StaticCell<EsbPrx<TIMER1>> = static_cell::StaticCell::new();
-        &*ESB.init(EsbPrx::new(
-            p.TIMER1, p.RADIO, &POOL, &esb_config, &addresses,
-        ))
+        &*ESB.init(EsbPrx::new(p.TIMER1, p.RADIO, &POOL, &esb_config, &addresses).unwrap())
     };
     unsafe { PRX_REF = Some(prx) };
 

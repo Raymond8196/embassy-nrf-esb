@@ -5,16 +5,16 @@ use core::fmt::Write as FmtWrite;
 
 use embassy_executor::Spawner;
 use embassy_nrf::peripherals::TIMER1;
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_time::Timer;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::isr::{EsbPtx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPtx};
 use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 
@@ -79,9 +79,7 @@ async fn main(spawner: Spawner) {
 
     let ptx = {
         static ESB: static_cell::StaticCell<EsbPtx<TIMER1>> = static_cell::StaticCell::new();
-        &*ESB.init(EsbPtx::new(
-            p.TIMER1, p.RADIO, &POOL, &config, &addresses, 0,
-        ))
+        &*ESB.init(EsbPtx::new(p.TIMER1, p.RADIO, &POOL, &config, &addresses, 0).unwrap())
     };
     unsafe { PTX_REF = Some(ptx) };
 

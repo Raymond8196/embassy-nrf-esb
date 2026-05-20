@@ -171,6 +171,10 @@ Scope:
 - Add `mpsl` versus `_cs-cortex` compile guard.
 - Document HFCLK ownership.
 
+Status:
+
+- 2026-05-20: README ESB/Gazell wording and HFCLK ownership are documented. `payload_length` is wired as the configured max payload length for RADIO `MAXLEN`, PTX sends, NoAck sends, and PRX ACK payloads. The `mpsl` versus `_cs-cortex` compile guard already exists in `src/lib.rs`.
+
 Verification:
 
 - `cargo check --features nrf52840,_cs-cortex`
@@ -205,6 +209,10 @@ Scope:
 - Make constructors return `Result` instead of panic.
 - Bound `radio.stop()` waiting behavior.
 - Align fallback ACK buffer.
+
+Status:
+
+- 2026-05-20: `EsbRadio::stop()` uses a bounded wait and power-cycle recovery instead of an infinite spin. The fallback empty ACK buffer is explicitly 4-byte aligned. `EsbPtx::new()` and `EsbPrx::new()` now return `Result<Self, Error>` instead of panicking on invalid config. Broader `UnsafeCell` access guards are still pending.
 
 Verification:
 

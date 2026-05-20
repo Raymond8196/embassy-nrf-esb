@@ -10,18 +10,24 @@
 //! duplicate detection, grant management) lives in `state_machine.rs`.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
 use crate::addresses::EsbAddresses;
 use crate::config::{Bitrate, EsbConfig};
 
-use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode, Skipaddr};
 #[cfg(feature = "fast-ru")]
 use crate::pac::radio::vals::Ru;
-use crate::pac::radio::{regs, Radio};
+use crate::pac::radio::vals::{Crcstatus, Endian, Len, Mode, Skipaddr};
+use crate::pac::radio::{Radio, regs};
 
 /// Number of ESB pipes (matching hardware RXMATCH field width).
 const NUM_PIPES: usize = 8;
+/// Bounded spin count for RADIO disable.
+///
+/// Normal disable completion is a short hardware transition. If this bound is
+/// hit, the radio state is already abnormal; power-cycle recovery is preferable
+/// to wedging firmware forever.
+const RADIO_DISABLE_SPIN_LIMIT: u32 = 100_000;
 
 /// Result of checking a received PRX packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +80,8 @@ impl EsbRadio {
         };
         r.mode().write(|w| w.set_mode(mode));
 
-        // LENGTH field bit width: 8 bits to support dynamic payload up to 252.
-        // esb-ng uses 6 bits when max ≤ 32, but we always use 8 since MAXLEN=252
-        // and send() allows any length up to 252.
+        // LENGTH field bit width: 8 bits to support dynamic payloads up to
+        // EsbConfig::payload_length.
         let len_bits: u8 = 8;
 
         // Convert addresses for nRF24L01+ compatibility (esb-ng lines 89–92).
@@ -99,7 +104,8 @@ impl EsbRadio {
         r.modecnf0().modify(|w| w.set_ru(Ru::FAST));
 
         // TX output power (esb-ng line 105).
-        r.txpower().write(|w| w.set_txpower(config.tx_power.to_pac()));
+        r.txpower()
+            .write(|w| w.set_txpower(config.tx_power.to_pac()));
 
         // PCNF0: LENGTH field + S1 field (PID + NO_ACK).
         // S1LEN=3: bits 2:1 = PID, bit 0 = NO_ACK (esb-ng lines 107–110).
@@ -110,11 +116,12 @@ impl EsbRadio {
             w.set_s1len(3);
         });
 
-        // PCNF1: max payload, 4-byte base + 1-byte prefix, big-endian (esb-ng lines 112–120).
-        // MAXLEN must be 252 (hardware maximum) so the RADIO never silently
-        // truncates a payload that passed software validation in send().
+        // PCNF1: max payload, 4-byte base + 1-byte prefix, big-endian
+        // (esb-ng lines 112–120). MAXLEN mirrors software validation so the
+        // RADIO cannot accept or DMA a packet larger than the configured
+        // maximum payload length.
         r.pcnf1().write(|w| {
-            w.set_maxlen(crate::header::EsbHeader::MAX_PAYLOAD);
+            w.set_maxlen(config.payload_length);
             w.set_balen(4); // 4-byte base address
             w.set_statlen(0);
             w.set_endian(Endian::BIG);
@@ -188,7 +195,7 @@ impl EsbRadio {
 
     // ---- Stop / disable ----
 
-    /// Stop the radio: disable shortcuts, trigger TASKS_DISABLE, spin-wait.
+    /// Stop the radio: disable shortcuts, trigger TASKS_DISABLE, bounded wait.
     /// Ref: esb-ng lines 182–203.
     pub(crate) fn stop(&mut self) {
         let r = self.radio;
@@ -201,9 +208,16 @@ impl EsbRadio {
         self.disable_disabled_interrupt();
         r.tasks_disable().write_value(1);
 
-        // Spin-wait for EVENTS_DISABLED (esb-ng line 192).
-        // Ensures subsequent task_disable won't trigger a stale interrupt.
-        while r.events_disabled().read() == 0 {}
+        // Wait for EVENTS_DISABLED (esb-ng line 192), but never wedge the
+        // firmware forever if the peripheral is in an unexpected state.
+        let mut spins = 0;
+        while r.events_disabled().read() == 0 && spins < RADIO_DISABLE_SPIN_LIMIT {
+            spins += 1;
+        }
+        if spins == RADIO_DISABLE_SPIN_LIMIT {
+            r.power().write(|w| w.set_power(false));
+            r.power().write(|w| w.set_power(true));
+        }
         self.clear_disabled_event();
 
         // Ensure DMA writes are visible to CPU (esb-ng line 196).
@@ -234,8 +248,7 @@ impl EsbRadio {
 
         // Set TX and RX addresses for this pipe (esb-ng lines 215–221).
         r.txaddress().write(|w| w.set_txaddress(pipe));
-        r.rxaddresses()
-            .write_value(regs::Rxaddresses(1 << pipe));
+        r.rxaddresses().write_value(regs::Rxaddresses(1 << pipe));
 
         // Set DMA pointer (esb-ng line 223).
         r.packetptr().write_value(dma_ptr as u32);
@@ -295,8 +308,7 @@ impl EsbRadio {
     /// Ref: esb-ng lines 279–282.
     #[inline]
     pub(crate) fn check_ack(&self) -> bool {
-        let ok =
-            self.radio.crcstatus().read().crcstatus() == Crcstatus::CRCOK;
+        let ok = self.radio.crcstatus().read().crcstatus() == Crcstatus::CRCOK;
         // Ensure DMA writes from RADIO are visible to CPU (esb-ng line 282).
         compiler_fence(Ordering::Acquire);
         ok
@@ -423,9 +435,7 @@ impl EsbRadio {
     /// Uses exact CRC + PID comparison (esb-ng line 364).
     /// Caller reads PID from DMA buffer after `check_packet()` returns NewPacket.
     pub(crate) fn check_duplicate(&self, pipe: usize, pid: u8, crc: u16) -> bool {
-        pipe < NUM_PIPES
-            && self.last_crc[pipe] == crc
-            && self.last_pid[pipe] == pid
+        pipe < NUM_PIPES && self.last_crc[pipe] == crc && self.last_pid[pipe] == pid
     }
 
     /// Update duplicate detection tracking for a pipe after accepting a new packet.
@@ -498,6 +508,7 @@ impl EsbRadio {
         //
         // link_section(".data") guarantees RAM placement — EasyDMA cannot read
         // from Flash (errata [122], PS §6.17.6).
+        #[repr(C, align(4))]
         struct FallbackAck(UnsafeCell<[u8; 2]>);
         unsafe impl Sync for FallbackAck {}
         #[unsafe(link_section = ".data")]

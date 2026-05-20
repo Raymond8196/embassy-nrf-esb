@@ -18,7 +18,7 @@
 //!
 //! ```ignore
 //! static ESB: StaticCell<EsbPtx<TIMER1>> = StaticCell::new();
-//! let ptx = ESB.init(EsbPtx::new(timer, radio, &pool, &config, &addresses, 0));
+//! let ptx = ESB.init(EsbPtx::new(timer, radio, &pool, &config, &addresses, 0)?);
 //!
 //! #[embassy_nrf::pac::interrupt]
 //! fn RADIO() { ptx.on_radio_interrupt(); }
@@ -93,6 +93,7 @@ pub struct EsbPtx<
     suspend_requested: AtomicBool,
     /// Woken by ISR when it goes idle with suspend_requested set.
     suspend_signal: AtomicWaker,
+    max_payload_len: usize,
 }
 
 // SAFETY: Placed in static by user. All ISR access is single-threaded.
@@ -117,8 +118,8 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         config: &EsbConfig,
         addresses: &EsbAddresses,
         tx_pipe: u8,
-    ) -> Self {
-        config.validate().expect("ESB config invalid");
+    ) -> Result<Self, Error> {
+        config.validate()?;
         let mut radio = EsbRadio::new(crate::pac::RADIO);
         radio.init(config, addresses);
 
@@ -128,14 +129,15 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         enable_radio_irq();
         unsafe { cortex_m::peripheral::NVIC::unmask(T::interrupt()) };
 
-        Self {
+        Ok(Self {
             sm: UnsafeCell::new(sm),
             pool,
             timer_flag: AtomicBool::new(false),
             max_attempts_flag: AtomicBool::new(false),
             suspend_requested: AtomicBool::new(false),
             suspend_signal: AtomicWaker::new(),
-        }
+            max_payload_len: config.payload_length as usize,
+        })
     }
 
     /// Called from the RADIO interrupt handler.
@@ -183,7 +185,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Returns after queuing. The packet will be sent in the next
     /// RADIO ISR cycle.
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
-        if payload.is_empty() || payload.len() > 252 {
+        if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
         }
         let payload_offset = EsbHeader::PAYLOAD_OFFSET;
@@ -209,7 +211,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     ///
     /// NoAck packets do not wait for acknowledgment — fire and forget.
     pub async fn send_no_ack(&self, payload: &[u8]) -> Result<(), Error> {
-        if payload.is_empty() || payload.len() > 252 {
+        if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
         }
         let payload_offset = EsbHeader::PAYLOAD_OFFSET;
@@ -375,6 +377,7 @@ pub struct EsbPrx<
     suspend_requested: AtomicBool,
     /// Woken by ISR when it returns to Receiver/Idle with suspend_requested set.
     suspend_signal: AtomicWaker,
+    max_payload_len: usize,
 }
 
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPrx<T, N, SIZE> {}
@@ -389,8 +392,8 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         pool: &'static PacketPool<N, SIZE>,
         config: &EsbConfig,
         addresses: &EsbAddresses,
-    ) -> Self {
-        config.validate().expect("ESB config invalid");
+    ) -> Result<Self, Error> {
+        config.validate()?;
         let mut radio = EsbRadio::new(crate::pac::RADIO);
         radio.init(config, addresses);
 
@@ -401,13 +404,14 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         enable_radio_irq();
         unsafe { cortex_m::peripheral::NVIC::unmask(T::interrupt()) };
 
-        Self {
+        Ok(Self {
             sm: UnsafeCell::new(sm),
             pool,
             timer_flag: AtomicBool::new(false),
             suspend_requested: AtomicBool::new(false),
             suspend_signal: AtomicWaker::new(),
-        }
+            max_payload_len: config.payload_length as usize,
+        })
     }
 
     /// Called from the RADIO interrupt handler.
@@ -464,7 +468,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Queue an ACK payload for a specific pipe.
     pub async fn send_ack_payload(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
-        if payload.is_empty() || payload.len() > 252 {
+        if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
         }
         let payload_offset = EsbHeader::PAYLOAD_OFFSET;

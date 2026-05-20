@@ -59,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_length_must_be_in_supported_range() {
+    fn payload_length_sets_max_supported_payload_size() {
         let mut config = EsbConfig::default();
 
         config.payload_length = 0;
@@ -225,7 +225,11 @@ pub struct EsbConfig {
     ///
     /// Must be >= 44 µs. Default: 120 µs.
     pub ack_timeout_us: u16,
-    /// Payload length (1–252 bytes).
+    /// Maximum payload length accepted by software and RADIO EasyDMA (1–252 bytes).
+    ///
+    /// ESB dynamic payloads shorter than this value are still allowed. Packets
+    /// longer than this value are rejected by `send()` / `send_no_ack()` /
+    /// `send_ack_payload()` and RADIO `PCNF1.MAXLEN`.
     pub payload_length: u8,
     /// TX output power.
     pub tx_power: TxPower,

@@ -807,6 +807,9 @@ pub async fn run_ptx_slots(
     packets_per_slot: u32,
 ) -> Result<PtxSlotResult, Error> {
     let _busy = PTX_STATE.try_enter()?;
+    if config.payload_length < 4 {
+        return Err(Error::InvalidParam);
+    }
 
     let mut session_id: u8 = 0;
     let ret = unsafe {
@@ -1262,6 +1265,9 @@ pub async fn run_prx_slots(
     enabled_pipes: u8,
 ) -> Result<PrxSlotResult, Error> {
     let _busy = PRX_STATE.try_enter()?;
+    if config.payload_length < 4 {
+        return Err(Error::InvalidParam);
+    }
 
     let mut session_id: u8 = 0;
     let ret = unsafe {

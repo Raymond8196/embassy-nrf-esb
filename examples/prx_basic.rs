@@ -5,7 +5,7 @@ use embassy_executor::Spawner;
 use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::isr::{EsbPrx, DEFAULT_POOL_N, DEFAULT_POOL_SIZE};
+use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPrx};
 use embassy_nrf_esb::pac;
 use embassy_nrf_esb::payload::PacketPool;
 use {defmt_rtt as _, panic_probe as _};
@@ -26,9 +26,7 @@ async fn main(_spawner: Spawner) {
 
     let prx = {
         static ESB: static_cell::StaticCell<EsbPrx<TIMER1>> = static_cell::StaticCell::new();
-        &*ESB.init(EsbPrx::new(
-            p.TIMER1, p.RADIO, &POOL, &config, &addresses,
-        ))
+        &*ESB.init(EsbPrx::new(p.TIMER1, p.RADIO, &POOL, &config, &addresses).unwrap())
     };
     unsafe { PRX_REF = Some(prx) };
 

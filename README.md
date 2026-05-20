@@ -8,7 +8,7 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 
 ## Goals
 
-1. **Drop-in replacement for Nordic Gazell** in the RMK keyboard firmware
+1. **Drop-in replacement for Nordic ESB**; can replace Gazell when both sides are migrated
 2. **Open-source friendly** — Clean API following Embassy conventions, no PAC types in public API
 3. **MPSL timeslot support** — BLE + ESB concurrent operation (Phase 7)
 
@@ -38,6 +38,16 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 - `cortex-m` 0.7
 
 Version-aligned with RMK for seamless integration.
+
+## Compatibility
+
+This crate implements Nordic's ESB radio packet format and is not wire-compatible with Nordic Gazell by itself. Gazell adds host identity, pairing, channel hopping, and scheduling behavior above ESB. Existing Gazell devices need both sides migrated to this crate or to another compatible ESB protocol layer.
+
+## Clock Ownership
+
+The library does not own HFCLK. In exclusive ESB mode, applications must start and hold the external high-frequency clock before using the RADIO. The examples do this explicitly with `CLOCK.tasks_hfclkstart()`.
+
+With the optional `mpsl` feature, applications should use `nrf-mpsl` for clock ownership, for example by holding the guard returned by `MultiprotocolServiceLayer::request_hfclk()`. The `mpsl` feature uses `nrf-mpsl`'s critical-section implementation and is mutually exclusive with the internal `_cs-cortex` example feature.
 
 ## Architecture
 
