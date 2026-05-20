@@ -147,3 +147,31 @@ Metrics to log:
 - split message latency
 - decode/deserialize errors
 - binding mismatch drops
+
+## RMK-Side Implementation Checklist
+
+Target file layout in RMK:
+
+| File | Purpose |
+|------|---------|
+| `rmk/src/split/esb.rs` | ESB implementation of `SplitReader` / `SplitWriter`, mirroring `gazell.rs` structure where useful. |
+| `rmk/src/split/mod.rs` | Feature-gate and module export for the ESB split transport. |
+| `rmk/Cargo.toml` | Optional dependency on `embassy-nrf-esb` and feature wiring. |
+| board/example config | Static binding table, ESB addresses, channel, payload length, and pipe assignment. |
+
+First implementation steps:
+
+1. Add an RMK feature such as `wireless_esb`.
+2. Add `split/esb.rs` with a central PRX driver and peripheral PTX driver.
+3. Keep serialization identical to existing Gazell/BLE paths: postcard
+   `SplitMessage` into `SPLIT_MESSAGE_MAX_SIZE` buffers.
+4. Wrap serialized bytes with `embassy_nrf_esb::transport::encode_frame`.
+5. On central receive, validate `pipe -> device_id` static binding before
+   deserializing.
+6. Use `SequenceTracker` before publishing key events.
+7. Expose counters for max attempts, duplicate drops, binding mismatch, decode
+   errors, and deserialization errors.
+8. Start with fixed channel and static addresses.
+
+Do not pull `SplitMessage` or RMK traits into `embassy-nrf-esb`; they are
+currently RMK crate-private and should remain owned by RMK.
