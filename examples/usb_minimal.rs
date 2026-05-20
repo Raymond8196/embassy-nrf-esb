@@ -2,11 +2,11 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{bind_interrupts, pac, peripherals, usb};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 
 use {defmt_rtt as _, panic_probe as _};
 

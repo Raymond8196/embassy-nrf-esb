@@ -2,11 +2,11 @@
 #![no_main]
 
 use embassy_executor::Spawner;
+use embassy_nrf::pac;
 use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPrx};
-use embassy_nrf::pac;
 use embassy_nrf_esb::payload::PacketPool;
 use {defmt_rtt as _, panic_probe as _};
 

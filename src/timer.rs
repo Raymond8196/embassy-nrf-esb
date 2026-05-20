@@ -18,7 +18,7 @@ use core::marker::PhantomData;
 use embassy_nrf::PeripheralType;
 
 use crate::pac::timer::vals::Bitmode;
-use crate::pac::timer::{regs, Timer};
+use crate::pac::timer::{Timer, regs};
 
 mod sealed {
     pub trait Sealed {}

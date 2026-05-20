@@ -197,22 +197,37 @@ mod tests {
 
         assert_eq!(addresses.prefix_for_pipe(0), Ok(0x10));
         assert_eq!(addresses.prefix_for_pipe(2), Ok(0x54));
-        assert_eq!(addresses.prefix_for_pipe(3), Err(AddressError::InvalidPipe(3)));
+        assert_eq!(
+            addresses.prefix_for_pipe(3),
+            Err(AddressError::InvalidPipe(3))
+        );
     }
 
     #[test]
     fn base_registers_are_bit_reversed_little_endian_words() {
         let addresses = sample_addresses(8);
 
-        assert_eq!(addresses.base0_reg(), u32::from_le_bytes([0x01, 0x23, 0x45, 0x67]).reverse_bits());
-        assert_eq!(addresses.base1_reg(), u32::from_le_bytes([0x89, 0xAB, 0xCD, 0xEF]).reverse_bits());
+        assert_eq!(
+            addresses.base0_reg(),
+            u32::from_le_bytes([0x01, 0x23, 0x45, 0x67]).reverse_bits()
+        );
+        assert_eq!(
+            addresses.base1_reg(),
+            u32::from_le_bytes([0x89, 0xAB, 0xCD, 0xEF]).reverse_bits()
+        );
     }
 
     #[test]
     fn prefix_registers_bit_reverse_each_byte_without_reordering_pipes() {
         let addresses = sample_addresses(8);
 
-        assert_eq!(addresses.prefix0_reg(), u32::from_le_bytes([0x08, 0x4C, 0x2A, 0x6E]));
-        assert_eq!(addresses.prefix1_reg(), u32::from_le_bytes([0x19, 0x5D, 0x3B, 0x7F]));
+        assert_eq!(
+            addresses.prefix0_reg(),
+            u32::from_le_bytes([0x08, 0x4C, 0x2A, 0x6E])
+        );
+        assert_eq!(
+            addresses.prefix1_reg(),
+            u32::from_le_bytes([0x19, 0x5D, 0x3B, 0x7F])
+        );
     }
 }

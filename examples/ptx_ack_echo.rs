@@ -12,10 +12,10 @@ use embassy_time::Timer;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 
+use embassy_nrf::pac;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPtx};
-use embassy_nrf::pac;
 use embassy_nrf_esb::payload::PacketPool;
 
 use {defmt_rtt as _, panic_probe as _};

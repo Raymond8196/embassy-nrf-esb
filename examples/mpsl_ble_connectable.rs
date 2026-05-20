@@ -11,21 +11,21 @@ use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicU16, Ordering};
 
 use bt_hci::cmd::SyncCmd;
-use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
 use bt_hci::cmd::controller_baseband::SetEventMask;
+use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
 use bt_hci::event::EventPacket;
 use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, EventMask, LeEventMask};
-use embassy_nrf::usb::Driver as UsbDriver;
-use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::mode::Blocking;
+use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::{bind_interrupts, pac, peripherals, rng, usb};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
-use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals, SessionMem};
+use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use nrf_sdc::vendor::ZephyrWriteBdAddr;
 use nrf_sdc::{self as sdc, SoftdeviceController};
 use static_cell::StaticCell;
@@ -55,11 +55,17 @@ struct WriteBuf {
 
 impl WriteBuf {
     fn new() -> Self {
-        Self { buf: [0; 96], pos: 0 }
+        Self {
+            buf: [0; 96],
+            pos: 0,
+        }
     }
 
     fn finish(self) -> LogLine {
-        LogLine { len: self.pos, bytes: self.buf }
+        LogLine {
+            len: self.pos,
+            bytes: self.buf,
+        }
     }
 }
 
@@ -103,7 +109,9 @@ async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, &'static Sof
 }
 
 #[embassy_executor::task]
-async fn log_task(mut class: CdcAcmClass<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>) {
+async fn log_task(
+    mut class: CdcAcmClass<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>,
+) {
     class.wait_connection().await;
     loop {
         let line = LOGS.receive().await;
@@ -185,15 +193,27 @@ fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
     let payload = &buf[8..8 + l2cap_len];
     match cid {
         0x0004 => {
-            usb_log!("ACL ATT len={} opcode={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            usb_log!(
+                "ACL ATT len={} opcode={}",
+                l2cap_len,
+                payload.get(0).copied().unwrap_or(0)
+            );
             handle_att(sdc, handle, payload);
         }
         0x0005 => {
-            usb_log!("ACL L2CAP len={} code={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            usb_log!(
+                "ACL L2CAP len={} code={}",
+                l2cap_len,
+                payload.get(0).copied().unwrap_or(0)
+            );
             handle_l2cap_control(sdc, handle, payload);
         }
         0x0006 => {
-            usb_log!("ACL SMP len={} code={}", l2cap_len, payload.get(0).copied().unwrap_or(0));
+            usb_log!(
+                "ACL SMP len={} code={}",
+                l2cap_len,
+                payload.get(0).copied().unwrap_or(0)
+            );
             handle_smp(sdc, handle, payload);
         }
         _ => defmt::debug!("ACL cid={} len={}", cid, l2cap_len),
@@ -252,7 +272,12 @@ fn handle_read_by_type(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) 
     };
 
     if pdu.len() >= 7 && pdu[5] == 0x03 && pdu[6] == 0x28 && start <= 2 && end >= 2 {
-        send_l2cap(sdc, handle, 0x0004, &[0x09, 7, 2, 0, 0x02, 3, 0, 0x00, 0x2a]);
+        send_l2cap(
+            sdc,
+            handle,
+            0x0004,
+            &[0x09, 7, 2, 0, 0x02, 3, 0, 0x00, 0x2a],
+        );
     } else if pdu.len() >= 7 && pdu[5] == 0x00 && pdu[6] == 0x2a && start <= 3 && end >= 3 {
         send_l2cap(sdc, handle, 0x0004, b"\x09\x0b\x03\x00ESB CONN");
     } else {
@@ -367,13 +392,19 @@ fn build_sdc<'d, const N: usize>(
         .support_peripheral()
         .peripheral_count(1)?;
     let required = builder.required_memory()?;
-    defmt::info!("SDC connectable required memory={} configured={}", required, N);
+    defmt::info!(
+        "SDC connectable required memory={} configured={}",
+        required,
+        N
+    );
     usb_log!("SDC memory required={} configured={}", required, N);
     builder.build(p, rng, mpsl, mem)
 }
 
 async fn start_connectable_advertising(sdc: &SoftdeviceController<'_>) {
-    let event_mask = EventMask::new().enable_le_meta(true).enable_disconnection_complete(true);
+    let event_mask = EventMask::new()
+        .enable_le_meta(true)
+        .enable_disconnection_complete(true);
     SetEventMask::new(event_mask).exec(sdc).await.unwrap();
 
     let le_event_mask = LeEventMask::new()

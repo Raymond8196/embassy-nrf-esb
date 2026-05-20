@@ -388,7 +388,10 @@ mod tests {
         let pool = PacketPool::<2, 16>::new();
 
         let idx = pool.alloc_tx().expect("free tx slot");
-        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::TX_ALLOCATED);
+        assert_eq!(
+            pool.state[idx].load(core::sync::atomic::Ordering::Acquire),
+            state::TX_ALLOCATED
+        );
         assert_eq!(pool.try_dequeue_tx(), None);
 
         unsafe {
@@ -401,10 +404,16 @@ mod tests {
 
         let claimed = pool.try_dequeue_tx().expect("queued tx slot");
         assert_eq!(claimed, idx);
-        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::IN_DMA);
+        assert_eq!(
+            pool.state[idx].load(core::sync::atomic::Ordering::Acquire),
+            state::IN_DMA
+        );
 
         pool.release_tx(idx);
-        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
+        assert_eq!(
+            pool.state[idx].load(core::sync::atomic::Ordering::Acquire),
+            state::FREE
+        );
     }
 
     #[test]
@@ -426,8 +435,14 @@ mod tests {
 
         let claimed_pipe1 = pool.try_dequeue_tx_for_pipe(1).expect("pipe1 queued slot");
         assert_eq!(claimed_pipe1, pipe1);
-        assert_eq!(pool.state[pipe1].load(core::sync::atomic::Ordering::Acquire), state::IN_DMA);
-        assert_eq!(pool.state[pipe0].load(core::sync::atomic::Ordering::Acquire), state::TX_QUEUED);
+        assert_eq!(
+            pool.state[pipe1].load(core::sync::atomic::Ordering::Acquire),
+            state::IN_DMA
+        );
+        assert_eq!(
+            pool.state[pipe0].load(core::sync::atomic::Ordering::Acquire),
+            state::TX_QUEUED
+        );
 
         let claimed_any = pool.try_dequeue_tx().expect("remaining queued slot");
         assert_eq!(claimed_any, pipe0);
@@ -442,11 +457,17 @@ mod tests {
 
         let idx = pool.alloc_tx().expect("free tx slot");
         pool.cancel_tx(idx);
-        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
+        assert_eq!(
+            pool.state[idx].load(core::sync::atomic::Ordering::Acquire),
+            state::FREE
+        );
 
         let idx = pool.alloc_tx().expect("reused tx slot");
         assert_ready(pool.enqueue_tx(idx));
         pool.cancel_tx(idx);
-        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
+        assert_eq!(
+            pool.state[idx].load(core::sync::atomic::Ordering::Acquire),
+            state::FREE
+        );
     }
 }
