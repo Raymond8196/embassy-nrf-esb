@@ -90,6 +90,7 @@ buffer ────────────────────────�
 - [Implementation Plan](docs/plan.md)
 - [Roadmap to 9/10](docs/roadmap-to-9.md)
 - [Core ESB Verification](docs/core-verification.md)
+- [RMK ESB Integration Notes](docs/rmk-integration.md)
 - [M10 MPSL Verification](docs/m10-verification.md)
 
 ## License
