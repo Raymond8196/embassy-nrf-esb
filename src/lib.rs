@@ -42,6 +42,7 @@ pub(crate) mod radio;
 pub mod state_machine;
 pub mod suspend;
 pub mod timer;
+pub mod transport;
 
 #[cfg(feature = "mpsl")]
 pub mod mpsl_timeslot;

@@ -29,6 +29,7 @@ The current roadmap is tracked in [Roadmap to 9/10](docs/roadmap-to-9.md).
 - Retransmission with configurable attempts
 - Embassy async API (`send().await`, `receive().await`)
 - Suspend/resume for MPSL timeslots and BLE/ESB hot-switching
+- Small transport framing helpers for RMK-style multi-split payloads
 - Configurable timer (TIMER1/2/3/4; TIMER0 reserved for MPSL)
 - `defmt` support
 
