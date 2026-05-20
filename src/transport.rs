@@ -12,6 +12,18 @@ pub const TRANSPORT_VERSION: u8 = 1;
 /// Header size in bytes.
 pub const TRANSPORT_HEADER_LEN: usize = 5;
 
+/// Return the ESB payload length required to carry a framed higher-level
+/// payload of `payload_len` bytes.
+pub const fn required_esb_payload_len(payload_len: usize) -> usize {
+    TRANSPORT_HEADER_LEN + payload_len
+}
+
+/// Return whether an ESB `payload_length` can carry a framed higher-level
+/// payload of `payload_len` bytes.
+pub const fn fits_esb_payload(esb_payload_len: u8, payload_len: usize) -> bool {
+    required_esb_payload_len(payload_len) <= esb_payload_len as usize
+}
+
 /// Header used by higher-level split protocols carried over ESB.
 ///
 /// Layout:
@@ -181,7 +193,7 @@ impl<const N: usize> Default for SequenceTracker<N> {
 mod tests {
     use super::{
         SequenceTracker, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportHeader, decode_frame,
-        encode_frame,
+        encode_frame, fits_esb_payload, required_esb_payload_len,
     };
     use crate::error::Error;
 
@@ -224,6 +236,14 @@ mod tests {
             encode_frame(0, 0, 0, &[1], &mut frame),
             Err(Error::InvalidParam)
         );
+    }
+
+    #[test]
+    fn required_payload_length_includes_transport_header() {
+        assert_eq!(required_esb_payload_len(0), TRANSPORT_HEADER_LEN);
+        assert_eq!(required_esb_payload_len(32), TRANSPORT_HEADER_LEN + 32);
+        assert!(fits_esb_payload(37, 32));
+        assert!(!fits_esb_payload(36, 32));
     }
 
     #[test]

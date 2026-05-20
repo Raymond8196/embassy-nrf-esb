@@ -58,6 +58,10 @@ The current `EsbConfig::default().payload_length` is 32, so RMK ESB builds
 should explicitly set a larger payload length if RMK's serialized split message
 can occupy the Gazell-era maximum.
 
+Use `transport::required_esb_payload_len(SPLIT_MESSAGE_MAX_SIZE)` and
+`transport::fits_esb_payload(config.payload_length, SPLIT_MESSAGE_MAX_SIZE)` in
+the RMK adapter or board config validation to catch this before runtime.
+
 ## MVP Binding Policy
 
 Use static binding first:
@@ -143,4 +147,3 @@ Metrics to log:
 - split message latency
 - decode/deserialize errors
 - binding mismatch drops
-
