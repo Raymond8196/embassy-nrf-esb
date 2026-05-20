@@ -189,11 +189,78 @@ impl<const N: usize> Default for SequenceTracker<N> {
     }
 }
 
+/// Static binding table for validating `pipe -> device_id` routing.
+///
+/// Each entry maps a local ESB pipe to the application-level device id that is
+/// allowed to send frames on that pipe. This is intentionally small and generic;
+/// pairing, persistence, and policy belong in the higher-level firmware.
+#[derive(Debug, Clone, Copy)]
+pub struct StaticBindingTable<const N: usize> {
+    pipe_to_device: [Option<u8>; N],
+}
+
+impl<const N: usize> StaticBindingTable<N> {
+    /// Create an empty binding table.
+    pub const fn new() -> Self {
+        Self {
+            pipe_to_device: [None; N],
+        }
+    }
+
+    /// Create a binding table from pipe-indexed entries.
+    pub const fn from_pipe_entries(pipe_to_device: [Option<u8>; N]) -> Self {
+        Self { pipe_to_device }
+    }
+
+    /// Bind one pipe to one device id.
+    pub fn bind(&mut self, pipe: u8, device_id: u8) -> Result<(), Error> {
+        let index = pipe as usize;
+        if index >= N {
+            return Err(Error::InvalidParam);
+        }
+
+        self.pipe_to_device[index] = Some(device_id);
+        Ok(())
+    }
+
+    /// Clear one pipe binding.
+    pub fn unbind(&mut self, pipe: u8) -> Result<(), Error> {
+        let index = pipe as usize;
+        if index >= N {
+            return Err(Error::InvalidParam);
+        }
+
+        self.pipe_to_device[index] = None;
+        Ok(())
+    }
+
+    /// Return the device bound to `pipe`, if any.
+    pub fn device_for_pipe(&self, pipe: u8) -> Result<Option<u8>, Error> {
+        let index = pipe as usize;
+        if index >= N {
+            return Err(Error::InvalidParam);
+        }
+
+        Ok(self.pipe_to_device[index])
+    }
+
+    /// Check whether a frame from `device_id` is allowed on `pipe`.
+    pub fn accepts(&self, pipe: u8, device_id: u8) -> Result<bool, Error> {
+        Ok(self.device_for_pipe(pipe)? == Some(device_id))
+    }
+}
+
+impl<const N: usize> Default for StaticBindingTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        SequenceTracker, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportHeader, decode_frame,
-        encode_frame, fits_esb_payload, required_esb_payload_len,
+        SequenceTracker, StaticBindingTable, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION,
+        TransportHeader, decode_frame, encode_frame, fits_esb_payload, required_esb_payload_len,
     };
     use crate::error::Error;
 
@@ -258,5 +325,32 @@ mod tests {
 
         tracker.reset_device(0).unwrap();
         assert_eq!(tracker.accept(0, 2), Ok(true));
+    }
+
+    #[test]
+    fn static_binding_table_validates_pipe_to_device_mapping() {
+        let mut bindings = StaticBindingTable::<4>::new();
+
+        assert_eq!(bindings.accepts(1, 7), Ok(false));
+        bindings.bind(1, 7).unwrap();
+
+        assert_eq!(bindings.device_for_pipe(1), Ok(Some(7)));
+        assert_eq!(bindings.accepts(1, 7), Ok(true));
+        assert_eq!(bindings.accepts(1, 8), Ok(false));
+        assert_eq!(bindings.accepts(2, 7), Ok(false));
+        assert_eq!(bindings.bind(4, 1), Err(Error::InvalidParam));
+
+        bindings.unbind(1).unwrap();
+        assert_eq!(bindings.device_for_pipe(1), Ok(None));
+    }
+
+    #[test]
+    fn static_binding_table_can_be_const_initialized() {
+        const BINDINGS: StaticBindingTable<3> =
+            StaticBindingTable::from_pipe_entries([Some(10), None, Some(12)]);
+
+        assert_eq!(BINDINGS.accepts(0, 10), Ok(true));
+        assert_eq!(BINDINGS.accepts(2, 12), Ok(true));
+        assert_eq!(BINDINGS.accepts(1, 10), Ok(false));
     }
 }

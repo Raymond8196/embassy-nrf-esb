@@ -67,6 +67,7 @@ As of 2026-05-20:
 - Transport frame rejects truncated buffers and unsupported versions.
 - Transport frame sizing helpers include the transport header.
 - `SequenceTracker` accepts new per-device sequences and rejects duplicates.
+- `StaticBindingTable` validates pipe-to-device mappings and can be const-initialized.
 
 ## Hardware Matrix
 

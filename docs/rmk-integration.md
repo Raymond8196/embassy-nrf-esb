@@ -32,7 +32,7 @@ RMK split manager
         └── embassy-nrf-esb
               ├── EsbPtx / EsbPrx
               ├── PacketPool
-              └── transport::{encode_frame, decode_frame, SequenceTracker}
+              └── transport::{encode_frame, decode_frame, SequenceTracker, StaticBindingTable}
 ```
 
 ## Frame Format
@@ -73,6 +73,7 @@ Use static binding first:
 | peripheral -> central message | PTX data packet |
 | central -> peripheral message | ACK payload where possible; explicit downlink packet later if needed |
 | duplicate suppression | `SequenceTracker<MAX_DEVICES>` in RMK adapter |
+| binding validation | `StaticBindingTable<PIPE_COUNT>` |
 
 Do not include dynamic pairing, channel hopping, or encryption in the first
 RMK ESB prototype.
@@ -105,7 +106,7 @@ Read path:
 1. `EsbPrx::receive().await`.
 2. Get `pipe()` from `ReceivedPacket`.
 3. `decode_frame(packet.payload())`.
-4. Verify static binding: `device_id` is allowed on that pipe.
+4. Verify static binding with `StaticBindingTable::accepts(pipe, device_id)`.
 5. Use `SequenceTracker::accept(device_id, sequence)`.
 6. Drop duplicates before deserializing/publishing key events.
 7. Deserialize `SplitMessage`.
