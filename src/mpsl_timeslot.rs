@@ -22,6 +22,13 @@ use crate::error::Error;
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
 
+fn mpsl_ok(ret: i32) -> Result<(), Error> {
+    RetVal::from(ret)
+        .to_result()
+        .map(|_| ())
+        .map_err(|_| Error::Mpsl)
+}
+
 struct Timer0RawMutex;
 unsafe impl RawMutex for Timer0RawMutex {
     const INIT: Self = Timer0RawMutex;
@@ -220,7 +227,13 @@ unsafe extern "C" fn timeslot_callback(
                 core::ptr::from_ref(&state.request)
             });
             let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-            assert!(ret == 0);
+            if ret < 0 {
+                STATE.with_inner(|state| {
+                    state.counters.invalid_return += 1;
+                    state.done = true;
+                    state.waker.wake();
+                });
+            }
             core::ptr::null_mut()
         }
 
@@ -302,7 +315,7 @@ pub async fn run_single_slot(
     let ret = unsafe {
         raw::mpsl_timeslot_session_open(Some(timeslot_callback), (&mut session_id) as *mut _)
     };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     let _drop = OnDrop::new(|| {
         let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
@@ -322,7 +335,7 @@ pub async fn run_single_slot(
 
     let request = STATE.with_inner(|state| core::ptr::from_ref(&state.request));
     let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     poll_fn(|cx| {
         STATE.with_inner(|state| {
@@ -339,7 +352,7 @@ pub async fn run_single_slot(
     _drop.defuse();
     unsafe {
         let ret = raw::mpsl_timeslot_session_close(session_id);
-        RetVal::from(ret).to_result().unwrap();
+        mpsl_ok(ret)?;
     }
 
     Ok(STATE.with_inner(|state| state.counters))
@@ -364,7 +377,7 @@ pub async fn run_chained_slots(
     let ret = unsafe {
         raw::mpsl_timeslot_session_open(Some(timeslot_callback), (&mut session_id) as *mut _)
     };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     let _drop = OnDrop::new(|| {
         let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
@@ -384,7 +397,7 @@ pub async fn run_chained_slots(
 
     let request = STATE.with_inner(|state| core::ptr::from_ref(&state.request));
     let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     poll_fn(|cx| {
         STATE.with_inner(|state| {
@@ -401,7 +414,7 @@ pub async fn run_chained_slots(
     _drop.defuse();
     unsafe {
         let ret = raw::mpsl_timeslot_session_close(session_id);
-        RetVal::from(ret).to_result().unwrap();
+        mpsl_ok(ret)?;
     }
 
     Ok(STATE.with_inner(|state| state.counters))
@@ -565,6 +578,15 @@ unsafe extern "C" fn ptx_timeslot_callback(
             state.counters.start += 1;
             state.phase = PtxPhase::Tx;
 
+            let (Some(config), Some(addresses)) = (state.config.as_ref(), state.addresses.as_ref())
+            else {
+                state.counters.invalid_return += 1;
+                state.done = true;
+                state.waker.wake();
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                return &mut state.return_param as *mut _;
+            };
+
             // Power cycle RADIO.
             let r = pac::RADIO;
             r.power().write(|w| w.set_power(false));
@@ -572,10 +594,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
             // Full ESB register init.
             let mut radio = crate::radio::EsbRadio::new(pac::RADIO);
-            radio.init(
-                state.config.as_ref().unwrap(),
-                state.addresses.as_ref().unwrap(),
-            );
+            radio.init(config, addresses);
             radio.restore_pid_state([state.pid; 8]);
 
             // Prepare TX buffer — payload is a u32 packet counter (LE).
@@ -764,7 +783,13 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 core::ptr::from_ref(&state.request)
             });
             let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-            assert!(ret == 0);
+            if ret < 0 {
+                PTX_STATE.with_inner(|state| {
+                    state.counters.invalid_return += 1;
+                    state.done = true;
+                    state.waker.wake();
+                });
+            }
             core::ptr::null_mut()
         }
 
@@ -815,7 +840,7 @@ pub async fn run_ptx_slots(
     let ret = unsafe {
         raw::mpsl_timeslot_session_open(Some(ptx_timeslot_callback), (&mut session_id) as *mut _)
     };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     let _drop = OnDrop::new(|| {
         let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
@@ -847,7 +872,7 @@ pub async fn run_ptx_slots(
 
     let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
     let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     poll_fn(|cx| {
         PTX_STATE.with_inner(|state| {
@@ -864,7 +889,7 @@ pub async fn run_ptx_slots(
     _drop.defuse();
     unsafe {
         let ret = raw::mpsl_timeslot_session_close(session_id);
-        RetVal::from(ret).to_result().unwrap();
+        mpsl_ok(ret)?;
     }
 
     Ok(PTX_STATE.with_inner(|state| PtxSlotResult {
@@ -1019,15 +1044,21 @@ unsafe extern "C" fn prx_timeslot_callback(
             state.counters.start += 1;
             state.slot_active = true;
 
+            let (Some(config), Some(addresses)) = (state.config.as_ref(), state.addresses.as_ref())
+            else {
+                state.counters.invalid_return += 1;
+                state.done = true;
+                state.waker.wake();
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                return &mut state.return_param as *mut _;
+            };
+
             let r = pac::RADIO;
             r.power().write(|w| w.set_power(false));
             r.power().write(|w| w.set_power(true));
 
             let mut radio = EsbRadio::new(pac::RADIO);
-            radio.init(
-                state.config.as_ref().unwrap(),
-                state.addresses.as_ref().unwrap(),
-            );
+            radio.init(config, addresses);
             radio.restore_pid_state(state.last_pid);
             radio.restore_crc_state(state.last_crc);
             radio.restore_detection_valid_state(state.last_valid);
@@ -1226,7 +1257,13 @@ unsafe extern "C" fn prx_timeslot_callback(
                 core::ptr::from_ref(&state.request)
             });
             let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-            assert!(ret == 0);
+            if ret < 0 {
+                PRX_STATE.with_inner(|state| {
+                    state.counters.invalid_return += 1;
+                    state.done = true;
+                    state.waker.wake();
+                });
+            }
             core::ptr::null_mut()
         }
 
@@ -1278,7 +1315,7 @@ pub async fn run_prx_slots(
     let ret = unsafe {
         raw::mpsl_timeslot_session_open(Some(prx_timeslot_callback), (&mut session_id) as *mut _)
     };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     let _drop = OnDrop::new(|| {
         let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
@@ -1311,7 +1348,7 @@ pub async fn run_prx_slots(
 
     let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
     let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-    RetVal::from(ret).to_result().unwrap();
+    mpsl_ok(ret)?;
 
     poll_fn(|cx| {
         PRX_STATE.with_inner(|state| {
@@ -1328,7 +1365,7 @@ pub async fn run_prx_slots(
     _drop.defuse();
     unsafe {
         let ret = raw::mpsl_timeslot_session_close(session_id);
-        RetVal::from(ret).to_result().unwrap();
+        mpsl_ok(ret)?;
     }
 
     Ok(PRX_STATE.with_inner(|state| PrxSlotResult {

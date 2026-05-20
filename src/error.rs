@@ -20,6 +20,8 @@ pub enum Error {
     OutOfMemory,
     /// Cannot suspend — state machine is mid-transaction.
     Busy,
+    /// MPSL raw API returned an error.
+    Mpsl,
 }
 
 const _: () = {
