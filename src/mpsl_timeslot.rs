@@ -917,6 +917,7 @@ struct PrxInnerState {
     bad_crc_count: u32,
     last_pid: [u8; NUM_PIPES],
     last_crc: [u16; NUM_PIPES],
+    last_valid: [bool; NUM_PIPES],
     enabled_pipes: u8,
     slot_active: bool,
     ack_counter: [u32; NUM_PIPES],
@@ -988,6 +989,7 @@ impl PrxState {
                 bad_crc_count: 0,
                 last_pid: [0; NUM_PIPES],
                 last_crc: [0; NUM_PIPES],
+                last_valid: [false; NUM_PIPES],
                 enabled_pipes: 0x01,
                 slot_active: false,
                 ack_counter: [0; NUM_PIPES],
@@ -1028,6 +1030,7 @@ unsafe extern "C" fn prx_timeslot_callback(
             );
             radio.restore_pid_state(state.last_pid);
             radio.restore_crc_state(state.last_crc);
+            radio.restore_detection_valid_state(state.last_valid);
 
             // Manual ACK lets us program TXADDRESS from RXMATCH before ACK TX.
             let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
@@ -1080,6 +1083,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                         let crc = r.rxcrc().read().rxcrc() as u16;
 
                         let is_dup = pipe < NUM_PIPES
+                            && state.last_valid[pipe]
                             && state.last_crc[pipe] == crc
                             && state.last_pid[pipe] == pid;
 
@@ -1113,6 +1117,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                             if pipe < NUM_PIPES {
                                 state.last_pid[pipe] = pid;
                                 state.last_crc[pipe] = crc;
+                                state.last_valid[pipe] = true;
                                 state.rx_per_pipe[pipe] += 1;
                             }
                             state.rx_count += 1;
@@ -1292,6 +1297,7 @@ pub async fn run_prx_slots(
         state.bad_crc_count = 0;
         state.last_pid = [0; NUM_PIPES];
         state.last_crc = [0; NUM_PIPES];
+        state.last_valid = [false; NUM_PIPES];
         state.enabled_pipes = enabled_pipes;
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];

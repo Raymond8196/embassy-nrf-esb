@@ -11,7 +11,7 @@ This document summarizes the traps, false starts, debugging signals, and practic
 - BLE-only diagnostic: `examples/mpsl_ble_connectable.rs`.
 - PTX timeslot example: `examples/mpsl_ptx_in_slot.rs`.
 - PRX timeslot example without BLE: `examples/mpsl_prx_in_slot.rs`.
-- Latest verified status: `ESB M10` can connect and stay connected in nRF Connect, but ESB ACK coverage under an active BLE connection is currently poor.
+- Latest verified status: MPSL PRX/PTX diagnostic multi-pipe ACK payload path passes on two dongles with both pipes at `tx=450 ack=450 ackpl=450 ctr=450`. `ESB M10` can connect and stay connected in nRF Connect; ESB ACK coverage under an active BLE connection improves with relaxed connection parameters but still needs scheduling work.
 
 ## Big Picture Lessons
 
@@ -115,11 +115,15 @@ Rule:
 
 ### OVERSTAYED Should Not Panic In Product Code
 
-Current MPSL paths still panic on `OVERSTAYED`.
+Early MPSL paths panicked on `OVERSTAYED`. That was useful while proving control flow, but it is not acceptable for keyboard firmware.
 
 Pitfall:
 
 - Panic is useful during bring-up, but a keyboard firmware must not crash because a radio slot overran.
+
+What changed:
+
+- `OVERSTAYED` now becomes observable counters plus safe stop/end behavior in the MPSL stopgap path.
 
 Rule:
 
@@ -246,6 +250,81 @@ Fix:
 Rule:
 
 - If ACK payloads arrive but counters do not progress, check whether the PRX session is being restarted.
+
+### Multi-Pipe Correctness Needs Pipe Metadata At Queue Time
+
+Changing a global PTX pipe works in a simple single-task demo, but it is not a reliable API boundary for a real dongle or keyboard transport.
+
+Pitfall:
+
+- A queued packet can be sent on the wrong pipe if another task calls `set_pipe()` before the ISR dequeues it.
+- PRX ACK payloads queued for pipe 1 can be consumed by a packet received on pipe 0 if the TX queue is not pipe-aware.
+
+What changed:
+
+- PTX now has `send_to(pipe, payload)` and `send_no_ack_to(pipe, payload)`.
+- The packet's software header carries the intended TX pipe.
+- PRX ACK selection claims only queued packets whose header pipe matches the current RX pipe.
+- `set_pipe()` remains only as a default-pipe convenience for simple examples.
+
+Rule:
+
+- Treat pipe as packet metadata, not mutable ambient driver state.
+- For multi-split dongles, queue ACK payloads by destination pipe or claim them with explicit pipe filtering.
+
+### Buffer Visibility Matters As Much As Radio Timing
+
+The per-pipe ACK scan exposed a more general Rust/DMA ownership issue.
+
+Pitfall:
+
+- If `alloc_tx()` immediately marks a buffer as queued, ISR-side scans can see that slot while application code is still filling the header and payload.
+- That creates a race even if the radio logic is otherwise correct.
+
+What changed:
+
+- `PacketPool` TX ownership is now `free -> tx_allocated -> tx_queued -> in_dma -> free`.
+- Application code fills a `tx_allocated` buffer first; only `enqueue_tx()` publishes it to ISR-side scans.
+
+Rule:
+
+- Separate allocation from queue publication. A buffer is not visible to ISR or DMA until all software metadata and payload bytes are complete.
+
+### Duplicate Detection Needs A Valid Bit
+
+PID and CRC are not enough to decide whether the first packet on a pipe is a duplicate.
+
+Pitfall:
+
+- A fresh detector initialized to `pid=0, crc=0` can falsely reject the first packet if the incoming packet happens to match those values.
+
+What changed:
+
+- Exclusive PRX duplicate detection now tracks per-pipe `last_valid`.
+- The MPSL PRX diagnostic path mirrors the same guard.
+- Suspend/restore now preserves duplicate-detection valid bits along with PID and CRC.
+
+Rule:
+
+- Duplicate detection state is a tuple of `valid + pid + crc`.
+- Persist all three fields across suspend/resume and timeslot reinitialization.
+
+### Hardware Regression Beats Plausible Theory
+
+The decisive signal for Batch 4 was not code inspection; it was the two-dongle run after fixing queue ownership, pipe metadata, and valid bits.
+
+Measured result:
+
+```text
+pipe=0 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+pipe=1 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+DONE
+```
+
+Rule:
+
+- For ESB timing work, software checks are necessary but insufficient.
+- Keep small hardware-verifiable checkpoints and record the exact final counters.
 
 ## BLE Connectable Lessons
 
@@ -385,17 +464,19 @@ Rule:
 
 ### DFU Serial Names Change After Flashing
 
-On macOS, the DFU bootloader and app CDC ports can have different names.
+DFU bootloader and app CDC ports can have different names. They can also appear and disappear briefly while each dongle re-enumerates.
 
 Observed examples:
 
 - DFU ports: `/dev/tty.usbmodemC2A1EFA145C41`, `/dev/tty.usbmodemDC08665938A21`.
 - App CDC port: `/dev/tty.usbmodem21301` or `/dev/tty.usbmodem21201`.
+- Linux run: `lsusb` showed two Nordic Open DFU bootloaders while `/dev/ttyACM*` exposed only one stable node at a time. After flashing PRX, the remaining DFU target appeared via `/sys/class/tty/ttyACM1`, and `nrfutil` could program `/dev/ttyACM1`.
 
 Rule:
 
 - Always list `/dev/tty.*` and `/dev/cu.*` before and after flashing.
 - Do not assume the same port remains after DFU.
+- On Linux, check both `lsusb` and `/sys/class/tty` if `/dev/ttyACM*` looks inconsistent.
 
 ### PRX May Not Expose USB CDC
 
@@ -476,22 +557,32 @@ Next actions:
 
 ### MPSL Stopgap Correctness
 
-Review backlog still applies:
+Recently closed stopgaps:
 
-- Convert `OVERSTAYED` panic to safe counters/termination.
-- Fix PRX PID/CRC state preservation.
-- Add MPSL re-entry guard.
-- Use `EsbHeader` helpers instead of manual header bit writes.
+- `OVERSTAYED` no longer panics.
+- PRX PID/CRC state is preserved instead of being cleared by a fresh radio wrapper.
+- MPSL free functions have busy guards.
+- MPSL header writes use `EsbHeader` helpers.
+
+Remaining:
+
+- Static global MPSL buffers and free-function API are still diagnostic scaffolding, not a final Embassy-quality wrapper.
+- Power-cycle-per-slot timing should be measured under shorter slots and active BLE.
 
 ### Protocol/API Correctness
 
-Review backlog still applies:
+Recently closed:
 
-- Per-pipe ACK payload queue.
-- Per-packet TX pipe metadata.
-- Duplicate detection valid bits.
 - Bound `EsbRadio::stop()` waits.
 - Align fallback ACK buffer.
+- Per-pipe ACK payload selection.
+- Per-packet TX pipe metadata.
+- Duplicate detection valid bits.
+
+Remaining:
+
+- Broader `UnsafeCell` audit is still needed; a first pass masks RADIO IRQ around the most direct task-side state-machine access, but async suspend poll paths and future MPSL wrappers need the same level of scrutiny.
+- Add host-side tests around packet-pool TX ownership and pipe-filtered ACK selection if the internals can be tested without PAC dependencies.
 
 ### BLE Host Layer
 

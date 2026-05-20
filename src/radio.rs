@@ -50,6 +50,8 @@ pub(crate) struct EsbRadio {
     last_crc: [u16; NUM_PIPES],
     /// Last received PID per pipe, for duplicate detection.
     last_pid: [u8; NUM_PIPES],
+    /// Whether the duplicate-detection entry for each pipe is initialized.
+    last_valid: [bool; NUM_PIPES],
 }
 
 #[allow(dead_code)]
@@ -60,6 +62,7 @@ impl EsbRadio {
             radio,
             last_crc: [0; NUM_PIPES],
             last_pid: [0; NUM_PIPES],
+            last_valid: [false; NUM_PIPES],
         }
     }
 
@@ -435,7 +438,10 @@ impl EsbRadio {
     /// Uses exact CRC + PID comparison (esb-ng line 364).
     /// Caller reads PID from DMA buffer after `check_packet()` returns NewPacket.
     pub(crate) fn check_duplicate(&self, pipe: usize, pid: u8, crc: u16) -> bool {
-        pipe < NUM_PIPES && self.last_crc[pipe] == crc && self.last_pid[pipe] == pid
+        pipe < NUM_PIPES
+            && self.last_valid[pipe]
+            && self.last_crc[pipe] == crc
+            && self.last_pid[pipe] == pid
     }
 
     /// Update duplicate detection tracking for a pipe after accepting a new packet.
@@ -444,6 +450,7 @@ impl EsbRadio {
         if pipe < NUM_PIPES {
             self.last_crc[pipe] = crc;
             self.last_pid[pipe] = pid;
+            self.last_valid[pipe] = true;
         }
     }
 
@@ -562,6 +569,7 @@ impl EsbRadio {
     pub(crate) fn reset_detection_state(&mut self) {
         self.last_crc = [0; NUM_PIPES];
         self.last_pid = [0; NUM_PIPES];
+        self.last_valid = [false; NUM_PIPES];
     }
 
     /// Save per-pipe PID state for suspend.
@@ -584,6 +592,16 @@ impl EsbRadio {
         self.last_crc = crc;
     }
 
+    /// Save duplicate-detection valid bits for suspend.
+    pub(crate) fn save_detection_valid_state(&self) -> [bool; NUM_PIPES] {
+        self.last_valid
+    }
+
+    /// Restore duplicate-detection valid bits after resume.
+    pub(crate) fn restore_detection_valid_state(&mut self, valid: [bool; NUM_PIPES]) {
+        self.last_valid = valid;
+    }
+
     /// Power-cycle the RADIO peripheral (for MPSL timeslot transitions).
     /// PS §6.17: POWER register resets all RADIO registers to initial values.
     pub(crate) fn power_cycle(&mut self) {
@@ -597,5 +615,51 @@ impl EsbRadio {
     #[inline]
     pub(crate) fn regs(&self) -> Radio {
         self.radio
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EsbRadio;
+
+    #[test]
+    fn duplicate_detection_requires_valid_entry() {
+        let mut radio = EsbRadio::new(crate::pac::RADIO);
+
+        assert!(!radio.check_duplicate(0, 0, 0));
+
+        radio.update_detection(0, 0, 0);
+        assert!(radio.check_duplicate(0, 0, 0));
+        assert!(!radio.check_duplicate(0, 1, 0));
+        assert!(!radio.check_duplicate(0, 0, 1));
+        assert!(!radio.check_duplicate(8, 0, 0));
+    }
+
+    #[test]
+    fn duplicate_detection_valid_bits_round_trip_through_save_restore() {
+        let mut radio = EsbRadio::new(crate::pac::RADIO);
+        radio.update_detection(2, 3, 0x1234);
+
+        let pid = radio.save_pid_state();
+        let crc = radio.save_crc_state();
+        let valid = radio.save_detection_valid_state();
+
+        let mut restored = EsbRadio::new(crate::pac::RADIO);
+        restored.restore_pid_state(pid);
+        restored.restore_crc_state(crc);
+        restored.restore_detection_valid_state(valid);
+
+        assert!(restored.check_duplicate(2, 3, 0x1234));
+        assert!(!restored.check_duplicate(1, 3, 0x1234));
+    }
+
+    #[test]
+    fn reset_detection_clears_valid_bits() {
+        let mut radio = EsbRadio::new(crate::pac::RADIO);
+        radio.update_detection(4, 2, 0xabcd);
+        assert!(radio.check_duplicate(4, 2, 0xabcd));
+
+        radio.reset_detection_state();
+        assert!(!radio.check_duplicate(4, 2, 0xabcd));
     }
 }

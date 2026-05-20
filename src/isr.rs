@@ -185,6 +185,18 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Returns after queuing. The packet will be sent in the next
     /// RADIO ISR cycle.
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
+        let pipe = self.default_pipe();
+        self.send_to(pipe, payload).await
+    }
+
+    /// Queue a packet for transmission on a specific pipe.
+    ///
+    /// The pipe is stored with the packet, so queued packets are not affected
+    /// by later `set_pipe()` calls or by other tasks enqueueing packets.
+    pub async fn send_to(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
+        if pipe >= 8 {
+            return Err(Error::InvalidParam);
+        }
         if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
         }
@@ -195,6 +207,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         let idx = self.pool.alloc_tx().ok_or(Error::TxFull)?;
 
         let header = unsafe { self.pool.header_mut(idx) };
+        header.pipe = pipe;
         header.length = payload.len() as u8;
         header.set_no_ack(false);
 
@@ -211,6 +224,15 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     ///
     /// NoAck packets do not wait for acknowledgment — fire and forget.
     pub async fn send_no_ack(&self, payload: &[u8]) -> Result<(), Error> {
+        let pipe = self.default_pipe();
+        self.send_no_ack_to(pipe, payload).await
+    }
+
+    /// Queue a NoAck packet for transmission on a specific pipe.
+    pub async fn send_no_ack_to(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
+        if pipe >= 8 {
+            return Err(Error::InvalidParam);
+        }
         if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
         }
@@ -221,6 +243,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         let idx = self.pool.alloc_tx().ok_or(Error::TxFull)?;
 
         let header = unsafe { self.pool.header_mut(idx) };
+        header.pipe = pipe;
         header.length = payload.len() as u8;
         header.set_no_ack(true);
 
@@ -252,15 +275,27 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     }
 
     /// Set the TX pipe for subsequent transmissions.
+    ///
+    /// This is a convenience default for `send()`/`send_no_ack()`. Prefer
+    /// `send_to()` when multiple tasks or queued multi-pipe traffic are used.
     pub fn set_pipe(&self, pipe: u8) {
+        debug_assert!(pipe < 8);
+        if pipe >= 8 {
+            return;
+        }
+        disable_radio_irq();
         let sm = unsafe { &mut *self.sm.get() };
         sm.tx_pipe = pipe;
+        unpend_radio_irq();
+        enable_radio_irq();
     }
 
     /// Get current PTX state.
     pub fn state(&self) -> crate::state_machine::StatePtx {
-        // SAFETY: Read-only access, state is updated atomically by ISR.
-        unsafe { &*self.sm.get() }.state()
+        disable_radio_irq();
+        let state = unsafe { &*self.sm.get() }.state();
+        enable_radio_irq();
+        state
     }
 
     /// Check if max retransmit attempts was reached since last check.
@@ -274,6 +309,13 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// Check if the PTX transmitter is idle (no packet in flight).
     pub fn is_tx_idle(&self) -> bool {
         self.state() == crate::state_machine::StatePtx::Idle
+    }
+
+    fn default_pipe(&self) -> u8 {
+        disable_radio_irq();
+        let pipe = unsafe { &*self.sm.get() }.tx_pipe;
+        enable_radio_irq();
+        pipe
     }
 
     // ---- Suspend / Resume ----
@@ -451,10 +493,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Start listening for incoming packets.
     pub fn start_listening(&self) -> Result<(), Error> {
-        // SAFETY: App context only; ISR won't modify state until we
-        // call start_receiving which arms the radio.
+        disable_radio_irq();
         let sm = unsafe { &mut *self.sm.get() };
-        sm.start_receiving(self.pool)
+        let result = sm.start_receiving(self.pool);
+        unpend_radio_irq();
+        enable_radio_irq();
+        result
     }
 
     /// Receive the next packet (async).
@@ -469,6 +513,9 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
     /// Queue an ACK payload for a specific pipe.
     pub async fn send_ack_payload(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
         if payload.is_empty() || payload.len() > self.max_payload_len {
+            return Err(Error::InvalidParam);
+        }
+        if pipe >= 8 {
             return Err(Error::InvalidParam);
         }
         let payload_offset = EsbHeader::PAYLOAD_OFFSET;
@@ -491,15 +538,19 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Stop listening and go idle.
     pub fn stop(&self) {
-        // SAFETY: App context; ISR won't fire after we stop the radio.
+        disable_radio_irq();
         let sm = unsafe { &mut *self.sm.get() };
         sm.stop_receiving(self.pool);
+        unpend_radio_irq();
+        enable_radio_irq();
     }
 
     /// Get current PRX state.
     pub fn state(&self) -> crate::state_machine::StatePrx {
-        // SAFETY: Read-only access.
-        unsafe { &*self.sm.get() }.state()
+        disable_radio_irq();
+        let state = unsafe { &*self.sm.get() }.state();
+        enable_radio_irq();
+        state
     }
 
     // ---- Suspend / Resume ----

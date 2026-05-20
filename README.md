@@ -4,13 +4,22 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 
 ## Status
 
-**M0 — Repository skeleton.** Core types and build infrastructure in place.
+**Active development — ESB core and MPSL bring-up.**
+
+- Exclusive PTX/PRX ESB examples build and have been hardware-smoke tested during M9/M10 work.
+- ACK payloads, multi-pipe routing, NoAck sends, retransmission, and suspend/resume are implemented.
+- MPSL timeslot diagnostics for PTX/PRX build and have shown two-dongle multi-pipe ACK payload success.
+- BLE + ESB coexistence is functional in diagnostics, but active BLE connection scheduling still needs tuning before it is treated as product-ready.
+- RMK integration is planned next; no RMK transport adapter is included yet.
+
+The current roadmap is tracked in [Roadmap to 9/10](docs/roadmap-to-9.md).
 
 ## Goals
 
-1. **Drop-in replacement for Nordic ESB**; can replace Gazell when both sides are migrated
-2. **Open-source friendly** — Clean API following Embassy conventions, no PAC types in public API
-3. **MPSL timeslot support** — BLE + ESB concurrent operation (Phase 7)
+1. **Nordic ESB-compatible transport**; can replace Gazell-based RMK links when both sides are migrated
+2. **RMK multi-split support** — static-bound multi-pipe peripherals first, pairing/channel hopping later
+3. **Open-source friendly** — Clean API following Embassy conventions, no PAC types in the normal public API
+4. **MPSL timeslot support** — BLE + ESB concurrent operation behind an optional feature
 
 ## Features
 
@@ -23,13 +32,23 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 - Configurable timer (TIMER1/2/3/4; TIMER0 reserved for MPSL)
 - `defmt` support
 
+## MPSL Status
+
+The `mpsl` feature is experimental. It currently provides diagnostic helpers
+and examples for MPSL timeslot bring-up, PTX/PRX in slots, and nRF SDC BLE
+coexistence. These examples are useful for hardware validation, but the public
+timeslot API is not yet the final owned wrapper described in
+`docs/roadmap-to-9.md`.
+
+Do not treat the current MPSL free-function diagnostics as a stable API.
+
 ## Supported Chips
 
 | Chip | Feature | Status |
 |------|---------|--------|
-| nRF52840 | `nrf52840` | Primary target |
-| nRF52833 | `nrf52833` | Reserved |
-| nRF52832 | `nrf52832` | Reserved |
+| nRF52840 | `nrf52840` | Primary target; current hardware validation target |
+| nRF52833 | `nrf52833` | Feature reserved; not hardware-validated yet |
+| nRF52832 | `nrf52832` | Feature reserved; not hardware-validated yet |
 
 ## Dependencies
 
@@ -68,6 +87,8 @@ buffer ────────────────────────�
 ## Documentation
 
 - [Implementation Plan](docs/plan.md)
+- [Roadmap to 9/10](docs/roadmap-to-9.md)
+- [M10 MPSL Verification](docs/m10-verification.md)
 
 ## License
 

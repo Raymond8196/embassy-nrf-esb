@@ -13,6 +13,8 @@ pub struct EsbSavedState {
     pub pid: [u8; MAX_PIPES],
     /// Per-pipe last-received CRC (for duplicate detection on PRX side).
     pub last_crc: [u16; MAX_PIPES],
+    /// Whether the duplicate-detection entry for each pipe is initialized.
+    pub last_valid: [bool; MAX_PIPES],
     /// Active TX pipe at time of suspend (PTX only; ignored for PRX).
     pub tx_pipe: u8,
     /// Retransmit attempt counter at time of suspend (PTX only).
@@ -26,6 +28,7 @@ impl Default for EsbSavedState {
         Self {
             pid: [0; MAX_PIPES],
             last_crc: [0; MAX_PIPES],
+            last_valid: [false; MAX_PIPES],
             tx_pipe: 0,
             attempts: 0,
             protocol_state: SavedProtocolState::Idle,

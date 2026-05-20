@@ -2,19 +2,26 @@
 
 Created: 2026-05-19
 
-This document tracks M10 verification separately from the implementation plan in `docs/m10-plan.md`. Hardware validation is pending for the latest Step 7 work because no dongles are currently available.
+This document tracks M10 verification separately from the implementation plan in `docs/m10-plan.md`. The top-level status below reflects the latest recorded local compile checks and two-dongle hardware runs from 2026-05-20.
 
 ## Current Status
 
 | Step | Scope | Status | Notes |
 |------|-------|--------|-------|
-| 0 | MPSL init smoke | Build-only current pass | Hardware result not re-run in this pass |
-| 1 | Single timeslot request | Build-only current pass | Hardware result not re-run in this pass |
-| 2 | Chained timeslots | Build-only current pass | Hardware result not re-run in this pass |
-| 3-4 | PTX-in-timeslot + PID continuity | Build-only current pass | Existing `mpsl_ptx_in_slot` compiles |
-| 5-6 | PRX-in-timeslot + multi-pipe ACK payload | Build-only current pass | Existing `mpsl_prx_in_slot` compiles |
-| 7 | BLE coexistence first pass | Compile-only ready | New `mpsl_prx_ble` advertises `ESB M10` and enters PRX timeslots |
-| 8-9 | Split E2E + overnight | Not started | Requires two dongles and BLE central/PC validation |
+| 0 | MPSL init smoke | Build-verified | Hardware result exists from earlier bring-up but was not re-run after the latest stopgap fixes. |
+| 1 | Single timeslot request | Build-verified | `mpsl_request_basic` compile check passes; latest hardware re-run not recorded. |
+| 2 | Chained timeslots | Build-verified | `mpsl_request_chained` compile check passes; latest hardware re-run not recorded. |
+| 3-4 | PTX-in-timeslot + PID continuity | Hardware-smoke passed | `mpsl_ptx_in_slot` participates in the recorded two-dongle runs. |
+| 5-6 | PRX-in-timeslot + multi-pipe ACK payload | Hardware-smoke passed | `mpsl_prx_in_slot` + `mpsl_ptx_in_slot` reached pipe0/pipe1 `tx=450 ack=450 ackpl=450`. |
+| 7 | BLE coexistence first pass | Functional, needs tuning | `mpsl_prx_ble` can connect and stay connected; relaxed connection parameters restore useful ESB ACK coverage, but pipe1 remains below advertising-only throughput. |
+| 8 | RMK-style split E2E | Not started | Requires RMK transport adapter and keyboard-style traffic. |
+| 9 | Overnight/stress validation | Not started | Requires stable Phase 7 parameters and repeatable hardware setup. |
+
+Summary:
+
+- Passed: MPSL diagnostic compile checks, stopgap correctness checks, PRX/PTX multi-pipe ACK payload hardware smoke without active BLE connection.
+- Functional but still below target: active BLE connection plus ESB PRX timeslots.
+- Not started: RMK split end-to-end and overnight/stress validation.
 
 ## Build Matrix
 
@@ -297,6 +304,25 @@ DONE
 ```
 
 - Result: relaxing BLE connection parameters restores useful ESB ACK coverage under an active BLE connection. Pipe 0 is near baseline; pipe 1 still loses more packets than advertising-only and needs further scheduling/slot tuning.
+
+Batch 4 protocol-correctness regression:
+
+- Built `mpsl_prx_in_slot` and `mpsl_ptx_in_slot` with `nrf52840,defmt,mpsl`.
+- Converted ELF outputs to Intel HEX with `arm-none-eabi-objcopy`.
+- Packaged unsigned app-only DFU zips with `nrfutil pkg generate --hw-version 52 --sd-req 0x00`.
+- Flashed PRX to `/dev/ttyACM0`, then PTX to `/dev/ttyACM1`.
+- PTX USB CDC re-enumerated as `/dev/ttyACM0`.
+- PTX output:
+
+```text
+connected
+before slots
+pipe=0 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+pipe=1 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+DONE
+```
+
+- Result: MPSL PRX/PTX multi-pipe ACK payload path passed for pipe 0 and pipe 1. Previous pipe 1 ACK failure is fixed in this diagnostic run, and ACK payload counters stayed monotonic per pipe.
 
 ## Pending Work
 

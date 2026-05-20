@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Format
+        run: cargo fmt --check
+      - name: Host unit tests
+        run: cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+      - name: Feature check without MPSL
+        run: cargo check --features nrf52840,_cs-cortex
+      - name: Feature check with MPSL
+        run: cargo check --features nrf52840,mpsl
+      - name: MPSL and cortex critical-section features must conflict
+        run: |
+          set +e
+          cargo check --features nrf52840,mpsl,_cs-cortex >feature-conflict.log 2>&1
+          status=$?
+          cat feature-conflict.log
+          if [ "$status" -eq 0 ]; then
+            echo "expected nrf52840,mpsl,_cs-cortex to fail"
+            exit 1
+          fi
+          grep -q "mutually exclusive" feature-conflict.log
+
+  examples-exclusive:
+    name: Exclusive examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: PTX basic
+        run: cargo check --example ptx_basic --features nrf52840,defmt,_cs-cortex
+      - name: PRX basic
+        run: cargo check --example prx_basic --features nrf52840,defmt,_cs-cortex
+      - name: PRX USB
+        run: cargo check --example prx_usb --features nrf52840,_cs-cortex
+      - name: PTX silent
+        run: cargo check --example ptx_silent --features nrf52840,_cs-cortex
+      - name: USB minimal
+        run: cargo check --example usb_minimal --features nrf52840,_cs-cortex
+      - name: PTX ACK echo
+        run: cargo check --example ptx_ack_echo --features nrf52840,_cs-cortex
+      - name: PTX multipipe
+        run: cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
+      - name: PTX suspend
+        run: cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
+
+  examples-mpsl:
+    name: MPSL examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: MPSL smoke
+        run: cargo check --example mpsl_smoke --features nrf52840,defmt,mpsl
+      - name: MPSL request basic
+        run: cargo check --example mpsl_request_basic --features nrf52840,defmt,mpsl
+      - name: MPSL request chained
+        run: cargo check --example mpsl_request_chained --features nrf52840,defmt,mpsl
+      - name: MPSL PTX in slot
+        run: cargo check --example mpsl_ptx_in_slot --features nrf52840,defmt,mpsl
+      - name: MPSL PRX in slot
+        run: cargo check --example mpsl_prx_in_slot --features nrf52840,defmt,mpsl
+      - name: MPSL PRX BLE
+        run: cargo check --example mpsl_prx_ble --features nrf52840,defmt,mpsl
+      - name: MPSL BLE connectable diagnostic
+        run: cargo check --example mpsl_ble_connectable --features nrf52840,defmt,mpsl

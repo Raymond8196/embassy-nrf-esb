@@ -128,6 +128,8 @@ pub struct PtxStateMachine<T: TimerInstance> {
     attempts: u8,
     /// TX pipe (typically 0 for PTX).
     pub(crate) tx_pipe: u8,
+    /// Pipe used by the packet currently in flight.
+    active_tx_pipe: u8,
     /// Retransmit delay in µs (from config, minus ramp-up).
     retransmit_delay_us: u16,
     /// ACK timeout in µs (from config, plus ramp-up).
@@ -158,6 +160,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             state: StatePtx::Idle,
             attempts: 0,
             tx_pipe,
+            active_tx_pipe: tx_pipe,
             // Timer calculations (R8):
             // Retransmit: subtract ramp-up (radio re-enables from DISABLED)
             retransmit_delay_us: config.retransmit.delay_us.saturating_sub(RAMP_UP_US),
@@ -184,7 +187,10 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         if disabled {
             self.radio.clear_disabled_event();
         }
-        IsrEvents { disabled, timer: timer_flag }
+        IsrEvents {
+            disabled,
+            timer: timer_flag,
+        }
     }
 
     /// Handle a RADIO ISR event.
@@ -340,15 +346,12 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     /// If tx_idx is already set (from a previous failed ACK buffer alloc),
     /// resend that packet instead of dequeuing a new one.
     /// Ref: esb-ng `src/irq.rs` lines 296–309.
-    fn send_next<const N: usize, const SIZE: usize>(
-        &mut self,
-        pool: &PacketPool<N, SIZE>,
-    ) {
+    fn send_next<const N: usize, const SIZE: usize>(&mut self, pool: &PacketPool<N, SIZE>) {
         // If a TX packet is pending from a failed ACK buffer allocation,
         // resend it (tx_idx is still in IN_DMA state).
         if self.tx_idx != NO_IDX {
             let dma_ptr = unsafe { pool.dma_ptr(self.tx_idx) };
-            self.radio.transmit(self.tx_pipe, dma_ptr, true);
+            self.radio.transmit(self.active_tx_pipe, dma_ptr, true);
             self.state = StatePtx::Tx;
             return;
         }
@@ -356,13 +359,17 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         if let Some(idx) = pool.try_dequeue_tx() {
             let header = unsafe { pool.header_mut(idx) };
             let no_ack = header.no_ack();
+            self.active_tx_pipe = header.pipe;
             // Set PID in header before TX (S1 field bits 2:1).
             header.set_pid(self.pid);
             let dma_ptr = unsafe { pool.dma_ptr(idx) };
-            pool.tx_to_dma(idx);
             self.tx_idx = idx;
-            self.radio.transmit(self.tx_pipe, dma_ptr, !no_ack);
-            self.state = if no_ack { StatePtx::TxNoAck } else { StatePtx::Tx };
+            self.radio.transmit(self.active_tx_pipe, dma_ptr, !no_ack);
+            self.state = if no_ack {
+                StatePtx::TxNoAck
+            } else {
+                StatePtx::Tx
+            };
         } else {
             self.radio.disable_disabled_interrupt();
             self.state = StatePtx::Idle;
@@ -376,14 +383,11 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     }
 
     /// Retransmit the current TX packet.
-    fn retransmit<const N: usize, const SIZE: usize>(
-        &mut self,
-        pool: &PacketPool<N, SIZE>,
-    ) {
+    fn retransmit<const N: usize, const SIZE: usize>(&mut self, pool: &PacketPool<N, SIZE>) {
         if self.tx_idx != NO_IDX {
             // SAFETY: tx_idx is in IN_DMA state; buffer data is still valid.
             let dma_ptr = unsafe { pool.dma_ptr(self.tx_idx) };
-            self.radio.transmit(self.tx_pipe, dma_ptr, true);
+            self.radio.transmit(self.active_tx_pipe, dma_ptr, true);
             self.state = StatePtx::Tx;
         } else {
             self.radio.disable_disabled_interrupt();
@@ -392,10 +396,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     }
 
     /// Release the current TX buffer back to the pool.
-    fn release_tx<const N: usize, const SIZE: usize>(
-        &mut self,
-        pool: &PacketPool<N, SIZE>,
-    ) {
+    fn release_tx<const N: usize, const SIZE: usize>(&mut self, pool: &PacketPool<N, SIZE>) {
         if self.tx_idx != NO_IDX {
             pool.release_tx(self.tx_idx);
             self.tx_idx = NO_IDX;
@@ -403,10 +404,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     }
 
     /// Release the current ACK RX buffer back to the pool.
-    fn release_ack_rx<const N: usize, const SIZE: usize>(
-        &mut self,
-        pool: &PacketPool<N, SIZE>,
-    ) {
+    fn release_ack_rx<const N: usize, const SIZE: usize>(&mut self, pool: &PacketPool<N, SIZE>) {
         if self.ack_rx_idx != NO_IDX {
             pool.release_rx(self.ack_rx_idx);
             self.ack_rx_idx = NO_IDX;
@@ -456,6 +454,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         let saved = EsbSavedState {
             pid: self.radio.save_pid_state(),
             last_crc: self.radio.save_crc_state(),
+            last_valid: self.radio.save_detection_valid_state(),
             tx_pipe: self.tx_pipe,
             attempts: self.attempts,
             protocol_state,
@@ -476,7 +475,9 @@ impl<T: TimerInstance> PtxStateMachine<T> {
         self.radio.init(&self.config, addresses);
         self.radio.restore_pid_state(state.pid);
         self.radio.restore_crc_state(state.last_crc);
+        self.radio.restore_detection_valid_state(state.last_valid);
         self.tx_pipe = state.tx_pipe;
+        self.active_tx_pipe = state.tx_pipe;
         self.state = StatePtx::Idle;
     }
 }
@@ -533,7 +534,10 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         if disabled {
             self.radio.clear_disabled_event();
         }
-        IsrEvents { disabled, timer: timer_flag }
+        IsrEvents {
+            disabled,
+            timer: timer_flag,
+        }
     }
 
     /// Start receiving on enabled pipes.
@@ -726,9 +730,8 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         pool: &PacketPool<N, SIZE>,
         pipe: u8,
     ) {
-        if let Some(idx) = pool.try_dequeue_tx() {
+        if let Some(idx) = pool.try_dequeue_tx_for_pipe(pipe) {
             let dma_ptr = unsafe { pool.dma_ptr(idx) };
-            pool.tx_to_dma(idx);
             self.ack_tx_idx = idx;
             self.radio.setup_ack_tx(pipe, dma_ptr);
         } else {
@@ -738,10 +741,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     }
 
     /// Release the current ACK TX buffer back to the pool.
-    fn release_ack_tx<const N: usize, const SIZE: usize>(
-        &mut self,
-        pool: &PacketPool<N, SIZE>,
-    ) {
+    fn release_ack_tx<const N: usize, const SIZE: usize>(&mut self, pool: &PacketPool<N, SIZE>) {
         if self.ack_tx_idx != NO_IDX {
             pool.release_tx(self.ack_tx_idx);
             self.ack_tx_idx = NO_IDX;
@@ -802,6 +802,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         EsbSavedState {
             pid: self.radio.save_pid_state(),
             last_crc: self.radio.save_crc_state(),
+            last_valid: self.radio.save_detection_valid_state(),
             tx_pipe: 0,
             attempts: 0,
             protocol_state: SavedProtocolState::Idle,
@@ -815,6 +816,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         self.radio.init(&self.config, addresses);
         self.radio.restore_pid_state(state.pid);
         self.radio.restore_crc_state(state.last_crc);
+        self.radio.restore_detection_valid_state(state.last_valid);
         self.enabled_pipes = addresses.enabled_mask();
         self.state = StatePrx::Idle;
     }

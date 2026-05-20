@@ -4,7 +4,7 @@
 //! The layout is `[rssi, pipe, length, pid_no_ack, payload...]` where bytes 2+ are the DMA region.
 //!
 //! Buffer states are tracked with atomic state machines:
-//! `free → tx_queued → in_dma → free` (TX path)
+//! `free → tx_allocated → tx_queued → in_dma → free` (TX path)
 //! `free → in_dma → rx_queued → free` (RX path)
 //!
 //! # Safety
@@ -14,7 +14,7 @@
 //! This ensures no data race between the ISR and application context.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{compiler_fence, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering, compiler_fence};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -27,9 +27,10 @@ pub const MAX_PAYLOAD: usize = 252;
 /// Packet buffer states (atomic state machine).
 mod state {
     pub const FREE: u8 = 0;
-    pub const TX_QUEUED: u8 = 1;
-    pub const IN_DMA: u8 = 2;
-    pub const RX_QUEUED: u8 = 3;
+    pub const TX_ALLOCATED: u8 = 1;
+    pub const TX_QUEUED: u8 = 2;
+    pub const IN_DMA: u8 = 3;
+    pub const RX_QUEUED: u8 = 4;
 }
 
 /// A single word-aligned packet buffer.
@@ -119,7 +120,6 @@ const _: () = assert!(core::mem::align_of::<Packet<1>>() >= 4);
 pub struct PacketPool<const N: usize, const SIZE: usize> {
     storage: [Packet<SIZE>; N],
     state: [AtomicU8; N],
-    tx_queue: Channel<CriticalSectionRawMutex, usize, N>,
     rx_queue: Channel<CriticalSectionRawMutex, usize, N>,
 }
 
@@ -144,12 +144,11 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
         Self {
             storage: [const { Packet::new() }; N],
             state: [NEW; N],
-            tx_queue: Channel::new(),
             rx_queue: Channel::new(),
         }
     }
 
-    /// Allocate a packet for TX: transitions `free → tx_queued`.
+    /// Allocate a packet for TX: transitions `free → tx_allocated`.
     ///
     /// Returns an index into the pool. Caller should fill the buffer then call
     /// `enqueue_tx()` or `release_tx()`.
@@ -159,7 +158,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
             if self.state[i]
                 .compare_exchange(
                     state::FREE,
-                    state::TX_QUEUED,
+                    state::TX_ALLOCATED,
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 )
@@ -173,12 +172,46 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
 
     /// Enqueue a TX packet for the ISR to send.
     pub async fn enqueue_tx(&self, index: usize) {
-        self.tx_queue.send(index).await;
+        debug_assert!(index < N);
+        let queued = self.state[index]
+            .compare_exchange(
+                state::TX_ALLOCATED,
+                state::TX_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        debug_assert!(queued, "enqueue_tx called for a non-allocated packet");
+        compiler_fence(Ordering::Release);
     }
 
     /// Dequeue the next TX packet (called from ISR).
     pub fn try_dequeue_tx(&self) -> Option<usize> {
-        self.tx_queue.try_receive().ok()
+        for index in 0..N {
+            if self.try_claim_queued_tx(index) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    /// Dequeue a queued TX packet for a specific pipe (called from ISR).
+    ///
+    /// This is used by PRX ACK payload handling so payloads queued for one
+    /// pipe cannot be consumed by packets received on another pipe. Stale
+    /// queue entries are skipped later by `try_dequeue_tx()`.
+    pub fn try_dequeue_tx_for_pipe(&self, pipe: u8) -> Option<usize> {
+        for index in 0..N {
+            if self.state[index].load(Ordering::Acquire) != state::TX_QUEUED {
+                continue;
+            }
+
+            let header = unsafe { self.header(index) };
+            if header.pipe == pipe && self.try_claim_queued_tx(index) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// Transition a TX packet to DMA ownership: `tx_queued → in_dma`.
@@ -187,7 +220,17 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     pub fn tx_to_dma(&self, index: usize) {
         debug_assert!(index < N);
         compiler_fence(Ordering::Release);
-        self.state[index].store(state::IN_DMA, Ordering::Release);
+        if self.state[index]
+            .compare_exchange(
+                state::TX_QUEUED,
+                state::IN_DMA,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            debug_assert_eq!(self.state[index].load(Ordering::Acquire), state::IN_DMA);
+        }
     }
 
     /// Release a TX packet after DMA completes: `in_dma → free`.
@@ -197,12 +240,28 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
         self.state[index].store(state::FREE, Ordering::Release);
     }
 
-    /// Cancel a TX allocation: `tx_queued → free`.
+    /// Cancel a TX allocation: `tx_allocated/tx_queued → free`.
     ///
     /// Use when a packet was allocated but will not be sent.
     pub fn cancel_tx(&self, index: usize) {
         debug_assert!(index < N);
         self.state[index].store(state::FREE, Ordering::Release);
+    }
+
+    fn try_claim_queued_tx(&self, index: usize) -> bool {
+        debug_assert!(index < N);
+        let ok = self.state[index]
+            .compare_exchange(
+                state::TX_QUEUED,
+                state::IN_DMA,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok();
+        if ok {
+            compiler_fence(Ordering::Acquire);
+        }
+        ok
     }
 
     /// Transition an RX packet to DMA ownership: `free → in_dma`.
@@ -211,7 +270,12 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     pub fn rx_to_dma(&self, index: usize) -> bool {
         debug_assert!(index < N);
         let ok = self.state[index]
-            .compare_exchange(state::FREE, state::IN_DMA, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(
+                state::FREE,
+                state::IN_DMA,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_ok();
         if ok {
             compiler_fence(Ordering::Release);
@@ -292,5 +356,97 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
     /// Caller must ensure no concurrent mutable access.
     pub(crate) unsafe fn buf(&self, index: usize) -> &[u8; SIZE] {
         unsafe { self.storage[index].buf() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{PacketPool, state};
+    use core::future::Future;
+    use core::task::{Context, Poll};
+    use std::sync::Arc;
+    use std::task::{Wake, Waker};
+
+    struct NoopWaker;
+
+    impl Wake for NoopWaker {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn assert_ready<F: Future<Output = ()>>(future: F) {
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut future = core::pin::pin!(future);
+
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(())));
+    }
+
+    #[test]
+    fn tx_allocation_is_not_visible_until_enqueued() {
+        let pool = PacketPool::<2, 16>::new();
+
+        let idx = pool.alloc_tx().expect("free tx slot");
+        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::TX_ALLOCATED);
+        assert_eq!(pool.try_dequeue_tx(), None);
+
+        unsafe {
+            let header = pool.header_mut(idx);
+            header.pipe = 3;
+            header.length = 4;
+        }
+
+        assert_ready(pool.enqueue_tx(idx));
+
+        let claimed = pool.try_dequeue_tx().expect("queued tx slot");
+        assert_eq!(claimed, idx);
+        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::IN_DMA);
+
+        pool.release_tx(idx);
+        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
+    }
+
+    #[test]
+    fn pipe_filtered_dequeue_claims_only_matching_pipe() {
+        let pool = PacketPool::<3, 16>::new();
+
+        let pipe0 = pool.alloc_tx().expect("pipe0 slot");
+        let pipe1 = pool.alloc_tx().expect("pipe1 slot");
+
+        unsafe {
+            pool.header_mut(pipe0).pipe = 0;
+            pool.header_mut(pipe1).pipe = 1;
+        }
+
+        assert_ready(pool.enqueue_tx(pipe0));
+        assert_ready(pool.enqueue_tx(pipe1));
+
+        assert_eq!(pool.try_dequeue_tx_for_pipe(2), None);
+
+        let claimed_pipe1 = pool.try_dequeue_tx_for_pipe(1).expect("pipe1 queued slot");
+        assert_eq!(claimed_pipe1, pipe1);
+        assert_eq!(pool.state[pipe1].load(core::sync::atomic::Ordering::Acquire), state::IN_DMA);
+        assert_eq!(pool.state[pipe0].load(core::sync::atomic::Ordering::Acquire), state::TX_QUEUED);
+
+        let claimed_any = pool.try_dequeue_tx().expect("remaining queued slot");
+        assert_eq!(claimed_any, pipe0);
+
+        pool.release_tx(pipe0);
+        pool.release_tx(pipe1);
+    }
+
+    #[test]
+    fn cancel_tx_releases_allocated_or_queued_slots() {
+        let pool = PacketPool::<1, 16>::new();
+
+        let idx = pool.alloc_tx().expect("free tx slot");
+        pool.cancel_tx(idx);
+        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
+
+        let idx = pool.alloc_tx().expect("reused tx slot");
+        assert_ready(pool.enqueue_tx(idx));
+        pool.cancel_tx(idx);
+        assert_eq!(pool.state[idx].load(core::sync::atomic::Ordering::Acquire), state::FREE);
     }
 }

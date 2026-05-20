@@ -229,11 +229,29 @@ Scope:
 - Per-packet TX pipe metadata via `send_to(pipe, payload)`.
 - Deprecate or document global `set_pipe()` limitations.
 
+Status:
+
+- 2026-05-20: Exclusive PRX duplicate detection now has per-pipe valid bits, saved/restored through `EsbSavedState`; the MPSL PRX diagnostic path mirrors the same valid-bit guard. PRX ACK payload selection now claims only queued TX packets whose software header pipe matches the current RX pipe. PTX now exposes `send_to(pipe, payload)` and `send_no_ack_to(pipe, payload)`; existing `send()`/`send_no_ack()` use the guarded default pipe from `set_pipe()`.
+- 2026-05-20: `PacketPool` TX ownership was tightened from `free -> tx_queued -> in_dma` to `free -> tx_allocated -> tx_queued -> in_dma`, preventing ISR-side per-pipe scans from seeing a buffer while application code is still filling it.
+- 2026-05-20: Task-context `set_pipe()`, PTX/PRX `state()`, PRX `start_listening()`, and PRX `stop()` now mask RADIO IRQ around direct `UnsafeCell` state-machine access. Broader audit remains needed for async suspend poll paths and any future MPSL wrapper that shares state with P0 callbacks.
+
+RMK note:
+
+- 2026-05-20: Latest `HaoboGu/rmk` main at `822e706` defines split payload as postcard-serialized `SplitMessage` in `rmk/src/split/mod.rs`, with `SPLIT_MESSAGE_MAX_SIZE = SplitMessage::POSTCARD_MAX_SIZE + 4`. Do not invent a parallel RMK ESB frame for the prototype; build the ESB transport around RMK's existing `SplitReader` / `SplitWriter` contract and carry serialized `SplitMessage` bytes.
+
 Verification:
 
 - Two-dongle multi-pipe test.
 - Pipe-specific ACK payloads do not cross pipes.
 - Repeated/retransmitted packets do not produce duplicate application events.
+- `cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840`
+- `cargo check --features nrf52840,_cs-cortex`
+- `cargo check --features nrf52840,mpsl`
+- `cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex`
+- `cargo check --example prx_basic --features nrf52840,defmt,_cs-cortex`
+- `cargo check --example mpsl_prx_in_slot --features nrf52840,defmt,mpsl`
+- `cargo check --example mpsl_prx_ble --features nrf52840,defmt,mpsl`
+- 2026-05-20 hardware regression: `mpsl_prx_in_slot` + `mpsl_ptx_in_slot` on two nRF52840 dongles passed with `pipe=0 tx=450 ack=450 ackpl=450 ctr=450` and `pipe=1 tx=450 ack=450 ackpl=450 ctr=450`.
 
 ### Fix Batch 5: Tests and CI Base
 
