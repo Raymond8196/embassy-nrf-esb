@@ -63,6 +63,10 @@ As of 2026-05-20:
 - `PacketPool` cancel releases allocated and queued TX slots.
 - Duplicate detection requires a valid bit before PID/CRC comparison.
 - Duplicate detection PID/CRC/valid state saves and restores.
+- Transport frame encode/decode round trips header and payload.
+- Transport frame rejects truncated buffers and unsupported versions.
+- Transport frame sizing helpers include the transport header.
+- `SequenceTracker` accepts new per-device sequences and rejects duplicates.
 
 ## Hardware Matrix
 
@@ -104,4 +108,3 @@ Core ESB reaches the target when:
 - C1-C3 have at least one 30 minute clean run.
 - Suspend/resume has either 10k successful cycles or a 30 minute clean run.
 - No known host-testable protocol bug remains without a regression test.
-
