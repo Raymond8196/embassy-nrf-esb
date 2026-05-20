@@ -15,9 +15,9 @@
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::bind_interrupts;
-use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals, SessionMem};
+use embassy_nrf::interrupt::typelevel;
+use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -56,14 +56,7 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: false,
     };
 
-    let mpsl_p = Peripherals::new(
-        p.RTC0,
-        p.TIMER0,
-        p.TEMP,
-        p.PPI_CH19,
-        p.PPI_CH30,
-        p.PPI_CH31,
-    );
+    let mpsl_p = Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
 
     static SESSION_MEM: StaticCell<SessionMem<1>> = StaticCell::new();
     let session_mem = SESSION_MEM.init(SessionMem::new());
@@ -93,7 +86,9 @@ async fn main(spawner: Spawner) {
 
     // Single long-lived PRX session; never re-enter so per-pipe ack_counter
     // stays monotonic for the entire run.
-    let _ = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03).await;
+    let _ = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03)
+        .await
+        .unwrap();
     loop {
         embassy_time::Timer::after_secs(60).await;
     }

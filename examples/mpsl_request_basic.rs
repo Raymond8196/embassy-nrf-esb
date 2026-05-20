@@ -15,12 +15,12 @@ use core::fmt::Write as FmtWrite;
 
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
-use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
-use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals, SessionMem};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -66,9 +66,7 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn usb_task(
-    mut device: UsbDevice<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>,
-) {
+async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>) {
     device.run().await;
 }
 
@@ -90,14 +88,7 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: false,
     };
 
-    let mpsl_p = Peripherals::new(
-        p.RTC0,
-        p.TIMER0,
-        p.TEMP,
-        p.PPI_CH19,
-        p.PPI_CH30,
-        p.PPI_CH31,
-    );
+    let mpsl_p = Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
 
     static SESSION_MEM: StaticCell<SessionMem<1>> = StaticCell::new();
     let session_mem = SESSION_MEM.init(SessionMem::new());
@@ -171,7 +162,7 @@ async fn main(spawner: Spawner) {
     let mut err_count: u32 = 0;
 
     for run in 0..100u32 {
-        let c = run_single_slot(mpsl, 5000, 4500).await;
+        let c = run_single_slot(mpsl, 5000, 4500).await.unwrap();
 
         let mut buf = [0u8; 256];
         let mut w = WriteBuf::new(&mut buf);

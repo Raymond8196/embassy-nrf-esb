@@ -187,6 +187,10 @@ Scope:
 - Add MPSL re-entry guard.
 - Use `EsbHeader` helpers in MPSL header writes.
 
+Status:
+
+- 2026-05-20: `OVERSTAYED` panic removal, PRX TIMER0 PID/CRC preservation, MPSL header helper usage, and free-function re-entry guards are implemented. The re-entry guards return `Error::Busy` before opening a second session on the same global MPSL path.
+
 Verification:
 
 - Two-dongle MPSL PTX/PRX examples.

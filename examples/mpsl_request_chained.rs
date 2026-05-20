@@ -15,13 +15,13 @@ use core::fmt::Write as FmtWrite;
 
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
-use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::usb::Driver as UsbDriver;
+use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_time::Instant;
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::UsbDevice;
-use nrf_mpsl::{raw, MultiprotocolServiceLayer, Peripherals, SessionMem};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -67,9 +67,7 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn usb_task(
-    mut device: UsbDevice<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>,
-) {
+async fn usb_task(mut device: UsbDevice<'static, UsbDriver<'static, &'static SoftwareVbusDetect>>) {
     device.run().await
 }
 
@@ -91,14 +89,7 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: false,
     };
 
-    let mpsl_p = Peripherals::new(
-        p.RTC0,
-        p.TIMER0,
-        p.TEMP,
-        p.PPI_CH19,
-        p.PPI_CH30,
-        p.PPI_CH31,
-    );
+    let mpsl_p = Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
 
     static SESSION_MEM: StaticCell<SessionMem<1>> = StaticCell::new();
     let session_mem = SESSION_MEM.init(SessionMem::new());
@@ -149,7 +140,7 @@ async fn main(spawner: Spawner) {
     // Round 1: 100 chained slots, normal priority.
     {
         let t0 = Instant::now();
-        let c = run_chained_slots(mpsl, 5000, 4500, 100).await;
+        let c = run_chained_slots(mpsl, 5000, 4500, 100).await.unwrap();
         let elapsed_ms = t0.elapsed().as_millis();
 
         let mut buf = [0u8; 256];
@@ -169,7 +160,7 @@ async fn main(spawner: Spawner) {
     //  verify the recovery path compiles and works if triggered.)
     {
         let t0 = Instant::now();
-        let c = run_chained_slots(mpsl, 5000, 4500, 100).await;
+        let c = run_chained_slots(mpsl, 5000, 4500, 100).await.unwrap();
         let elapsed_ms = t0.elapsed().as_millis();
 
         let mut buf = [0u8; 256];
@@ -187,7 +178,7 @@ async fn main(spawner: Spawner) {
     // Round 3: repeat to confirm stability.
     {
         let t0 = Instant::now();
-        let c = run_chained_slots(mpsl, 5000, 4500, 100).await;
+        let c = run_chained_slots(mpsl, 5000, 4500, 100).await.unwrap();
         let elapsed_ms = t0.elapsed().as_millis();
 
         let mut buf = [0u8; 256];

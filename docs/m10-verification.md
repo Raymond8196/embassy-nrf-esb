@@ -79,6 +79,30 @@ Current host-side coverage:
 - `EsbAddresses` base and prefix register bit reversal/packing.
 - `EsbConfig` default validity and validation boundaries.
 
+### Stopgap Correctness Update
+
+Date: 2026-05-20
+
+Compile-only checks completed after the MPSL stopgap fixes:
+
+```bash
+cargo check --example mpsl_ptx_in_slot --features nrf52840,defmt,mpsl
+cargo check --example mpsl_prx_in_slot --features nrf52840,defmt,mpsl
+cargo check --example mpsl_prx_ble --features nrf52840,defmt,mpsl
+cargo check --example mpsl_request_basic --features nrf52840,defmt,mpsl
+cargo check --example mpsl_request_chained --features nrf52840,defmt,mpsl
+cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+rustfmt --edition 2024 --check src/mpsl_timeslot.rs examples/mpsl_request_basic.rs examples/mpsl_request_chained.rs examples/mpsl_ptx_in_slot.rs examples/mpsl_prx_in_slot.rs examples/mpsl_prx_ble.rs
+```
+
+Notes:
+
+- `OVERSTAYED` no longer panics in the generic, PTX, or PRX timeslot callbacks. It increments the existing counter, marks the session done, wakes the waiter, and asks MPSL to end the slot.
+- PRX duplicate-detection state is no longer overwritten by a freshly-created `EsbRadio` at TIMER0 slot end. The manual PRX path keeps PID/CRC state in `PrxInnerState`.
+- MPSL PTX and ACK payload construction now uses `EsbHeader::set_pid()` / `set_no_ack()` through a shared counter-packet helper.
+- MPSL free functions now reject re-entry with `Error::Busy` before opening a second session on the same static state.
+- Full `cargo fmt --check` still reports unrelated pre-existing formatting changes outside `src/mpsl_timeslot.rs`.
+
 ## Step 7 Hardware Procedure
 
 When two dongles are available:
@@ -237,6 +261,25 @@ pipe=0 tx=50 ack=0 ackpl=0 ctr=0 inv=0 blk=0 can=0
 pipe=1 tx=67 ack=15 ackpl=15 ctr=29 inv=0 blk=0 can=0
 DONE
 ```
+
+Stopgap hardware smoke:
+
+- Date: 2026-05-20
+- Built and flashed `mpsl_prx_ble_20260520_stopgap.zip` to `/dev/ttyACM0` while in Open DFU Bootloader.
+- Built and flashed `mpsl_ptx_in_slot_20260520_stopgap.zip` to `/dev/ttyACM1` while in Open DFU Bootloader.
+- PTX USB CDC re-enumerated as `/dev/ttyACM0`.
+- PTX output:
+
+```text
+connected
+before slots
+pipe=0 tx=354 ack=336 ackpl=336 ctr=343 inv=0 start=50 t0=50 radio=690 idle=1 blk=0 can=0
+pipe=1 tx=383 ack=366 ackpl=366 ctr=373 inv=0 start=50 t0=50 radio=750 idle=1 blk=0 can=0
+DONE
+```
+
+- Result: both pipes ACK with ACK payloads after the stopgap fixes; no blocked/cancelled signals were reported by PTX.
+- Manual BLE observation: `ESB M10` was visible in nRF Connect and stayed connected during this firmware run.
 
 - Result: BLE connection stability first pass is achieved, but ESB PRX timeslot throughput regressed severely under an active BLE connection. This is expected to need timeslot duty-cycle tuning or connection interval/latency changes before Step 7 passes the ESB receive-rate target.
 

@@ -8,10 +8,12 @@
 #![no_std]
 #![no_main]
 
-use bt_hci::cmd::{AsyncCmd, SyncCmd};
 use bt_hci::cmd::controller_baseband::SetEventMask;
 use bt_hci::cmd::le::{LeConnUpdate, LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask};
+use bt_hci::cmd::{AsyncCmd, SyncCmd};
+use bt_hci::param::{
+    AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
+};
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::mode::Blocking;
@@ -71,7 +73,10 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
     let status = data[1];
     if status == 0 && (subevent == 1 || subevent == 10) && data.len() >= 4 {
         let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
-        defmt::info!("BLE connected; requesting relaxed conn params handle={}", handle);
+        defmt::info!(
+            "BLE connected; requesting relaxed conn params handle={}",
+            handle
+        );
         request_relaxed_conn_params(sdc, handle).await;
     }
 }
@@ -156,7 +161,12 @@ fn handle_read_by_type(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) 
     };
 
     if pdu.len() >= 7 && pdu[5] == 0x03 && pdu[6] == 0x28 && start <= 2 && end >= 2 {
-        send_l2cap(sdc, handle, 0x0004, &[0x09, 7, 2, 0, 0x02, 3, 0, 0x00, 0x2a]);
+        send_l2cap(
+            sdc,
+            handle,
+            0x0004,
+            &[0x09, 7, 2, 0, 0x02, 3, 0, 0x00, 0x2a],
+        );
     } else if pdu.len() >= 7 && pdu[5] == 0x00 && pdu[6] == 0x2a && start <= 3 && end >= 3 {
         send_l2cap(sdc, handle, 0x0004, b"\x09\x0a\x03\x00ESB M10");
     } else {
@@ -268,7 +278,9 @@ fn build_sdc<'d, const N: usize>(
 }
 
 async fn start_advertising(sdc: &SoftdeviceController<'_>) {
-    let event_mask = EventMask::new().enable_le_meta(true).enable_disconnection_complete(true);
+    let event_mask = EventMask::new()
+        .enable_le_meta(true)
+        .enable_disconnection_complete(true);
     SetEventMask::new(event_mask).exec(sdc).await.unwrap();
 
     let le_event_mask = LeEventMask::new()
@@ -361,6 +373,8 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let r = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03).await;
+    let r = run_prx_slots(mpsl, &esb_cfg, &esb_addr, 14000, 13500, u32::MAX, 0x03)
+        .await
+        .unwrap();
     defmt::warn!("PRX timeslot session ended unexpectedly: {:?}", r);
 }
