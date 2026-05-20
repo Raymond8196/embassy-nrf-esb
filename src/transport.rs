@@ -12,6 +12,13 @@ pub const TRANSPORT_VERSION: u8 = 1;
 /// Header size in bytes.
 pub const TRANSPORT_HEADER_LEN: usize = 5;
 
+/// Frame carries an application-level acknowledgement.
+pub const FLAG_ACK: u8 = 0x01;
+/// Frame carries a retransmitted application message.
+pub const FLAG_RETRANSMIT: u8 = 0x02;
+/// Flags currently defined by transport version 1.
+pub const FLAGS_V1_MASK: u8 = FLAG_ACK | FLAG_RETRANSMIT;
+
 /// Return the ESB payload length required to carry a framed higher-level
 /// payload of `payload_len` bytes.
 pub const fn required_esb_payload_len(payload_len: usize) -> usize {
@@ -54,7 +61,7 @@ pub struct TransportHeader {
 impl TransportHeader {
     /// Create a v1 header.
     pub fn new(device_id: u8, sequence: u8, flags: u8, payload_len: usize) -> Result<Self, Error> {
-        if payload_len > u8::MAX as usize {
+        if payload_len > u8::MAX as usize || flags & !FLAGS_V1_MASK != 0 {
             return Err(Error::InvalidParam);
         }
 
@@ -96,6 +103,10 @@ impl TransportHeader {
         };
 
         if header.version != TRANSPORT_VERSION {
+            return Err(Error::InvalidParam);
+        }
+
+        if header.flags & !FLAGS_V1_MASK != 0 {
             return Err(Error::InvalidParam);
         }
 
@@ -259,8 +270,9 @@ impl<const N: usize> Default for StaticBindingTable<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        SequenceTracker, StaticBindingTable, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION,
-        TransportHeader, decode_frame, encode_frame, fits_esb_payload, required_esb_payload_len,
+        FLAG_ACK, FLAG_RETRANSMIT, SequenceTracker, StaticBindingTable, TRANSPORT_HEADER_LEN,
+        TRANSPORT_VERSION, TransportHeader, decode_frame, encode_frame, fits_esb_payload,
+        required_esb_payload_len,
     };
     use crate::error::Error;
 
@@ -269,7 +281,8 @@ mod tests {
         let payload = [1, 2, 3, 4];
         let mut frame = [0u8; 16];
 
-        let len = encode_frame(2, 7, 0x80, &payload, &mut frame).unwrap();
+        let flags = FLAG_ACK | FLAG_RETRANSMIT;
+        let len = encode_frame(2, 7, flags, &payload, &mut frame).unwrap();
         assert_eq!(len, TRANSPORT_HEADER_LEN + payload.len());
 
         let (header, decoded_payload) = decode_frame(&frame[..len]).unwrap();
@@ -279,7 +292,7 @@ mod tests {
                 version: TRANSPORT_VERSION,
                 device_id: 2,
                 sequence: 7,
-                flags: 0x80,
+                flags,
                 payload_len: 4,
             }
         );
@@ -294,6 +307,10 @@ mod tests {
             Err(Error::InvalidParam)
         );
         assert_eq!(decode_frame(&[0xff, 1, 2, 3, 0]), Err(Error::InvalidParam));
+        assert_eq!(
+            decode_frame(&[TRANSPORT_VERSION, 1, 2, 0x80, 0]),
+            Err(Error::InvalidParam)
+        );
     }
 
     #[test]

@@ -43,7 +43,7 @@ Use `src/transport.rs`:
 byte 0: protocol_version
 byte 1: device_id
 byte 2: sequence_number
-byte 3: flags
+byte 3: flags (FLAG_ACK, FLAG_RETRANSMIT; other bits reserved)
 byte 4: payload_len
 byte 5..: postcard-serialized RMK SplitMessage bytes
 ```
