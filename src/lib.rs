@@ -51,5 +51,4 @@ pub mod mpsl_timeslot;
 // Re-export driver types from isr module
 pub mod isr;
 
-// Re-export PAC for internal use and advanced users
-pub use embassy_nrf::pac;
+pub(crate) use embassy_nrf::pac;

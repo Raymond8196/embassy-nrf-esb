@@ -6,12 +6,12 @@ use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPtx};
-use embassy_nrf_esb::pac;
+use embassy_nrf::pac;
 use embassy_nrf_esb::payload::PacketPool;
 use {defmt_rtt as _, panic_probe as _};
 
 mod interrupt {
-    pub use embassy_nrf_esb::pac::Interrupt::*;
+    pub use embassy_nrf::pac::Interrupt::*;
 }
 
 static POOL: PacketPool<DEFAULT_POOL_N, DEFAULT_POOL_SIZE> = PacketPool::new();

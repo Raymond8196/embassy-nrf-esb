@@ -96,8 +96,12 @@ pub struct EsbPtx<
     max_payload_len: usize,
 }
 
-// SAFETY: Placed in static by user. All ISR access is single-threaded.
-// pool pointer is valid for 'static.
+// SAFETY: `EsbPtx` is intended to live in a `static`. The inner state machine
+// is mutated from RADIO ISR context and from a small set of task-context
+// methods. Task-context direct state access masks RADIO IRQ before touching
+// `sm`; ISR entrypoints are documented as ISR-only and are not re-entrant on
+// Cortex-M. The packet pool is `'static` and enforces buffer ownership with
+// atomic state transitions.
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPtx<T, N, SIZE> {}
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Sync for EsbPtx<T, N, SIZE> {}
 
@@ -369,10 +373,10 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         // ISR is running and will see suspend_requested — wait for wake.
         core::future::poll_fn(|cx| {
             self.suspend_signal.register(cx.waker());
-            // SAFETY: Read-only state check, ISR may be updating concurrently
-            // but the read is atomic-ish for the purpose of detecting idle.
-            let sm = unsafe { &*self.sm.get() };
-            if sm.state() == crate::state_machine::StatePtx::Idle {
+            disable_radio_irq();
+            let state = unsafe { &*self.sm.get() }.state();
+            enable_radio_irq();
+            if state == crate::state_machine::StatePtx::Idle {
                 Poll::Ready(())
             } else {
                 Poll::Pending
@@ -422,6 +426,9 @@ pub struct EsbPrx<
     max_payload_len: usize,
 }
 
+// SAFETY: Same ownership model as `EsbPtx`: the driver is static, RADIO ISR
+// owns normal state-machine progress, and task-context state access masks the
+// RADIO IRQ. RX/TX buffers are owned by the packet pool's atomic state machine.
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Send for EsbPrx<T, N, SIZE> {}
 unsafe impl<T: TimerInstance, const N: usize, const SIZE: usize> Sync for EsbPrx<T, N, SIZE> {}
 
@@ -604,8 +611,9 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
         core::future::poll_fn(|cx| {
             self.suspend_signal.register(cx.waker());
-            let sm = unsafe { &*self.sm.get() };
-            let state = sm.state();
+            disable_radio_irq();
+            let state = unsafe { &*self.sm.get() }.state();
+            enable_radio_irq();
             if state == crate::state_machine::StatePrx::Idle
                 || state == crate::state_machine::StatePrx::Receiver
             {
