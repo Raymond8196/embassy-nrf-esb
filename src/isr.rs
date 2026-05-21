@@ -102,6 +102,23 @@ fn with_radio_irq_masked<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+struct SuspendRequestGuard<'a> {
+    requested: &'a AtomicBool,
+}
+
+impl<'a> SuspendRequestGuard<'a> {
+    fn new(requested: &'a AtomicBool) -> Self {
+        requested.store(true, Ordering::Release);
+        Self { requested }
+    }
+}
+
+impl Drop for SuspendRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.requested.store(false, Ordering::Release);
+    }
+}
+
 // ---- PTX Driver ----
 
 /// Embassy async PTX (Primary Transmitter) driver.
@@ -214,10 +231,15 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         sm.handle_timer_event();
     }
 
-    /// Queue a packet for transmission.
+    /// Queue a packet for transmission on the current default pipe.
     ///
-    /// Returns after queuing. The packet will be sent in the next
-    /// RADIO ISR cycle.
+    /// The default pipe is read at queue time. Use [`send_to`](Self::send_to)
+    /// for multi-pipe firmware or when multiple tasks can enqueue packets,
+    /// because `send_to` stores the pipe in the packet metadata.
+    ///
+    /// Returns after queuing; the RADIO ISR sends the packet later. Returns
+    /// [`Error::TxFull`] when no packet buffer is available and
+    /// [`Error::InvalidParam`] for an empty or oversized payload.
     pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
         let pipe = self.default_pipe();
         self.send_to(pipe, payload).await
@@ -227,6 +249,11 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     ///
     /// The pipe is stored with the packet, so queued packets are not affected
     /// by later `set_pipe()` calls or by other tasks enqueueing packets.
+    ///
+    /// This is the preferred PTX API for RMK-style split transports and other
+    /// multi-pipe users. Returns [`Error::TxFull`] when the packet pool is full
+    /// and [`Error::InvalidParam`] for an invalid pipe, empty payload, or
+    /// payload longer than `EsbConfig::payload_length`.
     pub async fn send_to(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
         if pipe >= 8 {
             return Err(Error::InvalidParam);
@@ -254,15 +281,21 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         Ok(())
     }
 
-    /// Queue a NoAck packet for transmission.
+    /// Queue a NoAck packet for transmission on the current default pipe.
     ///
-    /// NoAck packets do not wait for acknowledgment — fire and forget.
+    /// NoAck packets do not wait for acknowledgment. Use
+    /// [`send_no_ack_to`](Self::send_no_ack_to) for multi-pipe firmware or
+    /// when multiple tasks can enqueue packets.
     pub async fn send_no_ack(&self, payload: &[u8]) -> Result<(), Error> {
         let pipe = self.default_pipe();
         self.send_no_ack_to(pipe, payload).await
     }
 
     /// Queue a NoAck packet for transmission on a specific pipe.
+    ///
+    /// The pipe is stored in the packet metadata. Returns [`Error::TxFull`]
+    /// when the packet pool is full and [`Error::InvalidParam`] for an invalid
+    /// pipe, empty payload, or oversized payload.
     pub async fn send_no_ack_to(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
         if pipe >= 8 {
             return Err(Error::InvalidParam);
@@ -308,10 +341,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
     }
 
-    /// Set the TX pipe for subsequent transmissions.
+    /// Set the default TX pipe for subsequent [`send`](Self::send) calls.
     ///
-    /// This is a convenience default for `send()`/`send_no_ack()`. Prefer
-    /// `send_to()` when multiple tasks or queued multi-pipe traffic are used.
+    /// This is only a convenience default for simple single-task firmware.
+    /// Already queued packets keep their own pipe metadata. Prefer
+    /// [`send_to`](Self::send_to) and [`send_no_ack_to`](Self::send_no_ack_to)
+    /// when multiple tasks or queued multi-pipe traffic are used.
     pub fn set_pipe(&self, pipe: u8) {
         debug_assert!(pipe < 8);
         if pipe >= 8 {
@@ -380,7 +415,8 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         }
 
         // Set the flag so ISR will suppress new TX after current transaction.
-        self.suspend_requested.store(true, Ordering::Release);
+        // If this future is cancelled, the guard clears the request.
+        let _request_guard = SuspendRequestGuard::new(&self.suspend_requested);
 
         // Re-check under IRQ-disabled to close the race window where
         // the ISR completed between try_suspend() fail and the store above.
@@ -390,7 +426,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
             if sm.state() == crate::state_machine::StatePtx::Idle {
                 let saved = sm.do_suspend(self.pool);
                 unpend_radio_irq();
-                self.suspend_requested.store(false, Ordering::Release);
                 guard.keep_masked();
                 return saved;
             }
@@ -413,7 +448,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         let sm = unsafe { &mut *self.sm.get() };
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
-        self.suspend_requested.store(false, Ordering::Release);
         guard.keep_masked();
         saved
     }
@@ -542,7 +576,13 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         }
     }
 
-    /// Queue an ACK payload for a specific pipe.
+    /// Queue an ACK payload for a specific RX pipe.
+    ///
+    /// ACK payloads are pipe-filtered by the PRX state machine, so a payload
+    /// queued for pipe 1 cannot be consumed by a packet received on pipe 0.
+    /// Returns [`Error::TxFull`] when the packet pool is full and
+    /// [`Error::InvalidParam`] for an invalid pipe, empty payload, or oversized
+    /// payload.
     pub async fn send_ack_payload(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
         if payload.is_empty() || payload.len() > self.max_payload_len {
             return Err(Error::InvalidParam);
@@ -614,7 +654,9 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             return saved;
         }
 
-        self.suspend_requested.store(true, Ordering::Release);
+        // If this future is cancelled before suspension completes, clear the
+        // request so the ISR does not keep suppressing progress.
+        let _request_guard = SuspendRequestGuard::new(&self.suspend_requested);
 
         // Re-check under IRQ-disabled to close the race window where
         // the ISR completed between try_suspend() fail and the store above.
@@ -627,7 +669,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
             {
                 let saved = sm.do_suspend(self.pool);
                 unpend_radio_irq();
-                self.suspend_requested.store(false, Ordering::Release);
                 guard.keep_masked();
                 return saved;
             }
@@ -650,7 +691,6 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         let sm = unsafe { &mut *self.sm.get() };
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
-        self.suspend_requested.store(false, Ordering::Release);
         guard.keep_masked();
         saved
     }

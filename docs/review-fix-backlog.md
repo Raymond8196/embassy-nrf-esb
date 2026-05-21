@@ -233,11 +233,12 @@ Status:
 
 - 2026-05-20: Exclusive PRX duplicate detection now has per-pipe valid bits, saved/restored through `EsbSavedState`; the MPSL PRX diagnostic path mirrors the same valid-bit guard. PRX ACK payload selection now claims only queued TX packets whose software header pipe matches the current RX pipe. PTX now exposes `send_to(pipe, payload)` and `send_no_ack_to(pipe, payload)`; existing `send()`/`send_no_ack()` use the guarded default pipe from `set_pipe()`.
 - 2026-05-20: `PacketPool` TX ownership was tightened from `free -> tx_queued -> in_dma` to `free -> tx_allocated -> tx_queued -> in_dma`, preventing ISR-side per-pipe scans from seeing a buffer while application code is still filling it.
-- 2026-05-20: Task-context `set_pipe()`, PTX/PRX `state()`, PRX `start_listening()`, and PRX `stop()` now mask RADIO IRQ around direct `UnsafeCell` state-machine access. Broader audit remains needed for async suspend poll paths and any future MPSL wrapper that shares state with P0 callbacks.
+- 2026-05-20: Task-context `set_pipe()`, PTX/PRX `state()`, PRX `start_listening()`, and PRX `stop()` now mask RADIO IRQ around direct `UnsafeCell` state-machine access.
+- 2026-05-21: Exclusive ESB `src/isr.rs` task-context `UnsafeCell` audit is complete. Async suspend poll paths now clear `suspend_requested` on future cancellation. Future MPSL owned wrappers still need the same level of scrutiny if they share state with priority-0 callbacks.
 
 RMK note:
 
-- 2026-05-20: Latest `HaoboGu/rmk` main at `822e706` defines split payload as postcard-serialized `SplitMessage` in `rmk/src/split/mod.rs`, with `SPLIT_MESSAGE_MAX_SIZE = SplitMessage::POSTCARD_MAX_SIZE + 4`. Do not invent a parallel RMK ESB frame for the prototype; build the ESB transport around RMK's existing `SplitReader` / `SplitWriter` contract and carry serialized `SplitMessage` bytes.
+- 2026-05-21: Latest local `HaoboGu/rmk` checkout remains at `822e706`. RMK defines split payload as postcard-serialized `SplitMessage` in `rmk/src/split/mod.rs`, with `SPLIT_MESSAGE_MAX_SIZE = SplitMessage::POSTCARD_MAX_SIZE + 4`; a temporary integration test printed `SPLIT_MESSAGE_MAX_SIZE = 20`. Do not invent a parallel RMK ESB frame for the prototype; build the ESB transport around RMK's existing `SplitReader` / `SplitWriter` contract and carry serialized `SplitMessage` bytes.
 
 Verification:
 

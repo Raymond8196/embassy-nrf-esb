@@ -3,6 +3,25 @@
 //! Manages timeslot sessions via nrf-mpsl, providing async APIs for
 //! requesting individual timeslots, chained timeslot sequences, and
 //! PTX transmissions within timeslots.
+//!
+//! # Stability
+//!
+//! This module is experimental and diagnostic. The current public functions are
+//! useful for bring-up and hardware regression runs, but they are not the
+//! stable RMK split-transport API.
+//!
+//! Current limitations:
+//!
+//! - sessions are free functions backed by static global state;
+//! - PTX/PRX buffers are fixed static buffers rather than caller-owned pools;
+//! - the in-slot PTX/PRX protocol logic is duplicated from the exclusive ESB
+//!   state machines;
+//! - the diagnostic PTX path does not yet implement the full ACK timeout and
+//!   retry behavior used by the exclusive ESB core;
+//! - active BLE connection coexistence still needs scheduler tuning.
+//!
+//! Use the exclusive `EsbPtx`/`EsbPrx` path as the stable baseline for the
+//! first RMK dongle prototype.
 
 use core::cell::RefCell;
 use core::future::poll_fn;

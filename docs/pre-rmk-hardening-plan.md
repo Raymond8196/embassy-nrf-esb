@@ -58,6 +58,12 @@ Progress:
   task-side state access now uses a shared helper. Suspend paths still keep
   RADIO IRQ masked on success until `restore()`, but busy/early-return paths are
   guarded by RAII drop behavior.
+- 2026-05-21: Completed the `src/isr.rs` task-context `UnsafeCell` audit for
+  the exclusive ESB path. ISR entrypoints remain ISR-only; task-side
+  state-machine mutation or reads are either IRQ-masked or limited to
+  ISR-pending operations that do not touch mutable protocol state. Async
+  `suspend()` now clears `suspend_requested` if the future is cancelled before
+  suspension completes.
 
 ## Phase 2: Exclusive ESB API Polish
 
@@ -76,6 +82,14 @@ Acceptance:
 
 - RMK adapter code should not need to infer hidden behavior from examples.
 - Payload sizing and pipe-binding requirements are documented in one place.
+
+Progress:
+
+- 2026-05-21: Public PTX/PRX API docs now document `send_to()` /
+  `send_no_ack_to()` as the preferred multi-pipe APIs, clarify `set_pipe()` as a
+  simple default-pipe convenience, document pipe-filtered ACK payload behavior,
+  and list the expected `TxFull` / `InvalidParam` error cases for queueing
+  methods.
 
 ## Phase 3: MPSL Risk Containment
 
@@ -97,6 +111,13 @@ Acceptance:
 - MPSL remains useful for hardware experiments.
 - MPSL is not presented as the API RMK should use for the first dongle
   prototype.
+
+Progress:
+
+- 2026-05-21: `mpsl_timeslot` module docs now explicitly mark the free-function
+  timeslot helpers as experimental/diagnostic and list the current static-state,
+  fixed-buffer, duplicated-protocol, retry-timing, and BLE-scheduling
+  limitations.
 
 ## Phase 4: Host Test Expansion
 
@@ -122,6 +143,10 @@ Progress:
   critical-section provider or a different test seam, because
   `embassy_sync::Channel` requires critical-section symbols when linked on the
   host target.
+- 2026-05-21: Rechecked the full `rx_complete()` queue lifecycle test. It still
+  links against `embassy_sync::Channel` critical-section symbols on the default
+  host gate, so it remains intentionally unlanded until the crate has an
+  explicit host critical-section provider or a PAC-free test seam.
 
 ## Phase 5: Hardware Regression Procedure
 
@@ -170,6 +195,16 @@ Acceptance:
 - RMK ESB adapter implementation can start from a known trait and payload
   contract.
 - This crate remains independent of RMK types.
+
+Progress:
+
+- 2026-05-21: Rechecked local RMK checkout at
+  `822e706640c54a72415b51361e4c890ec13b362a`. `SplitMessage` remains
+  `pub(crate)` in `rmk/src/split/mod.rs`; `SplitReader` and `SplitWriter`
+  remain `pub(crate)` in `rmk/src/split/driver.rs`; writers still serialize via
+  `postcard::to_slice()` into `[u8; SPLIT_MESSAGE_MAX_SIZE]`. A temporary RMK
+  integration test printed `SPLIT_MESSAGE_MAX_SIZE = 20`, so it fits inside the
+  current 247-byte single-packet ESB transport payload budget.
 
 ## Recommended Execution Order
 
