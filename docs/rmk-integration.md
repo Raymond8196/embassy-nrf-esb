@@ -52,6 +52,7 @@ Payload length requirement:
 
 ```text
 ESB payload_length >= TRANSPORT_HEADER_LEN + SPLIT_MESSAGE_MAX_SIZE
+SPLIT_MESSAGE_MAX_SIZE <= MAX_TRANSPORT_PAYLOAD_LEN
 ```
 
 The current `EsbConfig::default().payload_length` is 32, so RMK ESB builds
@@ -61,6 +62,11 @@ can occupy the Gazell-era maximum.
 Use `transport::required_esb_payload_len(SPLIT_MESSAGE_MAX_SIZE)` and
 `transport::fits_esb_payload(config.payload_length, SPLIT_MESSAGE_MAX_SIZE)` in
 the RMK adapter or board config validation to catch this before runtime.
+Because ESB's maximum payload is 252 bytes and this transport header is 5 bytes,
+one framed packet can carry at most 247 bytes of postcard-serialized
+`SplitMessage`. If RMK's `SPLIT_MESSAGE_MAX_SIZE` grows beyond that, the ESB
+adapter needs fragmentation or a smaller RMK split message shape instead of
+silently truncating or relying on runtime send failures.
 
 ## MVP Binding Policy
 
@@ -105,11 +111,9 @@ Read path:
 
 1. `EsbPrx::receive().await`.
 2. Get `pipe()` from `ReceivedPacket`.
-3. `decode_frame(packet.payload())`.
-4. Verify static binding with `StaticBindingTable::accepts(pipe, device_id)`.
-5. Use `SequenceTracker::accept(device_id, sequence)`.
-6. Drop duplicates before deserializing/publishing key events.
-7. Deserialize `SplitMessage`.
+3. Use `transport::accept_bound_frame()` to decode, verify static binding, and
+   drop duplicate `device_id + sequence` frames before deserializing.
+4. Deserialize `SplitMessage`.
 
 Write path:
 

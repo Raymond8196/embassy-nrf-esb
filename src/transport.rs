@@ -5,12 +5,15 @@
 //! transport header for routing and duplicate suppression.
 
 use crate::error::Error;
+use crate::header::EsbHeader;
 
 /// Current ESB transport framing version.
 pub const TRANSPORT_VERSION: u8 = 1;
 
 /// Header size in bytes.
 pub const TRANSPORT_HEADER_LEN: usize = 5;
+/// Maximum higher-level payload length that can fit in one framed ESB packet.
+pub const MAX_TRANSPORT_PAYLOAD_LEN: usize = EsbHeader::MAX_PAYLOAD as usize - TRANSPORT_HEADER_LEN;
 
 /// Frame carries an application-level acknowledgement.
 pub const FLAG_ACK: u8 = 0x01;
@@ -28,7 +31,9 @@ pub const fn required_esb_payload_len(payload_len: usize) -> usize {
 /// Return whether an ESB `payload_length` can carry a framed higher-level
 /// payload of `payload_len` bytes.
 pub const fn fits_esb_payload(esb_payload_len: u8, payload_len: usize) -> bool {
-    required_esb_payload_len(payload_len) <= esb_payload_len as usize
+    payload_len <= MAX_TRANSPORT_PAYLOAD_LEN
+        && esb_payload_len <= EsbHeader::MAX_PAYLOAD
+        && required_esb_payload_len(payload_len) <= esb_payload_len as usize
 }
 
 /// Header used by higher-level split protocols carried over ESB.
@@ -61,7 +66,7 @@ pub struct TransportHeader {
 impl TransportHeader {
     /// Create a v1 header.
     pub fn new(device_id: u8, sequence: u8, flags: u8, payload_len: usize) -> Result<Self, Error> {
-        if payload_len > u8::MAX as usize || flags & !FLAGS_V1_MASK != 0 {
+        if payload_len > MAX_TRANSPORT_PAYLOAD_LEN || flags & !FLAGS_V1_MASK != 0 {
             return Err(Error::InvalidParam);
         }
 
@@ -144,6 +149,36 @@ pub fn decode_frame(frame: &[u8]) -> Result<(TransportHeader, &[u8]), Error> {
     let start = TRANSPORT_HEADER_LEN;
     let end = start + header.payload_len as usize;
     Ok((header, &frame[start..end]))
+}
+
+/// Decode and validate a frame received on `pipe`.
+///
+/// This helper matches the central-side flow needed by split keyboard
+/// transports:
+///
+/// 1. Decode the transport header.
+/// 2. Check the static `pipe -> device_id` binding.
+/// 3. Drop duplicate `device_id + sequence` messages.
+///
+/// Returns `Ok(Some(...))` for a new accepted frame, `Ok(None)` for a duplicate,
+/// and `Err(Error::InvalidParam)` for malformed frames, binding mismatches, or
+/// device ids outside the sequence tracker.
+pub fn accept_bound_frame<'a, const PIPES: usize, const DEVICES: usize>(
+    bindings: &StaticBindingTable<PIPES>,
+    tracker: &mut SequenceTracker<DEVICES>,
+    pipe: u8,
+    frame: &'a [u8],
+) -> Result<Option<(TransportHeader, &'a [u8])>, Error> {
+    let (header, payload) = decode_frame(frame)?;
+    if !bindings.accepts(pipe, header.device_id)? {
+        return Err(Error::InvalidParam);
+    }
+
+    if !tracker.accept(header.device_id, header.sequence)? {
+        return Ok(None);
+    }
+
+    Ok(Some((header, payload)))
 }
 
 /// Per-device sequence tracker for duplicate suppression above ESB PID/CRC.
@@ -270,9 +305,9 @@ impl<const N: usize> Default for StaticBindingTable<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FLAG_ACK, FLAG_RETRANSMIT, SequenceTracker, StaticBindingTable, TRANSPORT_HEADER_LEN,
-        TRANSPORT_VERSION, TransportHeader, decode_frame, encode_frame, fits_esb_payload,
-        required_esb_payload_len,
+        FLAG_ACK, FLAG_RETRANSMIT, MAX_TRANSPORT_PAYLOAD_LEN, SequenceTracker, StaticBindingTable,
+        TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportHeader, accept_bound_frame, decode_frame,
+        encode_frame, fits_esb_payload, required_esb_payload_len,
     };
     use crate::error::Error;
 
@@ -331,6 +366,25 @@ mod tests {
     }
 
     #[test]
+    fn framed_payload_cannot_exceed_single_esb_packet_capacity() {
+        assert_eq!(MAX_TRANSPORT_PAYLOAD_LEN, 247);
+        assert!(TransportHeader::new(0, 0, 0, MAX_TRANSPORT_PAYLOAD_LEN).is_ok());
+        assert_eq!(
+            TransportHeader::new(0, 0, 0, MAX_TRANSPORT_PAYLOAD_LEN + 1),
+            Err(Error::InvalidParam)
+        );
+
+        let payload = [0u8; MAX_TRANSPORT_PAYLOAD_LEN + 1];
+        let mut frame = [0u8; TRANSPORT_HEADER_LEN + MAX_TRANSPORT_PAYLOAD_LEN + 1];
+        assert_eq!(
+            encode_frame(0, 0, 0, &payload, &mut frame),
+            Err(Error::InvalidParam)
+        );
+        assert!(fits_esb_payload(252, MAX_TRANSPORT_PAYLOAD_LEN));
+        assert!(!fits_esb_payload(252, MAX_TRANSPORT_PAYLOAD_LEN + 1));
+    }
+
+    #[test]
     fn sequence_tracker_accepts_new_and_rejects_duplicates_per_device() {
         let mut tracker = SequenceTracker::<2>::new();
 
@@ -369,5 +423,29 @@ mod tests {
         assert_eq!(BINDINGS.accepts(0, 10), Ok(true));
         assert_eq!(BINDINGS.accepts(2, 12), Ok(true));
         assert_eq!(BINDINGS.accepts(1, 10), Ok(false));
+    }
+
+    #[test]
+    fn accept_bound_frame_validates_binding_and_drops_duplicates() {
+        let bindings = StaticBindingTable::<4>::from_pipe_entries([None, Some(7), None, None]);
+        let mut tracker = SequenceTracker::<8>::new();
+        let mut frame = [0u8; 16];
+        let len = encode_frame(7, 42, 0, &[0xAA, 0xBB], &mut frame).unwrap();
+
+        let accepted = accept_bound_frame(&bindings, &mut tracker, 1, &frame[..len])
+            .unwrap()
+            .expect("new frame");
+        assert_eq!(accepted.0.device_id, 7);
+        assert_eq!(accepted.0.sequence, 42);
+        assert_eq!(accepted.1, &[0xAA, 0xBB]);
+
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 1, &frame[..len]),
+            Ok(None)
+        );
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 2, &frame[..len]),
+            Err(Error::InvalidParam)
+        );
     }
 }

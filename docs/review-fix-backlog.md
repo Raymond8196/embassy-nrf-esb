@@ -260,6 +260,15 @@ Scope:
 - Host-side tests for `EsbHeader`, `EsbAddresses`, config validation, and pure duplicate/PID helpers.
 - Add CI check matrix if project is ready.
 
+Status:
+
+- 2026-05-21: Host-side tests now cover header bit layout, address register
+  conversion, config validation, packet-pool TX ownership, duplicate detection
+  valid bits, transport framing, static binding, and application-level sequence
+  deduplication. Transport helpers now reject framed payloads that cannot fit in
+  one ESB packet and provide `accept_bound_frame()` for RMK-style central-side
+  decode/binding/dedup flow.
+
 Verification:
 
 - `cargo test` for host-testable units, or a dedicated test crate if needed.
