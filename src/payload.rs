@@ -470,4 +470,29 @@ mod tests {
             state::FREE
         );
     }
+
+    #[test]
+    fn rx_dma_claim_rejects_busy_packet_and_preserves_contents() {
+        let pool = PacketPool::<1, 16>::new();
+
+        assert!(pool.rx_to_dma(0));
+        assert!(!pool.rx_to_dma(0));
+        assert_eq!(
+            pool.state[0].load(core::sync::atomic::Ordering::Acquire),
+            state::IN_DMA
+        );
+
+        unsafe {
+            pool.header_mut(0).pipe = 2;
+            pool.header_mut(0).length = 3;
+            let buf = pool.buf_mut(0);
+            buf[4..7].copy_from_slice(&[0xA0, 0xB1, 0xC2]);
+        }
+
+        unsafe {
+            assert_eq!(pool.header(0).pipe, 2);
+            assert_eq!(pool.header(0).length, 3);
+            assert_eq!(&pool.buf(0)[4..7], &[0xA0, 0xB1, 0xC2]);
+        }
+    }
 }

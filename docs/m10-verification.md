@@ -324,6 +324,60 @@ DONE
 
 - Result: MPSL PRX/PTX multi-pipe ACK payload path passed for pipe 0 and pipe 1. Previous pipe 1 ACK failure is fixed in this diagnostic run, and ACK payload counters stayed monotonic per pipe.
 
+Follow-up run, 2026-05-21:
+
+- Rebuilt and flashed `mpsl_prx_in_slot` to `/dev/ttyACM0`, then
+  `mpsl_ptx_in_slot` to `/dev/ttyACM1` while both boards were in Open DFU
+  Bootloader.
+- PTX USB CDC re-enumerated as `/dev/ttyACM0`.
+- PTX output:
+
+```text
+connected
+before slots
+pipe=0 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+pipe=1 tx=445 ack=444 ackpl=444 ctr=444 inv=0 start=50 t0=50 radio=889 idle=1 blk=0 can=0
+DONE
+```
+
+- Result: Both pipes produced ACK payloads with monotonic counters and no
+  inversions. Pipe 0 was full coverage; pipe 1 dropped a small number of
+  packets in this run, so keep this as a useful-but-not-perfect MPSL multi-pipe
+  smoke result rather than a full 450/450 repeat.
+
+Repeat run, 2026-05-21, same 10 packets-per-slot PTX build:
+
+```text
+connected
+before slots
+pipe=0 tx=450 ack=450 ackpl=450 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+pipe=1 tx=450 ack=447 ackpl=447 ctr=450 inv=0 start=50 t0=50 radio=900 idle=1 blk=0 can=0
+DONE
+```
+
+- Result: pipe 1 improved compared with the prior run but still missed a few
+  ACKs. Because `tx=450` and `radio=900`, the PTX side completed the expected
+  number of radio transitions; the remaining misses are consistent with
+  PRX/PTX timeslot phase/timing misses rather than packet construction or
+  static pipe routing failure.
+
+Diagnostic 8 packets-per-slot PTX run, 2026-05-21:
+
+```text
+connected
+before slots
+pipe=0 tx=338 ack=334 ackpl=334 ctr=336 inv=0 start=50 t0=50 radio=673 idle=1 blk=0 can=0
+pipe=1 tx=350 ack=349 ackpl=349 ctr=349 inv=0 start=50 t0=50 radio=699 idle=1 blk=0 can=0
+DONE
+```
+
+- Result: reducing the per-slot packet target did not make the run full
+  coverage. It instead showed that when an early packet in a slot misses ACK,
+  the diagnostic PTX path can spend the rest of that slot waiting for radio
+  completion until TIMER0 cuts the slot, reducing `tx` below the nominal
+  `50 * packets_per_slot`. This points to missing ACK timeout/retry machinery in
+  the MPSL diagnostic PTX path, not to the exclusive ESB core.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.

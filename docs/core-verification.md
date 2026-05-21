@@ -50,7 +50,7 @@ This must fail with the `mpsl` / `_cs-cortex` mutual-exclusion error.
 
 ## Current Host Coverage
 
-As of 2026-05-20:
+As of 2026-05-21:
 
 - `EsbHeader` PID and NoAck bit layout.
 - `EsbHeader` DMA/payload offsets and struct layout.
@@ -61,6 +61,7 @@ As of 2026-05-20:
 - `PacketPool` TX allocation is not visible until enqueue.
 - `PacketPool` pipe-filtered TX dequeue claims only the requested pipe.
 - `PacketPool` cancel releases allocated and queued TX slots.
+- `PacketPool` RX DMA claim rejects busy slots and preserves buffer contents.
 - Duplicate detection requires a valid bit before PID/CRC comparison.
 - Duplicate detection PID/CRC/valid state saves and restores.
 - Transport frame encode/decode round trips header and payload.
@@ -77,7 +78,7 @@ commit, feature flags, RF channel, payload length, and power source for each run
 | ID | Test | Firmware pair | Duration | Pass criteria | Result |
 |----|------|---------------|----------|---------------|--------|
 | C1 | PTX/PRX basic | `ptx_basic` + `prx_basic` | 30 min | No panic; TX/RX counters progress; no stuck radio. | Pending |
-| C2 | ACK payload echo | `ptx_ack_echo` + ACK-capable PRX | 30 min | ACK payload count progresses monotonically; no counter inversion. | Pending |
+| C2 | ACK payload echo | `ptx_ack_echo` + ACK-capable PRX | 30 min | ACK payload count progresses monotonically; no counter inversion. | 12 s smoke passed; 30 min pending |
 | C3 | Multi-pipe | `ptx_multipipe` + multi-pipe PRX | 30 min | pipe0/pipe1/pipe2 all ACK; no cross-pipe ACK payloads. | Pending |
 | C4 | Suspend/resume | `ptx_suspend` + PRX | 10k cycles or 30 min | No deadlock; traffic resumes after restore; no false duplicate burst. | Pending |
 | C5 | NoAck | NoAck PTX + PRX | 30 min | PRX receives NoAck packets; no ACK TX shortcut regression. | Pending |
@@ -99,6 +100,26 @@ For each hardware run, record:
 - Duplicate count if available.
 - Any panic/assert/timeout.
 - USB CDC or RTT output excerpt.
+
+## Hardware Results
+
+### 2026-05-21 Exclusive ESB ACK Echo Smoke
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware pair: `prx_usb` on PRX, `ptx_ack_echo` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_ack_echo --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX USB CDC reached `rx=1200 lost=0 loss=0.0%` during a 12 second capture.
+- PTX USB CDC reached `tx=1200 ack_rx=1199`; ACK payload data monotonically followed the counter.
+- No panic, USB reset loop, or stalled counter was observed during the capture.
 
 ## Acceptance For 9/10 Core
 

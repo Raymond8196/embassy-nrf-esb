@@ -72,6 +72,36 @@ fn unpend_radio_irq() {
     cortex_m::peripheral::NVIC::unpend(crate::pac::Interrupt::RADIO);
 }
 
+struct RadioIrqMask {
+    reenable_on_drop: bool,
+}
+
+impl RadioIrqMask {
+    fn new() -> Self {
+        disable_radio_irq();
+        Self {
+            reenable_on_drop: true,
+        }
+    }
+
+    fn keep_masked(mut self) {
+        self.reenable_on_drop = false;
+    }
+}
+
+impl Drop for RadioIrqMask {
+    fn drop(&mut self) {
+        if self.reenable_on_drop {
+            enable_radio_irq();
+        }
+    }
+}
+
+fn with_radio_irq_masked<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = RadioIrqMask::new();
+    f()
+}
+
 // ---- PTX Driver ----
 
 /// Embassy async PTX (Primary Transmitter) driver.
@@ -287,19 +317,16 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         if pipe >= 8 {
             return;
         }
-        disable_radio_irq();
-        let sm = unsafe { &mut *self.sm.get() };
-        sm.tx_pipe = pipe;
-        unpend_radio_irq();
-        enable_radio_irq();
+        with_radio_irq_masked(|| {
+            let sm = unsafe { &mut *self.sm.get() };
+            sm.tx_pipe = pipe;
+            unpend_radio_irq();
+        });
     }
 
     /// Get current PTX state.
     pub fn state(&self) -> crate::state_machine::StatePtx {
-        disable_radio_irq();
-        let state = unsafe { &*self.sm.get() }.state();
-        enable_radio_irq();
-        state
+        with_radio_irq_masked(|| unsafe { &*self.sm.get() }.state())
     }
 
     /// Check if max retransmit attempts was reached since last check.
@@ -316,10 +343,7 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     }
 
     fn default_pipe(&self) -> u8 {
-        disable_radio_irq();
-        let pipe = unsafe { &*self.sm.get() }.tx_pipe;
-        enable_radio_irq();
-        pipe
+        with_radio_irq_masked(|| unsafe { &*self.sm.get() }.tx_pipe)
     }
 
     // ---- Suspend / Resume ----
@@ -329,16 +353,16 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
     /// After success, RADIO IRQ is disabled and the radio is stopped.
     /// Call `restore()` to re-initialize and resume operation.
     pub fn try_suspend(&self) -> Result<EsbSavedState, Error> {
-        disable_radio_irq();
+        let guard = RadioIrqMask::new();
 
         let sm = unsafe { &mut *self.sm.get() };
         if sm.state() != crate::state_machine::StatePtx::Idle {
-            enable_radio_irq();
             return Err(Error::Busy);
         }
 
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
+        guard.keep_masked();
         Ok(saved)
     }
 
@@ -360,22 +384,22 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
 
         // Re-check under IRQ-disabled to close the race window where
         // the ISR completed between try_suspend() fail and the store above.
-        disable_radio_irq();
-        let sm = unsafe { &mut *self.sm.get() };
-        if sm.state() == crate::state_machine::StatePtx::Idle {
-            let saved = sm.do_suspend(self.pool);
-            unpend_radio_irq();
-            self.suspend_requested.store(false, Ordering::Release);
-            return saved;
+        {
+            let guard = RadioIrqMask::new();
+            let sm = unsafe { &mut *self.sm.get() };
+            if sm.state() == crate::state_machine::StatePtx::Idle {
+                let saved = sm.do_suspend(self.pool);
+                unpend_radio_irq();
+                self.suspend_requested.store(false, Ordering::Release);
+                guard.keep_masked();
+                return saved;
+            }
         }
-        enable_radio_irq();
 
         // ISR is running and will see suspend_requested — wait for wake.
         core::future::poll_fn(|cx| {
             self.suspend_signal.register(cx.waker());
-            disable_radio_irq();
-            let state = unsafe { &*self.sm.get() }.state();
-            enable_radio_irq();
+            let state = with_radio_irq_masked(|| unsafe { &*self.sm.get() }.state());
             if state == crate::state_machine::StatePtx::Idle {
                 Poll::Ready(())
             } else {
@@ -385,11 +409,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPtx<T, N, SIZE> {
         .await;
 
         // ISR is done and state is idle — finalize
-        disable_radio_irq();
+        let guard = RadioIrqMask::new();
         let sm = unsafe { &mut *self.sm.get() };
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
         self.suspend_requested.store(false, Ordering::Release);
+        guard.keep_masked();
         saved
     }
 
@@ -500,12 +525,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Start listening for incoming packets.
     pub fn start_listening(&self) -> Result<(), Error> {
-        disable_radio_irq();
-        let sm = unsafe { &mut *self.sm.get() };
-        let result = sm.start_receiving(self.pool);
-        unpend_radio_irq();
-        enable_radio_irq();
-        result
+        with_radio_irq_masked(|| {
+            let sm = unsafe { &mut *self.sm.get() };
+            let result = sm.start_receiving(self.pool);
+            unpend_radio_irq();
+            result
+        })
     }
 
     /// Receive the next packet (async).
@@ -545,19 +570,16 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
     /// Stop listening and go idle.
     pub fn stop(&self) {
-        disable_radio_irq();
-        let sm = unsafe { &mut *self.sm.get() };
-        sm.stop_receiving(self.pool);
-        unpend_radio_irq();
-        enable_radio_irq();
+        with_radio_irq_masked(|| {
+            let sm = unsafe { &mut *self.sm.get() };
+            sm.stop_receiving(self.pool);
+            unpend_radio_irq();
+        });
     }
 
     /// Get current PRX state.
     pub fn state(&self) -> crate::state_machine::StatePrx {
-        disable_radio_irq();
-        let state = unsafe { &*self.sm.get() }.state();
-        enable_radio_irq();
-        state
+        with_radio_irq_masked(|| unsafe { &*self.sm.get() }.state())
     }
 
     // ---- Suspend / Resume ----
@@ -567,19 +589,19 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
     /// PRX in `Idle` or `Receiver` state can be suspended immediately.
     /// `TxAck`/`TxRepeatedAck` states return `Err(Busy)`.
     pub fn try_suspend(&self) -> Result<EsbSavedState, Error> {
-        disable_radio_irq();
+        let guard = RadioIrqMask::new();
 
         let sm = unsafe { &mut *self.sm.get() };
         let state = sm.state();
         if state != crate::state_machine::StatePrx::Idle
             && state != crate::state_machine::StatePrx::Receiver
         {
-            enable_radio_irq();
             return Err(Error::Busy);
         }
 
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
+        guard.keep_masked();
         Ok(saved)
     }
 
@@ -596,24 +618,24 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 
         // Re-check under IRQ-disabled to close the race window where
         // the ISR completed between try_suspend() fail and the store above.
-        disable_radio_irq();
-        let sm = unsafe { &mut *self.sm.get() };
-        let state = sm.state();
-        if state == crate::state_machine::StatePrx::Idle
-            || state == crate::state_machine::StatePrx::Receiver
         {
-            let saved = sm.do_suspend(self.pool);
-            unpend_radio_irq();
-            self.suspend_requested.store(false, Ordering::Release);
-            return saved;
+            let guard = RadioIrqMask::new();
+            let sm = unsafe { &mut *self.sm.get() };
+            let state = sm.state();
+            if state == crate::state_machine::StatePrx::Idle
+                || state == crate::state_machine::StatePrx::Receiver
+            {
+                let saved = sm.do_suspend(self.pool);
+                unpend_radio_irq();
+                self.suspend_requested.store(false, Ordering::Release);
+                guard.keep_masked();
+                return saved;
+            }
         }
-        enable_radio_irq();
 
         core::future::poll_fn(|cx| {
             self.suspend_signal.register(cx.waker());
-            disable_radio_irq();
-            let state = unsafe { &*self.sm.get() }.state();
-            enable_radio_irq();
+            let state = with_radio_irq_masked(|| unsafe { &*self.sm.get() }.state());
             if state == crate::state_machine::StatePrx::Idle
                 || state == crate::state_machine::StatePrx::Receiver
             {
@@ -624,11 +646,12 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         })
         .await;
 
-        disable_radio_irq();
+        let guard = RadioIrqMask::new();
         let sm = unsafe { &mut *self.sm.get() };
         let saved = sm.do_suspend(self.pool);
         unpend_radio_irq();
         self.suspend_requested.store(false, Ordering::Release);
+        guard.keep_masked();
         saved
     }
 
