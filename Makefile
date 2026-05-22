@@ -1,6 +1,7 @@
 EXAMPLES    := usb_minimal ptx_silent prx_usb
 RELEASE_DIR := target/thumbv7em-none-eabihf/release/examples
 FEATURES    ?= nrf52840,_cs-cortex
+OBJCOPY     ?= arm-none-eabi-objcopy
 HW_VERSION  := 52
 SD_REQ      := 0x00
 APP_VERSION := 1
@@ -17,7 +18,7 @@ build-%:
 
 # Convert to hex: make ptx_silent.hex
 %.hex: build-%
-	rust-objcopy -O ihex $(RELEASE_DIR)/$* $@
+	$(OBJCOPY) -O ihex $(RELEASE_DIR)/$* $@
 
 # Create DFU package: make ptx_silent_dfu.zip
 %_dfu.zip: %.hex

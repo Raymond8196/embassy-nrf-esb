@@ -51,6 +51,33 @@ Do not treat the current MPSL free-function diagnostics as a stable API.
 | nRF52833 | `nrf52833` | Feature reserved; not hardware-validated yet |
 | nRF52832 | `nrf52832` | Feature reserved; not hardware-validated yet |
 
+## Quick Start
+
+Run the host and feature checks:
+
+```bash
+cargo fmt --check
+cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+cargo check --features nrf52840,_cs-cortex
+```
+
+Build the exclusive ESB USB smoke-test firmware for two nRF52840 boards:
+
+```bash
+make prx_usb_dfu.zip
+make ptx_ack_echo_dfu.zip
+```
+
+Flash each board while it is in serial DFU mode:
+
+```bash
+make flash-prx_usb PORT=/dev/ttyACM0
+make flash-ptx_ack_echo PORT=/dev/ttyACM1
+```
+
+Expected smoke-test output is documented in
+[Alpha Testing Guide](docs/alpha-testing.md).
+
 ## Dependencies
 
 - `embassy-nrf` 0.10 (with `unstable-pac` for PAC access)
