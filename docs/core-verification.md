@@ -121,6 +121,28 @@ Result:
 - PTX USB CDC reached `tx=1200 ack_rx=1199`; ACK payload data monotonically followed the counter.
 - No panic, USB reset loop, or stalled counter was observed during the capture.
 
+### 2026-05-22 Exclusive ESB ACK Echo Smoke
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware commit: `bf12546` plus local documentation/Makefile-only changes.
+- Firmware pair: `prx_usb` on PRX, `ptx_ack_echo` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_ack_echo --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX USB CDC reached `rx=7600 lost=0 loss=0.0%` across repeated 12 second
+  captures totaling roughly 72 seconds.
+- PTX USB CDC reached `tx=7600 ack_rx=7599`; ACK payload data monotonically
+  followed the counter.
+- No panic, USB reset loop, or stalled counter was observed during the capture.
+
 ## Acceptance For 9/10 Core
 
 Core ESB reaches the target when:
