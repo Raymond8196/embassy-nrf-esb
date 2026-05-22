@@ -36,6 +36,21 @@ pub const fn fits_esb_payload(esb_payload_len: u8, payload_len: usize) -> bool {
         && required_esb_payload_len(payload_len) <= esb_payload_len as usize
 }
 
+/// Validate that an ESB `payload_length` can carry a framed higher-level
+/// payload of `payload_len` bytes.
+///
+/// This is intentionally separate from `EsbConfig::validate()`: the base ESB
+/// config cannot know which higher-level transport, if any, will wrap the
+/// payload. Split-protocol adapters should call this during their own board or
+/// transport configuration validation.
+pub const fn validate_payload_length(esb_payload_len: u8, payload_len: usize) -> Result<(), Error> {
+    if fits_esb_payload(esb_payload_len, payload_len) {
+        Ok(())
+    } else {
+        Err(Error::InvalidParam)
+    }
+}
+
 /// Header used by higher-level split protocols carried over ESB.
 ///
 /// Layout:
@@ -307,7 +322,7 @@ mod tests {
     use super::{
         FLAG_ACK, FLAG_RETRANSMIT, MAX_TRANSPORT_PAYLOAD_LEN, SequenceTracker, StaticBindingTable,
         TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportHeader, accept_bound_frame, decode_frame,
-        encode_frame, fits_esb_payload, required_esb_payload_len,
+        encode_frame, fits_esb_payload, required_esb_payload_len, validate_payload_length,
     };
     use crate::error::Error;
 
@@ -363,6 +378,8 @@ mod tests {
         assert_eq!(required_esb_payload_len(32), TRANSPORT_HEADER_LEN + 32);
         assert!(fits_esb_payload(37, 32));
         assert!(!fits_esb_payload(36, 32));
+        assert_eq!(validate_payload_length(37, 32), Ok(()));
+        assert_eq!(validate_payload_length(36, 32), Err(Error::InvalidParam));
     }
 
     #[test]

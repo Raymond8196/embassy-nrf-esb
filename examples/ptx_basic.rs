@@ -6,6 +6,7 @@ use embassy_nrf::pac;
 use embassy_nrf::peripherals::TIMER1;
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
+use embassy_nrf_esb::esb_ptx_interrupts;
 use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPtx};
 use embassy_nrf_esb::payload::PacketPool;
 use {defmt_rtt as _, panic_probe as _};
@@ -16,6 +17,7 @@ mod interrupt {
 
 static POOL: PacketPool<DEFAULT_POOL_N, DEFAULT_POOL_SIZE> = PacketPool::new();
 static mut PTX_REF: Option<&'static EsbPtx<TIMER1>> = None;
+esb_ptx_interrupts!(PTX_REF, TIMER1);
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -70,19 +72,5 @@ async fn main(_spawner: Spawner) {
 
         counter = counter.wrapping_add(1);
         embassy_time::Timer::after_millis(500).await;
-    }
-}
-
-#[cortex_m_rt::interrupt]
-fn RADIO() {
-    if let Some(ptx) = unsafe { PTX_REF } {
-        ptx.on_radio_interrupt();
-    }
-}
-
-#[cortex_m_rt::interrupt]
-fn TIMER1() {
-    if let Some(ptx) = unsafe { PTX_REF } {
-        ptx.on_timer_interrupt();
     }
 }

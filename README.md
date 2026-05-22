@@ -150,6 +150,12 @@ license. This restricts use to Nordic Semiconductor integrated circuits
 (the nRF52 series). Without the `mpsl` feature, this crate is pure Rust under
 MIT OR Apache-2.0.
 
+Publishing note: the optional `mpsl` feature currently depends on a pinned git
+revision of `nrf-mpsl` for `embassy-nrf` 0.10 compatibility. This is acceptable
+for GitHub alpha testing, but it blocks normal crates.io packaging until a
+compatible crates.io dependency is available or the MPSL integration is split
+from the publishable core.
+
 ### Trademarks
 
 "Enhanced ShockBurst" and "ESB" are trademarks of Nordic Semiconductor ASA.

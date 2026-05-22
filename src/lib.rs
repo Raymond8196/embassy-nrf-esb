@@ -50,4 +50,48 @@ pub mod mpsl_timeslot;
 // Re-export driver types from isr module
 pub mod isr;
 
+/// Define RADIO and TIMER interrupt handlers for an ESB driver reference.
+///
+/// The first argument is a `static mut Option<&'static EsbPtx<_>>` or
+/// `static mut Option<&'static EsbPrx<_>>`. The second argument is the timer
+/// interrupt name, for example `TIMER1`.
+///
+/// This macro is intended for `cortex-m-rt` style examples. Applications using
+/// a different interrupt binding model can call `on_radio_interrupt()` and
+/// `on_timer_interrupt()` directly from their own handlers.
+#[macro_export]
+macro_rules! esb_interrupts {
+    ($driver_ref:ident, $timer_interrupt:ident $(,)?) => {
+        #[cortex_m_rt::interrupt]
+        fn RADIO() {
+            if let Some(driver) = unsafe { $driver_ref } {
+                driver.on_radio_interrupt();
+            }
+        }
+
+        #[cortex_m_rt::interrupt]
+        fn $timer_interrupt() {
+            if let Some(driver) = unsafe { $driver_ref } {
+                driver.on_timer_interrupt();
+            }
+        }
+    };
+}
+
+/// PTX-specific alias for [`esb_interrupts!`].
+#[macro_export]
+macro_rules! esb_ptx_interrupts {
+    ($driver_ref:ident, $timer_interrupt:ident $(,)?) => {
+        $crate::esb_interrupts!($driver_ref, $timer_interrupt);
+    };
+}
+
+/// PRX-specific alias for [`esb_interrupts!`].
+#[macro_export]
+macro_rules! esb_prx_interrupts {
+    ($driver_ref:ident, $timer_interrupt:ident $(,)?) => {
+        $crate::esb_interrupts!($driver_ref, $timer_interrupt);
+    };
+}
+
 pub(crate) use embassy_nrf::pac;

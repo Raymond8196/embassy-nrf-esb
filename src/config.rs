@@ -73,6 +73,14 @@ mod tests {
     }
 
     #[test]
+    fn payload_length_builder_sets_max_payload_size() {
+        let config = EsbConfig::default().with_payload_length(64);
+
+        assert_eq!(config.payload_length, 64);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
     fn ack_timeout_has_minimum() {
         let mut config = EsbConfig::default();
 
@@ -230,6 +238,11 @@ pub struct EsbConfig {
     /// ESB dynamic payloads shorter than this value are still allowed. Packets
     /// longer than this value are rejected by `send()` / `send_no_ack()` /
     /// `send_ack_payload()` and RADIO `PCNF1.MAXLEN`.
+    ///
+    /// Higher-level split protocols should set this to at least their framed
+    /// packet length. For `transport` frames, use
+    /// `transport::required_esb_payload_len(app_payload_len)` to calculate the
+    /// required value before constructing the driver.
     pub payload_length: u8,
     /// TX output power.
     pub tx_power: TxPower,
@@ -250,6 +263,16 @@ impl Default for EsbConfig {
 }
 
 impl EsbConfig {
+    /// Return a copy of this config with a different maximum payload length.
+    ///
+    /// This is a convenience for higher-level protocols that need payloads
+    /// larger than the ESB-compatible 32-byte default. The value is still
+    /// checked by [`validate`](Self::validate); valid lengths are 1–252 bytes.
+    pub const fn with_payload_length(mut self, payload_length: u8) -> Self {
+        self.payload_length = payload_length;
+        self
+    }
+
     /// Validate configuration against Nordic ESB constraints.
     ///
     /// Returns `Ok(())` if valid, `Err(Error::InvalidParam)` otherwise.

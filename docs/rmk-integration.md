@@ -55,13 +55,20 @@ ESB payload_length >= TRANSPORT_HEADER_LEN + SPLIT_MESSAGE_MAX_SIZE
 SPLIT_MESSAGE_MAX_SIZE <= MAX_TRANSPORT_PAYLOAD_LEN
 ```
 
-The current `EsbConfig::default().payload_length` is 32, so RMK ESB builds
-should explicitly set a larger payload length if RMK's serialized split message
-can occupy the Gazell-era maximum.
+The current `EsbConfig::default().payload_length` is 32. This is enough for the
+local RMK split size observed on 2026-05-21 (`SPLIT_MESSAGE_MAX_SIZE = 20`,
+requiring 25 ESB payload bytes after the transport header), but the RMK adapter
+must not rely on that staying true. It should compute the required ESB payload
+length from the actual RMK constant:
 
-Use `transport::required_esb_payload_len(SPLIT_MESSAGE_MAX_SIZE)` and
-`transport::fits_esb_payload(config.payload_length, SPLIT_MESSAGE_MAX_SIZE)` in
-the RMK adapter or board config validation to catch this before runtime.
+```rust
+let required = embassy_nrf_esb::transport::required_esb_payload_len(SPLIT_MESSAGE_MAX_SIZE);
+let config = EsbConfig::default().with_payload_length(required as u8);
+```
+
+Use `transport::validate_payload_length(config.payload_length,
+SPLIT_MESSAGE_MAX_SIZE)` in the RMK adapter or board config validation to catch
+this before runtime.
 Because ESB's maximum payload is 252 bytes and this transport header is 5 bytes,
 one framed packet can carry at most 247 bytes of postcard-serialized
 `SplitMessage`. If RMK's `SPLIT_MESSAGE_MAX_SIZE` grows beyond that, the ESB

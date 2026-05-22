@@ -23,6 +23,21 @@ Not ready as a stable user-facing feature:
 - Product-ready BLE + ESB coexistence through MPSL.
 - crates.io publishing with the optional `mpsl` feature.
 
+## Payload Length
+
+`EsbConfig::default()` uses a 32-byte maximum payload for ESB-compatible smoke
+tests. Higher-level transports that wrap application payloads in an additional
+header should set a larger value explicitly:
+
+```rust
+let config = EsbConfig::default().with_payload_length(required_payload_len);
+```
+
+For frames built with this crate's `transport` module, calculate the required
+ESB payload length with `transport::required_esb_payload_len(app_payload_len)`
+and validate it with `transport::validate_payload_length(config.payload_length,
+app_payload_len)`.
+
 ## Build Gate
 
 Run this before reporting hardware results:

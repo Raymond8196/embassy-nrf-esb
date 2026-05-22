@@ -14,14 +14,18 @@ all: $(addsuffix _dfu.zip,$(EXAMPLES))
 
 # Build single example: make build-ptx_silent
 build-%:
+	@command -v cargo >/dev/null || { echo "error: cargo not found in PATH"; exit 1; }
 	cargo build --example $* --features $(FEATURES) --release
 
 # Convert to hex: make ptx_silent.hex
 %.hex: build-%
+	@command -v $(OBJCOPY) >/dev/null || { echo "error: $(OBJCOPY) not found in PATH. Install arm-none-eabi-binutils or run make OBJCOPY=<objcopy>"; exit 1; }
 	$(OBJCOPY) -O ihex $(RELEASE_DIR)/$* $@
 
 # Create DFU package: make ptx_silent_dfu.zip
 %_dfu.zip: %.hex
+	@command -v python3 >/dev/null || { echo "error: python3 not found in PATH"; exit 1; }
+	@python3 -c 'import nordicsemi' >/dev/null 2>&1 || { echo "error: nrfutil Python package not found. Install it with: python3 -m pip install nrfutil"; exit 1; }
 	python3 -m nordicsemi pkg generate \
 		--application $< \
 		--hw-version $(HW_VERSION) \
@@ -34,6 +38,8 @@ flash-%: %_dfu.zip
 ifndef PORT
 	$(error PORT is not set. Usage: make flash-ptx_silent PORT=/dev/tty.usbmodemXXXX)
 endif
+	@command -v python3 >/dev/null || { echo "error: python3 not found in PATH"; exit 1; }
+	@python3 -c 'import nordicsemi' >/dev/null 2>&1 || { echo "error: nrfutil Python package not found. Install it with: python3 -m pip install nrfutil"; exit 1; }
 	python3 -m nordicsemi dfu serial -pkg $< -p $(PORT) -b $(DFU_BAUD)
 
 # List available serial ports
