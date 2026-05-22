@@ -40,6 +40,10 @@ cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
 cargo check --example prx_multipipe_usb --features nrf52840,_cs-cortex
 cargo check --example ptx_multipipe_ack --features nrf52840,_cs-cortex
 cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
+cargo check --example ptx_noack_usb --features nrf52840,_cs-cortex
+cargo check --example prx_noack_usb --features nrf52840,_cs-cortex
+cargo check --example ptx_suspend_usb --features nrf52840,_cs-cortex
+cargo check --example prx_idle_usb --features nrf52840,_cs-cortex
 ```
 
 Expected feature conflict:
@@ -82,9 +86,9 @@ commit, feature flags, RF channel, payload length, and power source for each run
 | C1 | PTX/PRX basic | `ptx_basic` + `prx_basic` | 30 min | No panic; TX/RX counters progress; no stuck radio. | Pending |
 | C2 | ACK payload echo | `ptx_ack_echo` + ACK-capable PRX | 30 min | ACK payload count progresses monotonically; no counter inversion. | Passed on 2026-05-22 |
 | C3 | Multi-pipe | `ptx_multipipe_ack` + `prx_multipipe_usb` | 30 min | pipe0/pipe1 both ACK; PRX counts stay balanced; `bad_pipe=0`, `malformed=0`, `invalid_ack=0`. | Passed on 2026-05-22 |
-| C4 | Suspend/resume | `ptx_suspend` + PRX | 10k cycles or 30 min | No deadlock; traffic resumes after restore; no false duplicate burst. | Pending |
-| C5 | NoAck | NoAck PTX + PRX | 30 min | PRX receives NoAck packets; no ACK TX shortcut regression. | Pending |
-| C6 | Long idle recovery | PRX idle/listen transitions | 30 min | Repeated `start_listening()`/`stop()` does not wedge RADIO. | Pending |
+| C4 | Suspend/resume | `ptx_suspend_usb` + PRX | 10k cycles or 30 min | No deadlock; traffic resumes after restore; no false duplicate burst. | Passed on 2026-05-22 |
+| C5 | NoAck | `ptx_noack_usb` + `prx_noack_usb` | 30 min | PRX receives NoAck packets; no ACK TX shortcut regression. | Passed on 2026-05-22 |
+| C6 | Long idle recovery | `prx_idle_usb` + `ptx_noack_usb` | 30 min | Repeated `start_listening()`/`stop()` does not wedge RADIO. | Passed on 2026-05-22 |
 
 ## Data To Capture
 
@@ -221,6 +225,84 @@ Result:
   drops, or invalid ACK payloads. ACK payload counters lagged queued TX counts
   by 66 packets on pipe 0 and 86 packets on pipe 1 at the final sample.
 - No panic, USB reset loop, or stalled counter was observed during the capture.
+
+### 2026-05-22 Exclusive ESB NoAck 30 Minute Run
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware base commit: `f0919a1` plus local `ptx_noack_usb` and
+  `prx_noack_usb` diagnostics later committed as `3f8ca84`.
+- Firmware pair: `prx_noack_usb` on PRX, `ptx_noack_usb` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_noack_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_noack_usb --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX and PTX USB CDC captures ran under `timeout 1800s` and exited by timeout
+  after a clean 30 minute run.
+- Final PTX excerpt reached `n=180200 q=180201 f=0 m=0`; the TX queue kept
+  progressing with no TX pool saturation or max-attempt reports.
+- Final PRX excerpt reached `rx=180000 lost=177 mf=0`; NoAck traffic continued
+  through the full run and no malformed packets were reported. The 177 counter
+  gaps are expected RF loss for an unretried NoAck stream, not ACK failure.
+- No panic, USB reset loop, or stalled counter was observed during the capture.
+
+### 2026-05-22 Exclusive ESB Suspend/Resume 30 Minute Run
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware base commit: `f0919a1` plus local `ptx_suspend_usb` diagnostic
+  later committed as `3f8ca84`.
+- Firmware pair: `prx_usb` on PRX, `ptx_suspend_usb` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_suspend_usb --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX and PTX USB CDC captures ran under `timeout 1800s` and exited by timeout
+  after a clean 30 minute run.
+- Final PTX excerpt reached `c=1716 q=171600 a=171563 f=0 m=0`; 1,716
+  suspend/restore cycles completed with queued traffic continuing after each
+  restore.
+- Final PRX excerpt reached `rx=171600 lost=0 loss=0.0%`.
+- No panic, USB reset loop, TX pool saturation, max-attempt report, deadlock,
+  or stalled counter was observed during the capture.
+
+### 2026-05-22 Exclusive ESB PRX Idle/Listens 30 Minute Run
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware commit: `3f8ca84` plus local documentation-only changes.
+- Firmware pair: `prx_idle_usb` on PRX, `ptx_noack_usb` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_idle_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_noack_usb --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX and PTX USB CDC output was sampled after the run had exceeded the 30
+  minute C6 threshold.
+- Final PRX excerpt reached `c=1840 rx=173152 last=96 empty=26 mf=0`;
+  repeated `start_listening()` / `stop()` cycles continued to recover and no
+  malformed packets were reported.
+- Final PTX excerpt reached `n=181800 q=181801 f=0 m=0`; the NoAck sender kept
+  queueing packets without TX pool saturation or max-attempt reports.
+- No panic, USB reset loop, wedged RADIO state, or stalled counter was observed
+  during the capture.
 
 ## Acceptance For 9/10 Core
 

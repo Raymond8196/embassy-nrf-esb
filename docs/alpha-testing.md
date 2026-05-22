@@ -52,6 +52,10 @@ cargo check --example prx_usb --features nrf52840,_cs-cortex
 cargo check --example ptx_ack_echo --features nrf52840,_cs-cortex
 cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
 cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
+cargo check --example ptx_noack_usb --features nrf52840,_cs-cortex
+cargo check --example prx_noack_usb --features nrf52840,_cs-cortex
+cargo check --example ptx_suspend_usb --features nrf52840,_cs-cortex
+cargo check --example prx_idle_usb --features nrf52840,_cs-cortex
 ```
 
 The intentional feature-conflict check should fail with a clear mutual
