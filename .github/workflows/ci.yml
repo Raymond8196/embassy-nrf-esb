@@ -57,10 +57,22 @@ jobs:
         run: cargo check --example usb_minimal --features nrf52840,_cs-cortex
       - name: PTX ACK echo
         run: cargo check --example ptx_ack_echo --features nrf52840,_cs-cortex
+      - name: PTX NoAck USB
+        run: cargo check --example ptx_noack_usb --features nrf52840,_cs-cortex
+      - name: PRX NoAck USB
+        run: cargo check --example prx_noack_usb --features nrf52840,_cs-cortex
       - name: PTX multipipe
         run: cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
+      - name: PTX multipipe ACK USB
+        run: cargo check --example ptx_multipipe_ack --features nrf52840,_cs-cortex
+      - name: PRX multipipe USB
+        run: cargo check --example prx_multipipe_usb --features nrf52840,_cs-cortex
       - name: PTX suspend
         run: cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
+      - name: PTX suspend USB
+        run: cargo check --example ptx_suspend_usb --features nrf52840,_cs-cortex
+      - name: PRX idle USB
+        run: cargo check --example prx_idle_usb --features nrf52840,_cs-cortex
 
   examples-mpsl:
     name: MPSL examples

@@ -49,8 +49,12 @@ cargo check --features nrf52840,_cs-cortex
 cargo check --example ptx_basic --features nrf52840,defmt,_cs-cortex
 cargo check --example prx_basic --features nrf52840,defmt,_cs-cortex
 cargo check --example prx_usb --features nrf52840,_cs-cortex
+cargo check --example ptx_silent --features nrf52840,_cs-cortex
+cargo check --example usb_minimal --features nrf52840,_cs-cortex
 cargo check --example ptx_ack_echo --features nrf52840,_cs-cortex
 cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
+cargo check --example prx_multipipe_usb --features nrf52840,_cs-cortex
+cargo check --example ptx_multipipe_ack --features nrf52840,_cs-cortex
 cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
 cargo check --example ptx_noack_usb --features nrf52840,_cs-cortex
 cargo check --example prx_noack_usb --features nrf52840,_cs-cortex
