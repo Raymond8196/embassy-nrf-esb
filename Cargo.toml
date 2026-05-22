@@ -88,6 +88,22 @@ name = "prx_multipipe_usb"
 required-features = ["nrf52840", "_cs-cortex"]
 
 [[example]]
+name = "ptx_noack_usb"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "prx_noack_usb"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "ptx_suspend_usb"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "prx_idle_usb"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
 name = "ptx_suspend"
 required-features = ["nrf52840", "defmt", "_cs-cortex"]
 
