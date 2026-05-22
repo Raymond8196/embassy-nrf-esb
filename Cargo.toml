@@ -80,6 +80,14 @@ name = "ptx_multipipe"
 required-features = ["nrf52840", "defmt", "_cs-cortex"]
 
 [[example]]
+name = "ptx_multipipe_ack"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "prx_multipipe_usb"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
 name = "ptx_suspend"
 required-features = ["nrf52840", "defmt", "_cs-cortex"]
 

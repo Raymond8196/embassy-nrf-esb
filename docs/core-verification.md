@@ -37,6 +37,8 @@ cargo check --example ptx_silent --features nrf52840,_cs-cortex
 cargo check --example usb_minimal --features nrf52840,_cs-cortex
 cargo check --example ptx_ack_echo --features nrf52840,_cs-cortex
 cargo check --example ptx_multipipe --features nrf52840,defmt,_cs-cortex
+cargo check --example prx_multipipe_usb --features nrf52840,_cs-cortex
+cargo check --example ptx_multipipe_ack --features nrf52840,_cs-cortex
 cargo check --example ptx_suspend --features nrf52840,defmt,_cs-cortex
 ```
 
@@ -78,8 +80,8 @@ commit, feature flags, RF channel, payload length, and power source for each run
 | ID | Test | Firmware pair | Duration | Pass criteria | Result |
 |----|------|---------------|----------|---------------|--------|
 | C1 | PTX/PRX basic | `ptx_basic` + `prx_basic` | 30 min | No panic; TX/RX counters progress; no stuck radio. | Pending |
-| C2 | ACK payload echo | `ptx_ack_echo` + ACK-capable PRX | 30 min | ACK payload count progresses monotonically; no counter inversion. | 12 s smoke passed; 30 min pending |
-| C3 | Multi-pipe | `ptx_multipipe` + multi-pipe PRX | 30 min | pipe0/pipe1/pipe2 all ACK; no cross-pipe ACK payloads. | Pending |
+| C2 | ACK payload echo | `ptx_ack_echo` + ACK-capable PRX | 30 min | ACK payload count progresses monotonically; no counter inversion. | Passed on 2026-05-22 |
+| C3 | Multi-pipe | `ptx_multipipe_ack` + `prx_multipipe_usb` | 30 min | pipe0/pipe1 both ACK; PRX counts stay balanced; `bad_pipe=0`, `malformed=0`, `invalid_ack=0`. | Passed on 2026-05-22 |
 | C4 | Suspend/resume | `ptx_suspend` + PRX | 10k cycles or 30 min | No deadlock; traffic resumes after restore; no false duplicate burst. | Pending |
 | C5 | NoAck | NoAck PTX + PRX | 30 min | PRX receives NoAck packets; no ACK TX shortcut regression. | Pending |
 | C6 | Long idle recovery | PRX idle/listen transitions | 30 min | Repeated `start_listening()`/`stop()` does not wedge RADIO. | Pending |
@@ -141,6 +143,83 @@ Result:
   captures totaling roughly 72 seconds.
 - PTX USB CDC reached `tx=7600 ack_rx=7599`; ACK payload data monotonically
   followed the counter.
+- No panic, USB reset loop, or stalled counter was observed during the capture.
+
+### 2026-05-22 Exclusive ESB ACK Echo 30 Minute Run
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware commit: `2505794`.
+- Firmware pair: `prx_usb` on PRX, `ptx_ack_echo` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_ack_echo --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PTX USB CDC capture ran under `timeout 1800s` and exited by timeout after a
+  clean 30 minute run.
+- Final PTX excerpt reached `tx=181200 ack_rx=181198`; ACK payload data
+  continued to follow the transmit counter monotonically through the full
+  capture.
+- A post-run PRX USB CDC sample reported `rx=2000 lost=0 loss=0.0%`.
+- No panic, USB reset loop, or stalled counter was observed during the capture.
+
+### 2026-05-22 Exclusive ESB Multi-Pipe Smoke
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware base commit: `2505794` plus local `ptx_multipipe_ack` and
+  `prx_multipipe_usb` diagnostics.
+- Firmware pair: `prx_multipipe_usb` on PRX, `ptx_multipipe_ack` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_multipipe_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_multipipe_ack --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX USB CDC reached `n=6200 p0=3100 p1=3100 bp=0 mf=0`; both pipes stayed
+  balanced and no wrong-pipe or malformed packets were reported.
+- PTX USB CDC reached `q0=3101 a0=3099 q1=3100 a1=3099 f=0 m=0 i=0`;
+  both ACK payload counters progressed, with no TX pool saturation, max-attempt
+  drops, or invalid ACK payloads.
+- This is a 60 second smoke, not the 30 minute C3 acceptance run.
+
+### 2026-05-22 Exclusive ESB Multi-Pipe 30 Minute Run
+
+Environment:
+
+- Hardware: two E104-BT5040U nRF52840 dongles.
+- Memory layout: `memory-dongle.x`.
+- Firmware base commit: `2505794` plus local `ptx_multipipe_ack` and
+  `prx_multipipe_usb` diagnostics.
+- Firmware pair: `prx_multipipe_usb` on PRX, `ptx_multipipe_ack` on PTX.
+- Build target/features:
+  - `cargo build --release --target thumbv7em-none-eabihf --example prx_multipipe_usb --features nrf52840,_cs-cortex`
+  - `cargo build --release --target thumbv7em-none-eabihf --example ptx_multipipe_ack --features nrf52840,_cs-cortex`
+- Flash path: unsigned serial DFU zips generated from Intel HEX and flashed
+  over `/dev/ttyACM0` and `/dev/ttyACM1`.
+
+Result:
+
+- PRX USB CDC capture ran under `timeout 1800s` and exited by timeout after a
+  clean 30 minute run.
+- Final PRX excerpt reached `n=180200 p0=90100 p1=90100 bp=0 mf=0`; both pipes
+  stayed balanced and no wrong-pipe or malformed packets were reported.
+- PTX USB CDC capture ran under `timeout 1800s` and exited by timeout after a
+  clean 30 minute run.
+- Final PTX excerpt reached `q0=90101 a0=90035 q1=90100 a1=90014 f=0 m=0 i=0`;
+  both ACK payload counters progressed, with no TX pool saturation, max-attempt
+  drops, or invalid ACK payloads. ACK payload counters lagged queued TX counts
+  by 66 packets on pipe 0 and 86 packets on pipe 1 at the final sample.
 - No panic, USB reset loop, or stalled counter was observed during the capture.
 
 ## Acceptance For 9/10 Core
