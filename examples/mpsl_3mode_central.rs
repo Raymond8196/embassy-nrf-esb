@@ -36,8 +36,8 @@ use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::usb::Driver as UsbDriver;
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, rng, usb};
-use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
@@ -48,7 +48,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{PrxSlotResult, run_prx_slots};
+use embassy_nrf_esb::mpsl_timeslot::{PrxSlotResult, open_prx_session};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -408,10 +408,11 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
 
 // ---- Main ----
 
-const BATCH_SIZE: u32 = 20;
+const BATCH_SIZE: u32 = 8;
 const SLOT_US: u32 = 14000;
 const MATCH_US: u32 = 13500;
 const PIPES: u8 = 0x03;
+const ESB_IDLE_MS: u64 = 20;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -426,8 +427,7 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: false,
     };
 
-    let mpsl_p =
-        Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
+    let mpsl_p = Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
 
     static SESSION_MEM: StaticCell<SessionMem<1>> = StaticCell::new();
     let session_mem = SESSION_MEM.init(SessionMem::new());
@@ -513,18 +513,31 @@ async fn main(spawner: Spawner) {
     let mut total_blk: u32 = 0;
 
     let mut err_count: u32 = 0;
+    let mut prx_session = match open_prx_session(
+        mpsl, &esb_cfg, &esb_addr, SLOT_US, MATCH_US, BATCH_SIZE, PIPES,
+    ) {
+        Ok(session) => session,
+        Err(e) => {
+            defmt::error!("open_prx_session failed: {:?}", e);
+            let mut buf = [0u8; LOG_BUF_SIZE];
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "[ERR] open_prx_session {:?}\r\n", e);
+            let err_len = w.pos;
+            log(&buf[..err_len]);
+            core::future::pending().await
+        }
+    };
 
     loop {
         batch += 1;
 
-        let result = run_prx_slots(mpsl, &esb_cfg, &esb_addr, SLOT_US, MATCH_US, BATCH_SIZE, PIPES)
-            .await;
+        let result = prx_session.next_report().await;
 
         let r = match result {
             Ok(r) => r,
             Err(e) => {
                 err_count += 1;
-                defmt::warn!("run_prx_slots error {:?} (count={})", e, err_count);
+                defmt::warn!("prx_session error {:?} (count={})", e, err_count);
                 let mut buf = [0u8; LOG_BUF_SIZE];
                 let mut w = WriteBuf::new(&mut buf);
                 let _ = write!(w, "[ERR] {:?} cnt={}\r\n", e, err_count);
@@ -556,6 +569,6 @@ async fn main(spawner: Spawner) {
             log(&buf[..cum_len]);
         }
 
-        embassy_time::Timer::after_millis(2).await;
+        embassy_time::Timer::after_millis(ESB_IDLE_MS).await;
     }
 }

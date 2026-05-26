@@ -40,12 +40,44 @@ use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 use crate::error::Error;
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
+const RADIO_DISABLE_SPIN_LIMIT: u32 = 100_000;
 
 fn mpsl_ok(ret: i32) -> Result<(), Error> {
     RetVal::from(ret)
         .to_result()
         .map(|_| ())
         .map_err(|_| Error::Mpsl)
+}
+
+fn quiesce_radio_before_timeslot_end() {
+    let r = pac::RADIO;
+    r.shorts().modify(|w| {
+        w.set_ready_start(false);
+        w.set_end_disable(false);
+        w.set_disabled_rxen(false);
+        w.set_disabled_txen(false);
+    });
+    r.intenclr().write(|w| w.set_disabled(true));
+    r.events_disabled().write_value(0);
+    r.tasks_disable().write_value(1);
+
+    let mut spins = 0;
+    while r.events_disabled().read() == 0 && spins < RADIO_DISABLE_SPIN_LIMIT {
+        spins += 1;
+    }
+
+    r.events_address().write_value(0);
+    r.events_payload().write_value(0);
+    r.events_end().write_value(0);
+    r.events_ready().write_value(0);
+    r.events_disabled().write_value(0);
+
+    // Reset residual RADIO state programmed by the ESB slot before MPSL
+    // hands the peripheral back to SDC.
+    r.power().write(|w| w.set_power(false));
+    r.power().write(|w| w.set_power(true));
+    cortex_m::peripheral::NVIC::unpend(pac::Interrupt::RADIO);
+    compiler_fence(Ordering::Acquire);
 }
 
 struct Timer0RawMutex;
@@ -83,6 +115,24 @@ pub struct SignalCounters {
 }
 
 impl SignalCounters {
+    fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            start: self.start.saturating_sub(previous.start),
+            timer0: self.timer0.saturating_sub(previous.timer0),
+            radio: self.radio.saturating_sub(previous.radio),
+            blocked: self.blocked.saturating_sub(previous.blocked),
+            cancelled: self.cancelled.saturating_sub(previous.cancelled),
+            session_idle: self.session_idle.saturating_sub(previous.session_idle),
+            session_closed: self.session_closed.saturating_sub(previous.session_closed),
+            overstayed: self.overstayed.saturating_sub(previous.overstayed),
+            invalid_return: self.invalid_return.saturating_sub(previous.invalid_return),
+            extend_failed: self.extend_failed.saturating_sub(previous.extend_failed),
+            extend_succeeded: self
+                .extend_succeeded
+                .saturating_sub(previous.extend_succeeded),
+        }
+    }
+
     const ZERO: Self = Self {
         start: 0,
         timer0: 0,
@@ -966,6 +1016,9 @@ struct PrxInnerState {
     slot_active: bool,
     ack_counter: [u32; NUM_PIPES],
     rx_per_pipe: [u32; NUM_PIPES],
+    report_every: u32,
+    last_report_start: u32,
+    report_ready: bool,
 }
 
 unsafe impl Send for PrxInnerState {}
@@ -1038,6 +1091,9 @@ impl PrxState {
                 slot_active: false,
                 ack_counter: [0; NUM_PIPES],
                 rx_per_pipe: [0; NUM_PIPES],
+                report_every: 0,
+                last_report_start: 0,
+                report_ready: false,
             })),
         }
     }
@@ -1239,14 +1295,19 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.events_compare(0).write_value(0);
             t.intenclr().write(|w| w.set_compare(0, true));
 
-            // Stop RADIO cleanly.
-            let mut radio = EsbRadio::new(pac::RADIO);
-            radio.stop();
-
+            quiesce_radio_before_timeslot_end();
             state.phase = PrxPhase::Idle;
 
-            let chain = state.target_count > 0 && state.counters.start < state.target_count;
-            if chain {
+            let long_session = state.report_every > 0;
+            let batch_complete = long_session
+                && state.counters.start.saturating_sub(state.last_report_start)
+                    >= state.report_every;
+
+            if batch_complete {
+                state.last_report_start = state.counters.start;
+                state.report_ready = true;
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+            } else if long_session || state.counters.start < state.target_count {
                 state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                 state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else {
@@ -1358,6 +1419,9 @@ pub async fn run_prx_slots(
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];
         state.rx_per_pipe = [0; NUM_PIPES];
+        state.report_every = 0;
+        state.last_report_start = 0;
+        state.report_ready = false;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
@@ -1394,4 +1458,160 @@ pub async fn run_prx_slots(
         bad_crc_count: state.bad_crc_count,
         rx_per_pipe: state.rx_per_pipe,
     }))
+}
+
+/// Long-lived PRX timeslot session.
+///
+/// This keeps the MPSL session open and chains timeslots continuously. It is
+/// intended for BLE coexistence tests where repeated session open/close can
+/// contend with the SoftDevice Controller scheduler.
+pub struct PrxSlotSession {
+    _busy: BusyGuard,
+    session_id: u8,
+    needs_request: bool,
+    last_counters: SignalCounters,
+    last_rx_count: u32,
+    last_dup_count: u32,
+    last_bad_crc_count: u32,
+    last_rx_per_pipe: [u32; NUM_PIPES],
+}
+
+impl PrxSlotSession {
+    pub async fn next_report(&mut self) -> Result<PrxSlotResult, Error> {
+        if self.needs_request {
+            PRX_STATE.with_inner(|state| {
+                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+                state.request.params.earliest.timeout_us = 1_000_000;
+            });
+            let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+            let ret = unsafe { raw::mpsl_timeslot_request(self.session_id, request) };
+            mpsl_ok(ret)?;
+            self.needs_request = false;
+        }
+
+        poll_fn(|cx| {
+            PRX_STATE.with_inner(|state| {
+                state.waker.register(cx.waker());
+                if state.done {
+                    Poll::Ready(())
+                } else if state.report_ready
+                    && state.counters.session_idle > self.last_counters.session_idle
+                {
+                    state.report_ready = false;
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await;
+
+        let result = PRX_STATE.with_inner(|state| {
+            if state.done {
+                return Err(Error::Mpsl);
+            }
+
+            let counters = state.counters.saturating_sub(self.last_counters);
+            let mut rx_per_pipe = [0; NUM_PIPES];
+            for (idx, rx) in rx_per_pipe.iter_mut().enumerate() {
+                *rx = state.rx_per_pipe[idx].saturating_sub(self.last_rx_per_pipe[idx]);
+            }
+
+            let result = PrxSlotResult {
+                counters,
+                rx_count: state.rx_count.saturating_sub(self.last_rx_count),
+                dup_count: state.dup_count.saturating_sub(self.last_dup_count),
+                bad_crc_count: state.bad_crc_count.saturating_sub(self.last_bad_crc_count),
+                rx_per_pipe,
+            };
+
+            self.last_counters = state.counters;
+            self.last_rx_count = state.rx_count;
+            self.last_dup_count = state.dup_count;
+            self.last_bad_crc_count = state.bad_crc_count;
+            self.last_rx_per_pipe = state.rx_per_pipe;
+
+            Ok(result)
+        })?;
+
+        self.needs_request = true;
+        Ok(result)
+    }
+}
+
+impl Drop for PrxSlotSession {
+    fn drop(&mut self) {
+        let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
+    }
+}
+
+pub fn open_prx_session(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_length_us: u32,
+    in_slot_match_us: u32,
+    report_every: u32,
+    enabled_pipes: u8,
+) -> Result<PrxSlotSession, Error> {
+    let busy = PRX_STATE.try_enter()?;
+    if config.payload_length < 4 || report_every == 0 {
+        return Err(Error::InvalidParam);
+    }
+
+    let mut session_id: u8 = 0;
+    let ret = unsafe {
+        raw::mpsl_timeslot_session_open(Some(prx_timeslot_callback), (&mut session_id) as *mut _)
+    };
+    if let Err(e) = mpsl_ok(ret) {
+        drop(busy);
+        return Err(e);
+    }
+
+    PRX_STATE.with_inner(|state| {
+        state.counters = SignalCounters::ZERO;
+        state.done = false;
+        state.target_count = 0;
+        state.in_slot_match_us = in_slot_match_us;
+        state.config = Some(config.clone());
+        state.addresses = Some(addresses.clone());
+        state.phase = PrxPhase::Idle;
+        state.rx_count = 0;
+        state.dup_count = 0;
+        state.bad_crc_count = 0;
+        state.last_pid = [0; NUM_PIPES];
+        state.last_crc = [0; NUM_PIPES];
+        state.last_valid = [false; NUM_PIPES];
+        state.enabled_pipes = enabled_pipes;
+        state.slot_active = false;
+        state.ack_counter = [0; NUM_PIPES];
+        state.rx_per_pipe = [0; NUM_PIPES];
+        state.report_every = report_every;
+        state.last_report_start = 0;
+        state.report_ready = false;
+        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+        state.request.params.earliest.length_us = slot_length_us;
+        state.request.params.earliest.timeout_us = 1_000_000;
+    });
+
+    let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+    let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+    if let Err(e) = mpsl_ok(ret) {
+        let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
+        drop(busy);
+        return Err(e);
+    }
+
+    Ok(PrxSlotSession {
+        _busy: busy,
+        session_id,
+        needs_request: false,
+        last_counters: SignalCounters::ZERO,
+        last_rx_count: 0,
+        last_dup_count: 0,
+        last_bad_crc_count: 0,
+        last_rx_per_pipe: [0; NUM_PIPES],
+    })
 }
