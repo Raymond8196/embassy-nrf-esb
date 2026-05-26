@@ -49,7 +49,12 @@ cortex-m-rt = "0.7"
 defmt-rtt = "1"
 nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", features = ["nrf52840", "peripheral", "defmt"], default-features = false }
 panic-probe = { version = "1", features = ["print-defmt"] }
+panic-halt = "1"
 static_cell = "2"
+postcard = { version = "1", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+heapless = { version = "0.8", default-features = false }
+usbd-hid = "0.8"
 
 [[example]]
 name = "ptx_basic"
@@ -134,3 +139,19 @@ required-features = ["nrf52840", "defmt", "mpsl"]
 [[example]]
 name = "mpsl_ble_connectable"
 required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_3mode_central"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "mpsl_ptx_continuous"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
+name = "ptx_split_peripheral"
+required-features = ["nrf52840", "_cs-cortex"]
+
+[[example]]
+name = "prx_split_central"
+required-features = ["nrf52840", "_cs-cortex"]
