@@ -943,14 +943,29 @@ unsafe extern "C" fn ptx_timeslot_callback(
             core::ptr::null_mut()
         }),
 
-        raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PTX_STATE.with_inner(|state| {
-            state.counters.overstayed += 1;
-            state.phase = PtxPhase::Done;
-            state.done = true;
-            state.waker.wake();
-            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
-            &mut state.return_param as *mut _
-        }),
+        raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => {
+            let ptr = PTX_STATE.with_inner(|state| {
+                state.counters.overstayed += 1;
+                state.phase = PtxPhase::Idle;
+                if state.poll_pipes > 0 {
+                    state.request.params.earliest.priority =
+                        raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
+                    state.request.params.earliest.timeout_us =
+                        raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                    state.return_param.params.request.p_next =
+                        core::ptr::from_mut(&mut state.request);
+                } else {
+                    state.done = true;
+                    state.waker.wake();
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                }
+                &mut state.return_param as *mut _
+            });
+            ptr
+        }
 
         _ => PTX_STATE.with_inner(|state| {
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;

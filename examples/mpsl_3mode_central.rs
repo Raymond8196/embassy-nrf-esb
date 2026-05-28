@@ -408,11 +408,11 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
 
 // ---- Main ----
 
-const BATCH_SIZE: u32 = 8;
-const SLOT_US: u32 = 14000;
-const MATCH_US: u32 = 13500;
+const BATCH_SIZE: u32 = 4;
+const SLOT_US: u32 = 3000;
+const MATCH_US: u32 = 2800;
 const PIPES: u8 = 0x03;
-const ESB_IDLE_MS: u64 = 20;
+const ESB_IDLE_MS: u64 = 0;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
