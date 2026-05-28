@@ -149,6 +149,10 @@ name = "mpsl_ptx_continuous"
 required-features = ["nrf52840", "defmt", "mpsl"]
 
 [[example]]
+name = "mpsl_3mode_poll"
+required-features = ["nrf52840", "defmt", "mpsl"]
+
+[[example]]
 name = "ptx_split_peripheral"
 required-features = ["nrf52840", "_cs-cortex"]
 

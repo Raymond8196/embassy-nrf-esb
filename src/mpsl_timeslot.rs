@@ -540,6 +540,13 @@ struct PtxInnerState {
     ack_payload_count: u32,
     ack_inversions: u32,
     last_ack_counter: u32,
+    poll_pipes: u8,
+    poll_pipe_mask: u8,
+    poll_report_every: u32,
+    poll_slots_since_report: u32,
+    poll_report_ready: bool,
+    ack_ok_per_pipe: [u32; NUM_PIPES],
+    tx_per_pipe: [u32; NUM_PIPES],
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -622,6 +629,13 @@ impl PtxState {
                 ack_payload_count: 0,
                 ack_inversions: 0,
                 last_ack_counter: 0,
+                poll_pipes: 0,
+                poll_pipe_mask: 0,
+                poll_report_every: 0,
+                poll_slots_since_report: 0,
+                poll_report_ready: false,
+                ack_ok_per_pipe: [0; NUM_PIPES],
+                tx_per_pipe: [0; NUM_PIPES],
             })),
         }
     }
@@ -656,6 +670,19 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 return &mut state.return_param as *mut _;
             };
 
+            // In poll mode, advance to next pipe in mask.
+            if state.poll_pipes > 0 {
+                let mask = state.poll_pipe_mask;
+                let mut next = state.tx_pipe;
+                for _ in 0..NUM_PIPES {
+                    next = (next + 1) % NUM_PIPES as u8;
+                    if mask & (1 << next) != 0 {
+                        break;
+                    }
+                }
+                state.tx_pipe = next;
+            }
+
             // Power cycle RADIO.
             let r = pac::RADIO;
             r.power().write(|w| w.set_power(false));
@@ -683,6 +710,12 @@ unsafe extern "C" fn ptx_timeslot_callback(
             radio.transmit(state.tx_pipe, dma_ptr, true);
             state.tx_count += 1;
             state.packets_sent_this_slot = 1;
+            if state.poll_pipes > 0 {
+                let pipe = state.tx_pipe as usize;
+                if pipe < NUM_PIPES {
+                    state.tx_per_pipe[pipe] += 1;
+                }
+            }
 
             // Ensure RADIO NVIC is unmasked so MPSL delivers SIGNAL_RADIO.
             unsafe {
@@ -726,6 +759,12 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
                     if crc_ok {
                         state.ack_ok_count += 1;
+                        if state.poll_pipes > 0 {
+                            let pipe = state.tx_pipe as usize;
+                            if pipe < NUM_PIPES {
+                                state.ack_ok_per_pipe[pipe] += 1;
+                            }
+                        }
 
                         let rx_buf = unsafe { &*PTX_BUFS.rx.get() };
                         let length = rx_buf[EsbHeader::DMA_OFFSET] as usize;
@@ -822,7 +861,39 @@ unsafe extern "C" fn ptx_timeslot_callback(
             }
 
             let chain = state.target_count > 0 && state.counters.start < state.target_count;
-            if chain {
+            let poll_active = state.poll_pipes > 0;
+
+            if poll_active {
+                if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
+                    let r = pac::RADIO;
+                    r.shorts().modify(|w| {
+                        w.set_ready_start(false);
+                        w.set_end_disable(false);
+                        w.set_disabled_rxen(false);
+                        w.set_disabled_txen(false);
+                    });
+                    r.intenclr().write(|w| w.set_disabled(true));
+                    r.events_disabled().write_value(0);
+                    r.tasks_disable().write_value(1);
+                    let mut spins = 0u32;
+                    while r.events_disabled().read() == 0 && spins < 1000 {
+                        spins += 1;
+                    }
+                    r.events_disabled().write_value(0);
+                    compiler_fence(Ordering::Acquire);
+                    state.phase = PtxPhase::Idle;
+                }
+
+                state.poll_slots_since_report += 1;
+                if state.poll_slots_since_report >= state.poll_report_every {
+                    state.poll_slots_since_report = 0;
+                    state.poll_report_ready = true;
+                    state.waker.wake();
+                }
+
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+            } else if chain {
                 state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                 state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else {
@@ -835,6 +906,9 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
         raw::MPSL_TIMESLOT_SIGNAL_SESSION_IDLE => PTX_STATE.with_inner(|state| {
             state.counters.session_idle += 1;
+            if state.poll_pipes > 0 {
+                state.poll_report_ready = true;
+            }
             state.waker.wake();
             core::ptr::null_mut()
         }),
@@ -1613,5 +1687,176 @@ pub fn open_prx_session(
         last_dup_count: 0,
         last_bad_crc_count: 0,
         last_rx_per_pipe: [0; NUM_PIPES],
+    })
+}
+
+/// Per-round result for the PTX poll session.
+pub struct PtxPollResult {
+    /// Signal counters for this reporting period.
+    pub counters: SignalCounters,
+    /// Total TX packets in this period.
+    pub tx_count: u32,
+    /// Total ACK OK in this period.
+    pub ack_ok_count: u32,
+    /// Per-pipe TX count.
+    pub tx_per_pipe: [u32; NUM_PIPES],
+    /// Per-pipe ACK OK count.
+    pub ack_per_pipe: [u32; NUM_PIPES],
+}
+
+/// Long-lived PTX poll session that round-robins across pipes.
+///
+/// Each timeslot polls exactly one pipe (1 TX + wait ACK). The pipe
+/// auto-advances through `pipe_mask` in round-robin order. After
+/// `report_every` slots, `next_report()` returns incremental stats.
+pub struct PtxPollSession {
+    _busy: BusyGuard,
+    session_id: u8,
+    last_counters: SignalCounters,
+    last_tx_count: u32,
+    last_ack_ok_count: u32,
+    last_tx_per_pipe: [u32; NUM_PIPES],
+    last_ack_per_pipe: [u32; NUM_PIPES],
+}
+
+impl PtxPollSession {
+    pub async fn next_report(&mut self) -> Result<PtxPollResult, Error> {
+        poll_fn(|cx| {
+            PTX_STATE.with_inner(|state| {
+                state.waker.register(cx.waker());
+                if state.done {
+                    Poll::Ready(())
+                } else if state.poll_report_ready {
+                    state.poll_report_ready = false;
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await;
+
+        let result = PTX_STATE.with_inner(|state| {
+            if state.done {
+                return Err(Error::Mpsl);
+            }
+
+            let counters = state.counters.saturating_sub(self.last_counters);
+            let mut tx_per_pipe = [0u32; NUM_PIPES];
+            let mut ack_per_pipe = [0u32; NUM_PIPES];
+            for i in 0..NUM_PIPES {
+                tx_per_pipe[i] = state.tx_per_pipe[i].saturating_sub(self.last_tx_per_pipe[i]);
+                ack_per_pipe[i] = state.ack_ok_per_pipe[i].saturating_sub(self.last_ack_per_pipe[i]);
+            }
+
+            let result = PtxPollResult {
+                counters,
+                tx_count: state.tx_count.saturating_sub(self.last_tx_count),
+                ack_ok_count: state
+                    .ack_ok_count
+                    .saturating_sub(self.last_ack_ok_count),
+                tx_per_pipe,
+                ack_per_pipe,
+            };
+
+            self.last_counters = state.counters;
+            self.last_tx_count = state.tx_count;
+            self.last_ack_ok_count = state.ack_ok_count;
+            self.last_tx_per_pipe = state.tx_per_pipe;
+            self.last_ack_per_pipe = state.ack_ok_per_pipe;
+
+            Ok(result)
+        })?;
+
+        Ok(result)
+    }
+}
+
+impl Drop for PtxPollSession {
+    fn drop(&mut self) {
+        let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
+    }
+}
+
+/// Open a long-lived PTX poll session that round-robins across the given pipes.
+///
+/// - `slot_length_us`: timeslot duration per poll (e.g. 1500 for ~1ms poll).
+/// - `in_slot_match_us`: TIMER0 compare value within slot (should be < slot_length_us).
+/// - `pipe_mask`: bitmask of pipes to poll (e.g. `0b0111_1110` for pipes 1-7).
+/// - `report_every`: number of slots per report (e.g. 7 for one full round).
+pub fn open_ptx_poll_session(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_length_us: u32,
+    in_slot_match_us: u32,
+    pipe_mask: u8,
+    report_every: u32,
+) -> Result<PtxPollSession, Error> {
+    let busy = PTX_STATE.try_enter()?;
+    if config.payload_length < 4 || pipe_mask == 0 || report_every == 0 {
+        drop(busy);
+        return Err(Error::InvalidParam);
+    }
+
+    let mut session_id: u8 = 0;
+    let ret = unsafe {
+        raw::mpsl_timeslot_session_open(Some(ptx_timeslot_callback), (&mut session_id) as *mut _)
+    };
+    if let Err(e) = mpsl_ok(ret) {
+        drop(busy);
+        return Err(e);
+    }
+
+    let first_pipe = pipe_mask.trailing_zeros() as u8;
+
+    PTX_STATE.with_inner(|state| {
+        state.counters = SignalCounters::ZERO;
+        state.done = false;
+        state.target_count = 0;
+        state.in_slot_match_us = in_slot_match_us;
+        state.config = Some(config.clone());
+        state.addresses = Some(addresses.clone());
+        state.phase = PtxPhase::Idle;
+        state.tx_count = 0;
+        state.ack_ok_count = 0;
+        state.tx_pipe = first_pipe;
+        state.payload_byte = 0;
+        state.packets_per_slot = 1;
+        state.packets_sent_this_slot = 0;
+        state.ack_payload_count = 0;
+        state.ack_inversions = 0;
+        state.last_ack_counter = 0;
+        state.pid = 0;
+        state.poll_pipes = pipe_mask.count_ones() as u8;
+        state.poll_pipe_mask = pipe_mask;
+        state.poll_report_every = report_every;
+        state.poll_slots_since_report = 0;
+        state.poll_report_ready = false;
+        state.ack_ok_per_pipe = [0; NUM_PIPES];
+        state.tx_per_pipe = [0; NUM_PIPES];
+        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+        state.request.params.earliest.length_us = slot_length_us;
+        state.request.params.earliest.timeout_us = 1_000_000;
+    });
+
+    let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+    let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+    if let Err(e) = mpsl_ok(ret) {
+        let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
+        drop(busy);
+        return Err(e);
+    }
+
+    Ok(PtxPollSession {
+        _busy: busy,
+        session_id,
+        last_counters: SignalCounters::ZERO,
+        last_tx_count: 0,
+        last_ack_ok_count: 0,
+        last_tx_per_pipe: [0; NUM_PIPES],
+        last_ack_per_pipe: [0; NUM_PIPES],
     })
 }
