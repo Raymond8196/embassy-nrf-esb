@@ -147,6 +147,11 @@ Progress:
   links against `embassy_sync::Channel` critical-section symbols on the default
   host gate, so it remains intentionally unlanded until the crate has an
   explicit host critical-section provider or a PAC-free test seam.
+- 2026-06-01: Added an x86_64 dev-only `critical-section/std` provider, which
+  unblocks host tests that exercise `embassy_sync::Channel`. Host coverage now
+  includes the full `rx_complete()` queue/release lifecycle, pipe-filtered TX
+  dequeue skipping allocated or wrong-pipe slots, transport trailing-byte
+  decode behavior, and unbound/out-of-range route rejection.
 
 ## Phase 5: Hardware Regression Procedure
 
@@ -176,6 +181,10 @@ Progress:
   `prx_usb` + `ptx_ack_echo`. PRX reported `rx=1200 lost=0 loss=0.0%`; PTX
   reported `tx=1200 ack_rx=1199` during a 12 second USB CDC capture. This is a
   short smoke, not the 30 minute C2 acceptance run.
+- 2026-06-01: Added `make check-no-hw` and split targets for host tests,
+  exclusive examples, MPSL examples, feature-conflict checking, and targeted
+  formatting/whitespace checks. This gives protocol and API changes a single
+  no-dongle pre-hardware gate.
 
 ## Phase 6: RMK Interface Recheck
 

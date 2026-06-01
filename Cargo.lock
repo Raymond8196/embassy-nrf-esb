@@ -470,6 +470,7 @@ dependencies = [
  "bt-hci",
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "defmt 0.3.100",
  "defmt-rtt",
  "embassy-executor",

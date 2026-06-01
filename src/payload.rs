@@ -452,6 +452,45 @@ mod tests {
     }
 
     #[test]
+    fn pipe_filtered_dequeue_skips_allocated_or_wrong_pipe_slots() {
+        let pool = PacketPool::<3, 16>::new();
+
+        let allocated = pool.alloc_tx().expect("allocated slot");
+        let wrong_pipe = pool.alloc_tx().expect("wrong pipe slot");
+        let target_pipe = pool.alloc_tx().expect("target pipe slot");
+
+        unsafe {
+            pool.header_mut(allocated).pipe = 1;
+            pool.header_mut(wrong_pipe).pipe = 2;
+            pool.header_mut(target_pipe).pipe = 1;
+        }
+
+        assert_ready(pool.enqueue_tx(wrong_pipe));
+        assert_ready(pool.enqueue_tx(target_pipe));
+
+        let claimed = pool
+            .try_dequeue_tx_for_pipe(1)
+            .expect("target pipe queued slot");
+        assert_eq!(claimed, target_pipe);
+        assert_eq!(
+            pool.state[allocated].load(core::sync::atomic::Ordering::Acquire),
+            state::TX_ALLOCATED
+        );
+        assert_eq!(
+            pool.state[wrong_pipe].load(core::sync::atomic::Ordering::Acquire),
+            state::TX_QUEUED
+        );
+
+        pool.cancel_tx(allocated);
+        pool.release_tx(target_pipe);
+        let claimed_wrong_pipe = pool
+            .try_dequeue_tx_for_pipe(2)
+            .expect("wrong pipe slot remains queued");
+        assert_eq!(claimed_wrong_pipe, wrong_pipe);
+        pool.release_tx(wrong_pipe);
+    }
+
+    #[test]
     fn cancel_tx_releases_allocated_or_queued_slots() {
         let pool = PacketPool::<1, 16>::new();
 
@@ -494,5 +533,39 @@ mod tests {
             assert_eq!(pool.header(0).length, 3);
             assert_eq!(&pool.buf(0)[4..7], &[0xA0, 0xB1, 0xC2]);
         }
+    }
+
+    #[test]
+    fn rx_complete_queues_packet_until_app_releases_it() {
+        let pool = PacketPool::<1, 16>::new();
+
+        assert!(pool.rx_to_dma(0));
+        unsafe {
+            pool.header_mut(0).pipe = 3;
+            pool.header_mut(0).length = 2;
+            pool.buf_mut(0)[4..6].copy_from_slice(&[0x11, 0x22]);
+        }
+
+        pool.rx_complete(0);
+        assert_eq!(
+            pool.state[0].load(core::sync::atomic::Ordering::Acquire),
+            state::RX_QUEUED
+        );
+        assert_eq!(pool.try_receive_rx(), Some(0));
+        assert_eq!(pool.try_receive_rx(), None);
+        assert!(!pool.rx_to_dma(0));
+
+        unsafe {
+            assert_eq!(pool.header(0).pipe, 3);
+            assert_eq!(pool.header(0).length, 2);
+            assert_eq!(&pool.buf(0)[4..6], &[0x11, 0x22]);
+        }
+
+        pool.release_rx(0);
+        assert_eq!(
+            pool.state[0].load(core::sync::atomic::Ordering::Acquire),
+            state::FREE
+        );
+        assert!(pool.rx_to_dma(0));
     }
 }

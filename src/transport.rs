@@ -364,6 +364,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_frame_ignores_trailing_bytes_after_declared_payload() {
+        let frame = [TRANSPORT_VERSION, 1, 2, 0, 1, 0xAA, 0xBB, 0xCC];
+
+        let (header, payload) = decode_frame(&frame).unwrap();
+        assert_eq!(header.device_id, 1);
+        assert_eq!(header.sequence, 2);
+        assert_eq!(header.payload_len, 1);
+        assert_eq!(payload, &[0xAA]);
+    }
+
+    #[test]
     fn encode_frame_requires_output_capacity() {
         let mut frame = [0u8; TRANSPORT_HEADER_LEN];
         assert_eq!(
@@ -462,6 +473,29 @@ mod tests {
         );
         assert_eq!(
             accept_bound_frame(&bindings, &mut tracker, 2, &frame[..len]),
+            Err(Error::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn accept_bound_frame_rejects_unbound_or_out_of_range_routes() {
+        let bindings = StaticBindingTable::<2>::from_pipe_entries([Some(0), None]);
+        let mut tracker = SequenceTracker::<1>::new();
+        let mut frame = [0u8; 16];
+
+        let len = encode_frame(0, 1, 0, &[0x10], &mut frame).unwrap();
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 1, &frame[..len]),
+            Err(Error::InvalidParam)
+        );
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 2, &frame[..len]),
+            Err(Error::InvalidParam)
+        );
+
+        let len = encode_frame(1, 1, 0, &[0x10], &mut frame).unwrap();
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 0, &frame[..len]),
             Err(Error::InvalidParam)
         );
     }

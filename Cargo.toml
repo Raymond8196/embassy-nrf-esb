@@ -38,6 +38,9 @@ mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section-impl"]
 # Mutually exclusive with `mpsl`.
 _cs-cortex = ["cortex-m/critical-section-single-core"]
 
+[target.'cfg(target_arch = "x86_64")'.dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+
 [target.'cfg(target_arch = "arm")'.dev-dependencies]
 bt-hci = { version = "0.8", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
