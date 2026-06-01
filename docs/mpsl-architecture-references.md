@@ -66,6 +66,13 @@ The following ideas have been folded into this repository:
    session every report period and creating a receive gap while task-side code
    prints logs and submits the next request.
 
+6. **PRX duty sweep profiles**
+
+   The `DiagnosticPipe1Prx8ms`, `DiagnosticPipe1Prx12ms`, and
+   `DiagnosticPipe1Prx20ms` profiles keep PTX timing at the baseline while
+   increasing the PRX receive window. They are intended to test whether the
+   stable timeout rate is dominated by packets not landing in PRX timeslots.
+
 ## Recommended Study Order
 
 1. Read `too1/ncs-esb-ble-mpsl-demo` first for the closest BLE/ESB/MPSL

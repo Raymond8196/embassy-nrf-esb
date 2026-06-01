@@ -16,6 +16,12 @@ pub enum CoexistenceProfile {
     DiagnosticPipe1Retry1,
     /// Same narrow pipe-1 diagnostic with a longer PTX slot and ACK window.
     DiagnosticPipe1LongSlot,
+    /// Same narrow pipe-1 diagnostic with an 8 ms PRX receive window.
+    DiagnosticPipe1Prx8ms,
+    /// Same narrow pipe-1 diagnostic with a 12 ms PRX receive window.
+    DiagnosticPipe1Prx12ms,
+    /// Same narrow pipe-1 diagnostic with a 20 ms PRX receive window.
+    DiagnosticPipe1Prx20ms,
     /// Advertising-visible BLE coexistence smoke profile.
     AdvertisingCoexistence,
     /// Active BLE connection profile assuming relaxed connection parameters.
@@ -254,6 +260,66 @@ impl CoexistenceProfileConfig {
                     report_every: 1,
                     ack_timeout_us: 600,
                     max_retries: 1,
+                    request,
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe1Prx8ms => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 8000,
+                    in_slot_match_us: 7600,
+                    report_every: 12,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe1Prx12ms => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 12_000,
+                    in_slot_match_us: 11_500,
+                    report_every: 8,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe1Prx20ms => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 20_000,
+                    in_slot_match_us: 19_000,
+                    report_every: 5,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
                     request,
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,

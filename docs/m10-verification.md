@@ -415,6 +415,9 @@ Current no-hardware diagnostic configuration:
     0 retries.
   - `DiagnosticPipe1Retry1`: PTX 1500 us slot, 400 us ACK timeout, 1 retry.
   - `DiagnosticPipe1LongSlot`: PTX 3000 us slot, 600 us ACK timeout, 1 retry.
+  - `DiagnosticPipe1Prx8ms`: PRX 8000 us slot, PTX baseline.
+  - `DiagnosticPipe1Prx12ms`: PRX 12000 us slot, PTX baseline.
+  - `DiagnosticPipe1Prx20ms`: PRX 20000 us slot, PTX baseline.
 - `mpsl_3mode_poll` profile values: 1500 us slot, 1300 us in-slot match, pipe
   1 only (`pipe_mask = 0x02`), one report per poll.
 - `mpsl_3mode_central` profile values: 5000 us slot, 4500 us in-slot match,
@@ -640,11 +643,47 @@ Next hardware check:
    - central `p1 rx` and `ack_tx` both track poll `p1 ack`: PTX packets are
      mostly arriving only during PRX windows.
 
+Continuous PRX report retest summary:
+
+| Run | Poll ack_rate | Poll to_rate | Poll crc_rate | Central bk/cn/dt |
+| --- | ---: | ---: | ---: | --- |
+| Old `DiagnosticPipe1` | 0.6533 | 0.3418 | 0.0049 | 0/0/0 |
+| Continuous PRX report retest | 0.6573 | 0.3379 | 0.0048 | 0/0/0 |
+
+Interpretation:
+
+- The timeout rate improved only slightly, from `0.3418` to `0.3379`, so the
+  report gap was not the dominant source of misses.
+- The external hardware summary reported poll `p1 tx=63126`, central
+  `p1 rx=43426`, central `p1 ack_tx=43426`, and poll `p1 ack=41491`.
+- Derived rates:
+  - `prx_rx_rate = central.p1_rx / poll.p1_tx = 43426 / 63126 = 0.688`.
+  - `ack_return_rate = poll.p1_ack / central.p1_ack_tx = 41491 / 43426 = 0.955`.
+- This points to PRX receive-window coverage as the main loss source. The ACK
+  return path still has some loss, but it is not the first-order limiter.
+
+Next PRX duty sweep:
+
+1. Keep the poll/PTX side on the baseline PTX values by selecting the same
+   profile name in both 3-mode examples.
+2. Test these profile values in order:
+   - `DiagnosticPipe1Prx8ms`
+   - `DiagnosticPipe1Prx12ms`
+   - `DiagnosticPipe1Prx20ms`
+3. Capture each profile for 2-5 minutes.
+4. Compare:
+   - `prx_rx_rate = central.p1_rx / poll.p1_tx`
+   - `ack_return_rate = poll.p1_ack / central.p1_ack_tx`
+   - poll `to_rate` and `crc_rate`
+   - central `bk/cn/dt` and `rd_max`
+5. A useful improvement should raise `prx_rx_rate` and reduce `to_rate` without
+   introducing blocked/cancelled/disable-timeout accumulation.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
-- Re-run the 3-mode poll diagnostic on hardware after the continuous PRX report
-  change and compare the default profile against the earlier sweep baseline.
+- Re-run the 3-mode poll diagnostic across the PRX duty sweep profiles and
+  compare `prx_rx_rate`, `ack_return_rate`, `to_rate`, `rd_max`, and `bk/cn/dt`.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.
