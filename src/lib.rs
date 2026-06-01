@@ -39,6 +39,10 @@ pub mod error;
 pub mod header;
 #[cfg(any(test, feature = "mpsl"))]
 pub(crate) mod mpsl_common;
+#[cfg(feature = "mpsl")]
+pub mod mpsl_profile;
+#[cfg(feature = "mpsl")]
+pub mod mpsl_radio;
 pub mod payload;
 pub(crate) mod radio;
 pub mod state_machine;

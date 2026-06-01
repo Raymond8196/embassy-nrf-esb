@@ -39,58 +39,23 @@ use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 
 use crate::error::Error;
 use crate::mpsl_common::{
-    NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload, spin_until,
+    NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
     write_counter_packet,
 };
+pub use crate::mpsl_profile::{
+    BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxSlotConfig, PtxPollConfig,
+    TimeslotRequestConfig,
+};
+pub use crate::mpsl_radio::{RadioDisableResult, RadioQuiesceResult, RadioRecoveryPolicy};
+use crate::mpsl_radio::{disable_radio_bounded, quiesce_radio_before_timeslot_end};
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
-const RADIO_DISABLE_SPIN_LIMIT: u32 = 100_000;
 
 fn mpsl_ok(ret: i32) -> Result<(), Error> {
     RetVal::from(ret)
         .to_result()
         .map(|_| ())
         .map_err(|_| Error::Mpsl)
-}
-
-fn quiesce_radio_before_timeslot_end() -> bool {
-    let r = pac::RADIO;
-    let disabled = disable_radio_bounded(true, true);
-
-    r.events_address().write_value(0);
-    r.events_payload().write_value(0);
-    r.events_end().write_value(0);
-    r.events_ready().write_value(0);
-    r.events_disabled().write_value(0);
-
-    // Reset residual RADIO state programmed by the ESB slot before MPSL
-    // hands the peripheral back to SDC.
-    r.power().write(|w| w.set_power(false));
-    r.power().write(|w| w.set_power(true));
-    cortex_m::peripheral::NVIC::unpend(pac::Interrupt::RADIO);
-    compiler_fence(Ordering::Acquire);
-    disabled
-}
-
-fn disable_radio_bounded(clear_rxen: bool, clear_txen: bool) -> bool {
-    let r = pac::RADIO;
-    r.shorts().modify(|w| {
-        w.set_ready_start(false);
-        w.set_end_disable(false);
-        if clear_rxen {
-            w.set_disabled_rxen(false);
-        }
-        if clear_txen {
-            w.set_disabled_txen(false);
-        }
-    });
-    r.intenclr().write(|w| w.set_disabled(true));
-    r.events_disabled().write_value(0);
-    r.tasks_disable().write_value(1);
-    let disabled = spin_until(|| r.events_disabled().read() != 0, RADIO_DISABLE_SPIN_LIMIT);
-    r.events_disabled().write_value(0);
-    compiler_fence(Ordering::Acquire);
-    disabled
 }
 
 struct Timer0RawMutex;
@@ -813,7 +778,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                         state.pid = advance_pid(state.pid);
                         state.payload_byte = state.payload_byte.wrapping_add(1);
                     }
-                    if !disable_radio_bounded(false, false) {
+                    if disable_radio_bounded(false, false).timed_out() {
                         state.counters.radio_disable_timeout += 1;
                     }
 
@@ -837,7 +802,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 state.ack_timeout_count += 1;
 
                 let r = pac::RADIO;
-                if !disable_radio_bounded(true, false) {
+                if disable_radio_bounded(true, false).timed_out() {
                     state.counters.radio_disable_timeout += 1;
                 }
 
@@ -888,7 +853,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 });
 
                 if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
-                    if !disable_radio_bounded(true, true) {
+                    if disable_radio_bounded(true, true).timed_out() {
                         state.counters.radio_disable_timeout += 1;
                     }
                     state.phase = PtxPhase::Done;
@@ -1083,23 +1048,6 @@ pub async fn run_ptx_slots(
 
 // ---- PRX-in-timeslot ----
 
-/// Diagnostic coexistence tuning profiles.
-///
-/// These are starting points for hardware runs, not product guarantees. The
-/// explicit config structs can be edited after choosing a profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum CoexistenceProfile {
-    /// Narrow pipe-1 diagnostic used to classify ACK misses.
-    DiagnosticPipe1,
-    /// Advertising-visible BLE coexistence smoke profile.
-    AdvertisingCoexistence,
-    /// Active BLE connection profile assuming relaxed connection parameters.
-    ConnectedRelaxedBle,
-    /// Low-density keyboard traffic starting point for RMK-style smoke tests.
-    RmkKeyboardLowLatency,
-}
-
 /// Result of a PRX timeslot session.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -1138,6 +1086,7 @@ struct PrxInnerState {
     last_crc: [u16; NUM_PIPES],
     last_valid: [bool; NUM_PIPES],
     enabled_pipes: u8,
+    recovery_policy: RadioRecoveryPolicy,
     slot_active: bool,
     ack_counter: [u32; NUM_PIPES],
     rx_per_pipe: [u32; NUM_PIPES],
@@ -1213,6 +1162,7 @@ impl PrxState {
                 last_crc: [0; NUM_PIPES],
                 last_valid: [false; NUM_PIPES],
                 enabled_pipes: 0x01,
+                recovery_policy: RadioRecoveryPolicy::ForceResetAfterBoundedDisable,
                 slot_active: false,
                 ack_counter: [0; NUM_PIPES],
                 rx_per_pipe: [0; NUM_PIPES],
@@ -1420,7 +1370,7 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.events_compare(0).write_value(0);
             t.intenclr().write(|w| w.set_compare(0, true));
 
-            if !quiesce_radio_before_timeslot_end() {
+            if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
                 state.counters.radio_disable_timeout += 1;
             }
             state.phase = PrxPhase::Idle;
@@ -1669,64 +1619,6 @@ impl Drop for PrxSlotSession {
     }
 }
 
-/// Configuration for a long-lived PRX timeslot session.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct PrxSlotConfig {
-    /// Timeslot duration per PRX window.
-    pub slot_length_us: u32,
-    /// TIMER0 compare value within the slot. Must be less than `slot_length_us`.
-    pub in_slot_match_us: u32,
-    /// Number of slots per report.
-    pub report_every: u32,
-    /// Enabled ESB RX pipe mask.
-    pub enabled_pipes: u8,
-}
-
-impl PrxSlotConfig {
-    pub const fn for_profile(profile: CoexistenceProfile) -> Self {
-        match profile {
-            CoexistenceProfile::DiagnosticPipe1 => Self {
-                slot_length_us: 5000,
-                in_slot_match_us: 4500,
-                report_every: 20,
-                enabled_pipes: 0x02,
-            },
-            CoexistenceProfile::AdvertisingCoexistence => Self {
-                slot_length_us: 12_000,
-                in_slot_match_us: 11_500,
-                report_every: 50,
-                enabled_pipes: 0x06,
-            },
-            CoexistenceProfile::ConnectedRelaxedBle => Self {
-                slot_length_us: 5000,
-                in_slot_match_us: 4500,
-                report_every: 20,
-                enabled_pipes: 0x02,
-            },
-            CoexistenceProfile::RmkKeyboardLowLatency => Self {
-                slot_length_us: 3000,
-                in_slot_match_us: 2800,
-                report_every: 4,
-                enabled_pipes: 0x02,
-            },
-        }
-    }
-
-    fn validate(self) -> Result<(), Error> {
-        if self.slot_length_us == 0
-            || self.in_slot_match_us == 0
-            || self.in_slot_match_us >= self.slot_length_us
-            || self.report_every == 0
-            || self.enabled_pipes == 0
-        {
-            return Err(Error::InvalidParam);
-        }
-
-        Ok(())
-    }
-}
-
 pub fn open_prx_session(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &EsbConfig,
@@ -1767,6 +1659,7 @@ pub fn open_prx_session(
         state.last_crc = [0; NUM_PIPES];
         state.last_valid = [false; NUM_PIPES];
         state.enabled_pipes = slot_config.enabled_pipes;
+        state.recovery_policy = slot_config.recovery;
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];
         state.rx_per_pipe = [0; NUM_PIPES];
@@ -1777,7 +1670,7 @@ pub fn open_prx_session(
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
         state.request.params.earliest.length_us = slot_config.slot_length_us;
-        state.request.params.earliest.timeout_us = 1_000_000;
+        state.request.params.earliest.timeout_us = slot_config.request.timeout_us;
     });
 
     let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
@@ -1816,99 +1709,6 @@ pub struct PtxPollResult {
     pub ack_timeout_count: u32,
     /// ACK packets received with a bad CRC.
     pub ack_crc_fail_count: u32,
-}
-
-/// Configuration for a long-lived PTX poll session.
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct PtxPollConfig {
-    /// Timeslot duration per poll.
-    pub slot_length_us: u32,
-    /// TIMER0 compare value within the slot. Must be less than `slot_length_us`.
-    pub in_slot_match_us: u32,
-    /// Bitmask of pipes to poll.
-    pub pipe_mask: u8,
-    /// Number of slots per report.
-    pub report_every: u32,
-    /// ACK wait window after TX completion.
-    pub ack_timeout_us: u32,
-    /// In-slot retries after ACK timeout. Use 0 to keep misses visible.
-    pub max_retries: u8,
-}
-
-impl PtxPollConfig {
-    /// Build a poll config from a named coexistence profile.
-    pub const fn for_profile(profile: CoexistenceProfile) -> Self {
-        match profile {
-            CoexistenceProfile::DiagnosticPipe1 => Self {
-                slot_length_us: 1500,
-                in_slot_match_us: 1300,
-                pipe_mask: 0x02,
-                report_every: 1,
-                ack_timeout_us: 400,
-                max_retries: 0,
-            },
-            CoexistenceProfile::AdvertisingCoexistence => Self {
-                slot_length_us: 3000,
-                in_slot_match_us: 2800,
-                pipe_mask: 0x06,
-                report_every: 2,
-                ack_timeout_us: 400,
-                max_retries: 0,
-            },
-            CoexistenceProfile::ConnectedRelaxedBle => Self {
-                slot_length_us: 1500,
-                in_slot_match_us: 1300,
-                pipe_mask: 0x02,
-                report_every: 1,
-                ack_timeout_us: 400,
-                max_retries: 0,
-            },
-            CoexistenceProfile::RmkKeyboardLowLatency => Self {
-                slot_length_us: 3000,
-                in_slot_match_us: 2800,
-                pipe_mask: 0x02,
-                report_every: 1,
-                ack_timeout_us: 400,
-                max_retries: 1,
-            },
-        }
-    }
-
-    /// Build a diagnostic poll config with no in-slot retries.
-    pub const fn diagnostic(
-        slot_length_us: u32,
-        in_slot_match_us: u32,
-        pipe_mask: u8,
-        report_every: u32,
-    ) -> Self {
-        Self {
-            slot_length_us,
-            in_slot_match_us,
-            pipe_mask,
-            report_every,
-            ack_timeout_us: 400,
-            max_retries: 0,
-        }
-    }
-
-    pub const fn pipe_count(self) -> u32 {
-        self.pipe_mask.count_ones()
-    }
-
-    fn validate(self) -> Result<(), Error> {
-        if self.slot_length_us == 0
-            || self.in_slot_match_us == 0
-            || self.in_slot_match_us >= self.slot_length_us
-            || self.pipe_mask == 0
-            || self.report_every == 0
-            || self.ack_timeout_us == 0
-        {
-            return Err(Error::InvalidParam);
-        }
-
-        Ok(())
-    }
 }
 
 /// Long-lived PTX poll session that round-robins across pipes.
@@ -2053,7 +1853,7 @@ pub fn open_ptx_poll_session(
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
         state.request.params.earliest.length_us = poll_config.slot_length_us;
-        state.request.params.earliest.timeout_us = 1_000_000;
+        state.request.params.earliest.timeout_us = poll_config.request.timeout_us;
     });
 
     let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
