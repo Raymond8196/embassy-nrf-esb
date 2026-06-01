@@ -536,6 +536,8 @@ struct PtxInnerState {
     ack_timeout_us: u32,
     ack_timeout_count: u32,
     ack_crc_fail_count: u32,
+    ack_timeout_per_pipe: [u32; NUM_PIPES],
+    ack_crc_fail_per_pipe: [u32; NUM_PIPES],
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -617,6 +619,8 @@ impl PtxState {
                 ack_timeout_us: 600,
                 ack_timeout_count: 0,
                 ack_crc_fail_count: 0,
+                ack_timeout_per_pipe: [0; NUM_PIPES],
+                ack_crc_fail_per_pipe: [0; NUM_PIPES],
             })),
         }
     }
@@ -772,6 +776,10 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
                     if !crc_ok {
                         state.ack_crc_fail_count += 1;
+                        let pipe = state.tx_pipe as usize;
+                        if pipe < NUM_PIPES {
+                            state.ack_crc_fail_per_pipe[pipe] += 1;
+                        }
                     }
 
                     if state.acked_this_slot {
@@ -800,6 +808,10 @@ unsafe extern "C" fn ptx_timeslot_callback(
             if t.events_compare(1).read() == 1 && state.phase == PtxPhase::WaitAck {
                 t.events_compare(1).write_value(0);
                 state.ack_timeout_count += 1;
+                let pipe = state.tx_pipe as usize;
+                if pipe < NUM_PIPES {
+                    state.ack_timeout_per_pipe[pipe] += 1;
+                }
 
                 let r = pac::RADIO;
                 if disable_radio_bounded(true, false).timed_out() {
@@ -1057,6 +1069,9 @@ pub struct PrxSlotResult {
     pub dup_count: u32,
     pub bad_crc_count: u32,
     pub rx_per_pipe: [u32; NUM_PIPES],
+    pub dup_per_pipe: [u32; NUM_PIPES],
+    pub bad_crc_per_pipe: [u32; NUM_PIPES],
+    pub ack_tx_per_pipe: [u32; NUM_PIPES],
 }
 
 /// Phase within a single PRX timeslot.
@@ -1090,6 +1105,9 @@ struct PrxInnerState {
     slot_active: bool,
     ack_counter: [u32; NUM_PIPES],
     rx_per_pipe: [u32; NUM_PIPES],
+    dup_per_pipe: [u32; NUM_PIPES],
+    bad_crc_per_pipe: [u32; NUM_PIPES],
+    ack_tx_per_pipe: [u32; NUM_PIPES],
     report_every: u32,
     last_report_start: u32,
     report_ready: bool,
@@ -1166,6 +1184,9 @@ impl PrxState {
                 slot_active: false,
                 ack_counter: [0; NUM_PIPES],
                 rx_per_pipe: [0; NUM_PIPES],
+                dup_per_pipe: [0; NUM_PIPES],
+                bad_crc_per_pipe: [0; NUM_PIPES],
+                ack_tx_per_pipe: [0; NUM_PIPES],
                 report_every: 0,
                 last_report_start: 0,
                 report_ready: false,
@@ -1248,6 +1269,10 @@ unsafe extern "C" fn prx_timeslot_callback(
                     // Check CRC.
                     if r.crcstatus().read().crcstatus() == pac::radio::vals::Crcstatus::CRCERROR {
                         state.bad_crc_count += 1;
+                        let pipe = r.rxmatch().read().rxmatch() as usize;
+                        if pipe < NUM_PIPES {
+                            state.bad_crc_per_pipe[pipe] += 1;
+                        }
                         // Restart RX: stop radio, re-enable shortcuts, start RX again.
                         let mut radio = EsbRadio::new(pac::RADIO);
                         radio.stop();
@@ -1270,6 +1295,9 @@ unsafe extern "C" fn prx_timeslot_callback(
 
                         if is_dup {
                             state.dup_count += 1;
+                            if pipe < NUM_PIPES {
+                                state.dup_per_pipe[pipe] += 1;
+                            }
                             if no_ack {
                                 // Dup NoAck — stop TX ramp, restart RX.
                                 let mut radio = EsbRadio::new(pac::RADIO);
@@ -1291,6 +1319,9 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
                                 let mut radio = EsbRadio::new(pac::RADIO);
                                 radio.transmit_ack_manual(pipe as u8, dma_ptr);
+                                if pipe < NUM_PIPES {
+                                    state.ack_tx_per_pipe[pipe] += 1;
+                                }
                                 state.phase = PrxPhase::TxRepeatedAck;
                             }
                         } else {
@@ -1325,6 +1356,9 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
                                 let mut radio = EsbRadio::new(pac::RADIO);
                                 radio.transmit_ack_manual(pipe as u8, dma_ptr);
+                                if pipe < NUM_PIPES {
+                                    state.ack_tx_per_pipe[pipe] += 1;
+                                }
                                 state.phase = PrxPhase::TxAck;
                             }
                         }
@@ -1496,6 +1530,9 @@ pub async fn run_prx_slots(
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];
         state.rx_per_pipe = [0; NUM_PIPES];
+        state.dup_per_pipe = [0; NUM_PIPES];
+        state.bad_crc_per_pipe = [0; NUM_PIPES];
+        state.ack_tx_per_pipe = [0; NUM_PIPES];
         state.report_every = 0;
         state.last_report_start = 0;
         state.report_ready = false;
@@ -1534,6 +1571,9 @@ pub async fn run_prx_slots(
         dup_count: state.dup_count,
         bad_crc_count: state.bad_crc_count,
         rx_per_pipe: state.rx_per_pipe,
+        dup_per_pipe: state.dup_per_pipe,
+        bad_crc_per_pipe: state.bad_crc_per_pipe,
+        ack_tx_per_pipe: state.ack_tx_per_pipe,
     }))
 }
 
@@ -1551,6 +1591,9 @@ pub struct PrxSlotSession {
     last_dup_count: u32,
     last_bad_crc_count: u32,
     last_rx_per_pipe: [u32; NUM_PIPES],
+    last_dup_per_pipe: [u32; NUM_PIPES],
+    last_bad_crc_per_pipe: [u32; NUM_PIPES],
+    last_ack_tx_per_pipe: [u32; NUM_PIPES],
 }
 
 impl PrxSlotSession {
@@ -1590,6 +1633,11 @@ impl PrxSlotSession {
 
             let counters = state.counters.saturating_sub(self.last_counters);
             let rx_per_pipe = delta_per_pipe(&state.rx_per_pipe, &self.last_rx_per_pipe);
+            let dup_per_pipe = delta_per_pipe(&state.dup_per_pipe, &self.last_dup_per_pipe);
+            let bad_crc_per_pipe =
+                delta_per_pipe(&state.bad_crc_per_pipe, &self.last_bad_crc_per_pipe);
+            let ack_tx_per_pipe =
+                delta_per_pipe(&state.ack_tx_per_pipe, &self.last_ack_tx_per_pipe);
 
             let result = PrxSlotResult {
                 counters,
@@ -1597,6 +1645,9 @@ impl PrxSlotSession {
                 dup_count: state.dup_count.saturating_sub(self.last_dup_count),
                 bad_crc_count: state.bad_crc_count.saturating_sub(self.last_bad_crc_count),
                 rx_per_pipe,
+                dup_per_pipe,
+                bad_crc_per_pipe,
+                ack_tx_per_pipe,
             };
 
             self.last_counters = state.counters;
@@ -1604,6 +1655,9 @@ impl PrxSlotSession {
             self.last_dup_count = state.dup_count;
             self.last_bad_crc_count = state.bad_crc_count;
             self.last_rx_per_pipe = state.rx_per_pipe;
+            self.last_dup_per_pipe = state.dup_per_pipe;
+            self.last_bad_crc_per_pipe = state.bad_crc_per_pipe;
+            self.last_ack_tx_per_pipe = state.ack_tx_per_pipe;
 
             Ok(result)
         })?;
@@ -1663,6 +1717,9 @@ pub fn open_prx_session(
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];
         state.rx_per_pipe = [0; NUM_PIPES];
+        state.dup_per_pipe = [0; NUM_PIPES];
+        state.bad_crc_per_pipe = [0; NUM_PIPES];
+        state.ack_tx_per_pipe = [0; NUM_PIPES];
         state.report_every = slot_config.report_every;
         state.last_report_start = 0;
         state.report_ready = false;
@@ -1690,6 +1747,9 @@ pub fn open_prx_session(
         last_dup_count: 0,
         last_bad_crc_count: 0,
         last_rx_per_pipe: [0; NUM_PIPES],
+        last_dup_per_pipe: [0; NUM_PIPES],
+        last_bad_crc_per_pipe: [0; NUM_PIPES],
+        last_ack_tx_per_pipe: [0; NUM_PIPES],
     })
 }
 
@@ -1709,6 +1769,10 @@ pub struct PtxPollResult {
     pub ack_timeout_count: u32,
     /// ACK packets received with a bad CRC.
     pub ack_crc_fail_count: u32,
+    /// Per-pipe ACK wait windows that reached the diagnostic timeout.
+    pub ack_timeout_per_pipe: [u32; NUM_PIPES],
+    /// Per-pipe ACK packets received with a bad CRC.
+    pub ack_crc_fail_per_pipe: [u32; NUM_PIPES],
 }
 
 /// Long-lived PTX poll session that round-robins across pipes.
@@ -1726,6 +1790,8 @@ pub struct PtxPollSession {
     last_ack_per_pipe: [u32; NUM_PIPES],
     last_ack_timeout_count: u32,
     last_ack_crc_fail_count: u32,
+    last_ack_timeout_per_pipe: [u32; NUM_PIPES],
+    last_ack_crc_fail_per_pipe: [u32; NUM_PIPES],
 }
 
 impl PtxPollSession {
@@ -1753,6 +1819,12 @@ impl PtxPollSession {
             let counters = state.counters.saturating_sub(self.last_counters);
             let tx_per_pipe = delta_per_pipe(&state.tx_per_pipe, &self.last_tx_per_pipe);
             let ack_per_pipe = delta_per_pipe(&state.ack_ok_per_pipe, &self.last_ack_per_pipe);
+            let ack_timeout_per_pipe =
+                delta_per_pipe(&state.ack_timeout_per_pipe, &self.last_ack_timeout_per_pipe);
+            let ack_crc_fail_per_pipe = delta_per_pipe(
+                &state.ack_crc_fail_per_pipe,
+                &self.last_ack_crc_fail_per_pipe,
+            );
 
             let result = PtxPollResult {
                 counters,
@@ -1766,6 +1838,8 @@ impl PtxPollSession {
                 ack_crc_fail_count: state
                     .ack_crc_fail_count
                     .saturating_sub(self.last_ack_crc_fail_count),
+                ack_timeout_per_pipe,
+                ack_crc_fail_per_pipe,
             };
 
             self.last_counters = state.counters;
@@ -1775,6 +1849,8 @@ impl PtxPollSession {
             self.last_ack_per_pipe = state.ack_ok_per_pipe;
             self.last_ack_timeout_count = state.ack_timeout_count;
             self.last_ack_crc_fail_count = state.ack_crc_fail_count;
+            self.last_ack_timeout_per_pipe = state.ack_timeout_per_pipe;
+            self.last_ack_crc_fail_per_pipe = state.ack_crc_fail_per_pipe;
 
             Ok(result)
         })?;
@@ -1845,6 +1921,8 @@ pub fn open_ptx_poll_session(
         state.poll_report_ready = false;
         state.ack_ok_per_pipe = [0; NUM_PIPES];
         state.tx_per_pipe = [0; NUM_PIPES];
+        state.ack_timeout_per_pipe = [0; NUM_PIPES];
+        state.ack_crc_fail_per_pipe = [0; NUM_PIPES];
         state.retry_count = 0;
         state.max_retries = poll_config.max_retries;
         state.acked_this_slot = false;
@@ -1874,5 +1952,7 @@ pub fn open_ptx_poll_session(
         last_ack_per_pipe: [0; NUM_PIPES],
         last_ack_timeout_count: 0,
         last_ack_crc_fail_count: 0,
+        last_ack_timeout_per_pipe: [0; NUM_PIPES],
+        last_ack_crc_fail_per_pipe: [0; NUM_PIPES],
     })
 }

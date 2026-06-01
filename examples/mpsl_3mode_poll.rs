@@ -45,7 +45,7 @@ use embassy_nrf_esb::mpsl_timeslot::{CoexistenceProfile, PtxPollConfig, open_ptx
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 
-const LOG_BUF_SIZE: usize = 192;
+const LOG_BUF_SIZE: usize = 256;
 
 static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_SIZE>, 4> =
     Channel::new();
@@ -301,8 +301,6 @@ impl core::fmt::Write for WriteBuf<'_> {
 }
 
 const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1;
-const ACK_TIMEOUT_US: u32 = 400;
-const MAX_RETRIES: u8 = 0; // keep misses visible in diagnostic counters
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -391,9 +389,7 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let mut poll_cfg = PtxPollConfig::for_profile(PROFILE);
-    poll_cfg.ack_timeout_us = ACK_TIMEOUT_US;
-    poll_cfg.max_retries = MAX_RETRIES;
+    let poll_cfg = PtxPollConfig::for_profile(PROFILE);
 
     let mut poll = match open_ptx_poll_session(mpsl, &esb_cfg, &esb_addr, poll_cfg) {
         Ok(s) => s,
@@ -441,7 +437,15 @@ async fn main(spawner: Spawner) {
         );
         for i in 0..8 {
             if poll_cfg.pipe_mask & (1 << i) != 0 {
-                let _ = write!(w, " p{}:{}/{}", i, r.ack_per_pipe[i], r.tx_per_pipe[i]);
+                let _ = write!(
+                    w,
+                    " p{}:{}/{}/{}/{}",
+                    i,
+                    r.ack_per_pipe[i],
+                    r.tx_per_pipe[i],
+                    r.ack_timeout_per_pipe[i],
+                    r.ack_crc_fail_per_pipe[i]
+                );
             }
         }
         let _ = write!(w, "\r\n");

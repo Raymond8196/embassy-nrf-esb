@@ -52,6 +52,13 @@ The following ideas have been folded into this repository:
 
    `mpsl_timeslot.rs` still owns callback-heavy PRX/PTX logic for now.
 
+4. **Diagnostic profile sweep and per-pipe counters**
+
+   The `DiagnosticPipe1` family now includes relaxed ACK, retry, and long-slot
+   variants. The 3-mode logs expose per-pipe poll `ack/tx/to/crc` and central
+   `rx/dup/crc/ack_tx` so the next hardware run can distinguish missed ACK
+   windows from CRC failures and central-side receive/ACK behavior.
+
 ## Recommended Study Order
 
 1. Read `too1/ncs-esb-ble-mpsl-demo` first for the closest BLE/ESB/MPSL

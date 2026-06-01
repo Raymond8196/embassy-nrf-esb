@@ -408,6 +408,13 @@ Current no-hardware diagnostic configuration:
 - Both `mpsl_3mode_poll` and `mpsl_3mode_central` now select
   `CoexistenceProfile::DiagnosticPipe1` rather than scattering raw slot
   constants through the examples.
+- The diagnostic profile family now includes sweep variants for the next
+  hardware tuning pass:
+  - `DiagnosticPipe1`: PTX 1500 us slot, 400 us ACK timeout, 0 retries.
+  - `DiagnosticPipe1RelaxedAck`: PTX 1500 us slot, 600 us ACK timeout,
+    0 retries.
+  - `DiagnosticPipe1Retry1`: PTX 1500 us slot, 400 us ACK timeout, 1 retry.
+  - `DiagnosticPipe1LongSlot`: PTX 3000 us slot, 600 us ACK timeout, 1 retry.
 - `mpsl_3mode_poll` profile values: 1500 us slot, 1300 us in-slot match, pipe
   1 only (`pipe_mask = 0x02`), one report per poll.
 - `mpsl_3mode_central` profile values: 5000 us slot, 4500 us in-slot match,
@@ -417,7 +424,9 @@ Current no-hardware diagnostic configuration:
 - The current diagnostic config uses `ack_timeout_us = 400` and
   `max_retries = 0`, so missed ACKs remain visible as diagnostic counters
   instead of being hidden by recovered retransmits.
-- `PtxPollResult` reports incremental ACK timeout and ACK CRC-fail counts.
+- `PtxPollResult` reports incremental ACK timeout and ACK CRC-fail counts, both
+  globally and per pipe.
+- `PrxSlotResult` reports per-pipe RX, duplicate, bad-CRC, and ACK-TX counts.
 - MPSL diagnostic protocol helpers for PID advance, pipe-mask round-robin,
   counter packet encoding/decoding, per-pipe deltas, and bounded spin loops are
   covered by host tests.
@@ -428,8 +437,12 @@ Current no-hardware diagnostic configuration:
   `crc=<ack_crc_fail_count>`, plus `dt=<radio_disable_timeout>`:
 
 ```text
-r=<round> tx=<n> ack=<n> to=<n> crc=<n> s=<start> t0=<timer0> rd=<radio> dt=<disable_timeout> p1:<ack>/<tx>
+r=<round> tx=<n> ack=<n> to=<n> crc=<n> s=<start> t0=<timer0> rd=<radio> dt=<disable_timeout> p1:<ack>/<tx>/<to>/<crc>
+b=<batch> rx=<n> dup=<n> crc=<n> p1:<rx>/<dup>/<crc>/<ack_tx> s=<start> t0=<timer0> rd=<radio> bk=<blocked> cn=<cancelled> dt=<disable_timeout>
 ```
+
+For each `pN:` group, poll/TX uses `ack/tx/to/crc` and central/RX uses
+`rx/dup/crc/ack_tx`.
 
 No-hardware verification on 2026-06-01:
 
@@ -534,11 +547,35 @@ Result:
   profile, not an obvious profile/radio-helper regression or runaway MPSL
   scheduling failure.
 
+Next profile sweep procedure:
+
+1. Edit `PROFILE` in both `examples/mpsl_3mode_poll.rs` and
+   `examples/mpsl_3mode_central.rs`.
+2. Use the same central profile for all narrow pipe-1 sweep runs unless the PRX
+   side is explicitly being tuned; the current sweep variants mostly change PTX
+   ACK wait/retry/slot behavior.
+3. Build and flash `mpsl_3mode_central` and `mpsl_3mode_poll`.
+4. Capture each profile for 2-5 minutes.
+5. Compare:
+   - poll `ack_rate`, `to_rate`, `crc_rate`, `rd_max`, and `dt_max`;
+   - poll per-pipe `p1:<ack>/<tx>/<to>/<crc>`;
+   - central per-pipe `p1:<rx>/<dup>/<crc>/<ack_tx>`;
+   - central `bk/cn/dt` and whether `rd` remains bounded.
+
+Suggested order:
+
+1. `DiagnosticPipe1` baseline.
+2. `DiagnosticPipe1RelaxedAck` to test whether 400 us ACK wait is too short.
+3. `DiagnosticPipe1Retry1` to test whether one in-slot retry recovers misses.
+4. `DiagnosticPipe1LongSlot` to test whether extra slot budget changes both
+   `to_rate` and `rd/dt`.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
-- Re-run the 3-mode poll diagnostic on hardware and classify pipe 1 misses using
-  the new timeout versus CRC-fail counters.
+- Re-run the 3-mode poll diagnostic on hardware across the diagnostic profile
+  sweep variants and compare `to_rate`, `crc_rate`, per-pipe `to/crc`,
+  central-side `rx/ack_tx`, and `rd/dt/bk/cn`.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.

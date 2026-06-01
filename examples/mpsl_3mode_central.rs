@@ -55,7 +55,7 @@ use embassy_nrf_esb::mpsl_timeslot::{
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 
-const LOG_BUF_SIZE: usize = 192;
+const LOG_BUF_SIZE: usize = 256;
 
 static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_SIZE>, 4> =
     Channel::new();
@@ -392,13 +392,19 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
     let mut w = WriteBuf::new(buf);
     let _ = write!(
         w,
-        "b={} rx={} dup={} crc={} p0={} p1={} s={} t0={} rd={} bk={} cn={} dt={}\r\n",
+        "b={} rx={} dup={} crc={} p0:{}/{}/{}/{} p1:{}/{}/{}/{} s={} t0={} rd={} bk={} cn={} dt={}\r\n",
         batch,
         r.rx_count,
         r.dup_count,
         r.bad_crc_count,
         r.rx_per_pipe[0],
+        r.dup_per_pipe[0],
+        r.bad_crc_per_pipe[0],
+        r.ack_tx_per_pipe[0],
         r.rx_per_pipe[1],
+        r.dup_per_pipe[1],
+        r.bad_crc_per_pipe[1],
+        r.ack_tx_per_pipe[1],
         r.counters.start,
         r.counters.timer0,
         r.counters.radio,
