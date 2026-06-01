@@ -48,7 +48,9 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{PrxSlotResult, open_prx_session};
+use embassy_nrf_esb::mpsl_timeslot::{
+    CoexistenceProfile, PrxSlotConfig, PrxSlotResult, open_prx_session,
+};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -390,7 +392,7 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
     let mut w = WriteBuf::new(buf);
     let _ = write!(
         w,
-        "b={} rx={} dup={} crc={} p0={} p1={} s={} t0={} rd={} bk={} cn={}\r\n",
+        "b={} rx={} dup={} crc={} p0={} p1={} s={} t0={} rd={} bk={} cn={} dt={}\r\n",
         batch,
         r.rx_count,
         r.dup_count,
@@ -402,16 +404,14 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
         r.counters.radio,
         r.counters.blocked,
         r.counters.cancelled,
+        r.counters.radio_disable_timeout,
     );
     w.pos
 }
 
 // ---- Main ----
 
-const BATCH_SIZE: u32 = 20;
-const SLOT_US: u32 = 5000;
-const MATCH_US: u32 = 4500;
-const PIPES: u8 = 0x02;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1;
 const ESB_IDLE_MS: u64 = 0;
 
 #[embassy_executor::main]
@@ -513,9 +513,8 @@ async fn main(spawner: Spawner) {
     let mut total_blk: u32 = 0;
 
     let mut err_count: u32 = 0;
-    let mut prx_session = match open_prx_session(
-        mpsl, &esb_cfg, &esb_addr, SLOT_US, MATCH_US, BATCH_SIZE, PIPES,
-    ) {
+    let prx_cfg = PrxSlotConfig::for_profile(PROFILE);
+    let mut prx_session = match open_prx_session(mpsl, &esb_cfg, &esb_addr, prx_cfg) {
         Ok(session) => session,
         Err(e) => {
             defmt::error!("open_prx_session failed: {:?}", e);

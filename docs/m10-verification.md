@@ -405,20 +405,30 @@ r=10938 tx=1 ack=1 s=1 t0=1 rd=2 p1:1/1
 
 Current no-hardware diagnostic configuration:
 
-- `mpsl_3mode_poll`: 1500 us slot, 1300 us in-slot match, pipe 1 only
-  (`PIPE_MASK = 0x02`), one report per poll.
-- `mpsl_3mode_central`: batch size 20, 5000 us slot, 4500 us in-slot match,
-  pipe 1 only (`PIPES = 0x02`), no extra ESB idle delay.
+- Both `mpsl_3mode_poll` and `mpsl_3mode_central` now select
+  `CoexistenceProfile::DiagnosticPipe1` rather than scattering raw slot
+  constants through the examples.
+- `mpsl_3mode_poll` profile values: 1500 us slot, 1300 us in-slot match, pipe
+  1 only (`pipe_mask = 0x02`), one report per poll.
+- `mpsl_3mode_central` profile values: 5000 us slot, 4500 us in-slot match,
+  pipe 1 only (`enabled_pipes = 0x02`), 20 slots per report, no extra ESB idle
+  delay.
 - `PtxPollConfig` now makes ACK timeout and in-slot retry count explicit.
 - The current diagnostic config uses `ack_timeout_us = 400` and
   `max_retries = 0`, so missed ACKs remain visible as diagnostic counters
   instead of being hidden by recovered retransmits.
 - `PtxPollResult` reports incremental ACK timeout and ACK CRC-fail counts.
+- MPSL diagnostic protocol helpers for PID advance, pipe-mask round-robin,
+  counter packet encoding/decoding, per-pipe deltas, and bounded spin loops are
+  covered by host tests.
+- PTX diagnostic RADIO disable waits now use a bounded helper instead of
+  unbounded `EVENTS_DISABLED` spins. `SignalCounters::radio_disable_timeout`
+  reports bounded waits that hit the spin limit.
 - PTX log lines now include `to=<ack_timeout_count>` and
-  `crc=<ack_crc_fail_count>`:
+  `crc=<ack_crc_fail_count>`, plus `dt=<radio_disable_timeout>`:
 
 ```text
-r=<round> tx=<n> ack=<n> to=<n> crc=<n> s=<start> t0=<timer0> rd=<radio> p1:<ack>/<tx>
+r=<round> tx=<n> ack=<n> to=<n> crc=<n> s=<start> t0=<timer0> rd=<radio> dt=<disable_timeout> p1:<ack>/<tx>
 ```
 
 No-hardware verification on 2026-06-01:

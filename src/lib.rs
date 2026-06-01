@@ -37,6 +37,8 @@ pub mod addresses;
 pub mod config;
 pub mod error;
 pub mod header;
+#[cfg(any(test, feature = "mpsl"))]
+pub(crate) mod mpsl_common;
 pub mod payload;
 pub(crate) mod radio;
 pub mod state_machine;

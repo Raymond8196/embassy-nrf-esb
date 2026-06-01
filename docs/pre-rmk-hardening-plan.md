@@ -118,6 +118,13 @@ Progress:
   timeslot helpers as experimental/diagnostic and list the current static-state,
   fixed-buffer, duplicated-protocol, retry-timing, and BLE-scheduling
   limitations.
+- 2026-06-01: Added explicit MPSL coexistence profiles and PRX/PTX diagnostic
+  config structs so the 3-mode examples choose a named profile instead of
+  carrying raw slot constants. Extracted pure MPSL diagnostic helpers for PID
+  advance, pipe-mask round-robin, counter packet encode/decode, per-pipe deltas,
+  and bounded spin loops; these are now host-tested. PTX diagnostic RADIO
+  disable waits now use a bounded helper instead of unbounded spins, and
+  `SignalCounters` reports bounded disable waits that hit the spin limit.
 
 ## Phase 4: Host Test Expansion
 
@@ -152,6 +159,8 @@ Progress:
   includes the full `rx_complete()` queue/release lifecycle, pipe-filtered TX
   dequeue skipping allocated or wrong-pipe slots, transport trailing-byte
   decode behavior, and unbound/out-of-range route rejection.
+- 2026-06-01: Host coverage increased to 40 tests after adding pure MPSL
+  diagnostic helper tests.
 
 ## Phase 5: Hardware Regression Procedure
 

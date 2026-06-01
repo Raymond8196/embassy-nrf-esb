@@ -38,6 +38,10 @@ use embassy_sync::waitqueue::WakerRegistration;
 use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 
 use crate::error::Error;
+use crate::mpsl_common::{
+    NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload, spin_until,
+    write_counter_packet,
+};
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
 const RADIO_DISABLE_SPIN_LIMIT: u32 = 100_000;
@@ -49,22 +53,9 @@ fn mpsl_ok(ret: i32) -> Result<(), Error> {
         .map_err(|_| Error::Mpsl)
 }
 
-fn quiesce_radio_before_timeslot_end() {
+fn quiesce_radio_before_timeslot_end() -> bool {
     let r = pac::RADIO;
-    r.shorts().modify(|w| {
-        w.set_ready_start(false);
-        w.set_end_disable(false);
-        w.set_disabled_rxen(false);
-        w.set_disabled_txen(false);
-    });
-    r.intenclr().write(|w| w.set_disabled(true));
-    r.events_disabled().write_value(0);
-    r.tasks_disable().write_value(1);
-
-    let mut spins = 0;
-    while r.events_disabled().read() == 0 && spins < RADIO_DISABLE_SPIN_LIMIT {
-        spins += 1;
-    }
+    let disabled = disable_radio_bounded(true, true);
 
     r.events_address().write_value(0);
     r.events_payload().write_value(0);
@@ -78,6 +69,28 @@ fn quiesce_radio_before_timeslot_end() {
     r.power().write(|w| w.set_power(true));
     cortex_m::peripheral::NVIC::unpend(pac::Interrupt::RADIO);
     compiler_fence(Ordering::Acquire);
+    disabled
+}
+
+fn disable_radio_bounded(clear_rxen: bool, clear_txen: bool) -> bool {
+    let r = pac::RADIO;
+    r.shorts().modify(|w| {
+        w.set_ready_start(false);
+        w.set_end_disable(false);
+        if clear_rxen {
+            w.set_disabled_rxen(false);
+        }
+        if clear_txen {
+            w.set_disabled_txen(false);
+        }
+    });
+    r.intenclr().write(|w| w.set_disabled(true));
+    r.events_disabled().write_value(0);
+    r.tasks_disable().write_value(1);
+    let disabled = spin_until(|| r.events_disabled().read() != 0, RADIO_DISABLE_SPIN_LIMIT);
+    r.events_disabled().write_value(0);
+    compiler_fence(Ordering::Acquire);
+    disabled
 }
 
 struct Timer0RawMutex;
@@ -112,6 +125,7 @@ pub struct SignalCounters {
     pub invalid_return: u32,
     pub extend_failed: u32,
     pub extend_succeeded: u32,
+    pub radio_disable_timeout: u32,
 }
 
 impl SignalCounters {
@@ -130,6 +144,9 @@ impl SignalCounters {
             extend_succeeded: self
                 .extend_succeeded
                 .saturating_sub(previous.extend_succeeded),
+            radio_disable_timeout: self
+                .radio_disable_timeout
+                .saturating_sub(previous.radio_disable_timeout),
         }
     }
 
@@ -145,6 +162,7 @@ impl SignalCounters {
         invalid_return: 0,
         extend_failed: 0,
         extend_succeeded: 0,
+        radio_disable_timeout: 0,
     };
 }
 
@@ -578,20 +596,6 @@ static PTX_BUFS: PtxBuffers = PtxBuffers {
     rx: UnsafeCell::new([0u8; 256]),
 };
 
-fn write_counter_packet(buf: &mut [u8; 256], pid: u8, counter: u32) {
-    let header = unsafe { &mut *(buf.as_mut_ptr().cast::<EsbHeader>()) };
-    header.length = 4;
-    header.pid_no_ack = 0;
-    header.set_pid(pid);
-    header.set_no_ack(false);
-
-    let p = EsbHeader::PAYLOAD_OFFSET;
-    buf[p] = counter as u8;
-    buf[p + 1] = (counter >> 8) as u8;
-    buf[p + 2] = (counter >> 16) as u8;
-    buf[p + 3] = (counter >> 24) as u8;
-}
-
 impl PtxState {
     const fn new() -> Self {
         Self {
@@ -684,15 +688,9 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
             // In poll mode, advance to next pipe in mask.
             if state.poll_pipes > 0 {
-                let mask = state.poll_pipe_mask;
-                let mut next = state.tx_pipe;
-                for _ in 0..NUM_PIPES {
-                    next = (next + 1) % NUM_PIPES as u8;
-                    if mask & (1 << next) != 0 {
-                        break;
-                    }
+                if let Some(next) = next_pipe_in_mask(state.tx_pipe, state.poll_pipe_mask) {
+                    state.tx_pipe = next;
                 }
-                state.tx_pipe = next;
             }
 
             // Power cycle RADIO.
@@ -798,15 +796,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                         }
 
                         let rx_buf = unsafe { &*PTX_BUFS.rx.get() };
-                        let length = rx_buf[EsbHeader::DMA_OFFSET] as usize;
-                        if length >= 4 {
-                            let p = EsbHeader::PAYLOAD_OFFSET;
-                            let counter = u32::from_le_bytes([
-                                rx_buf[p],
-                                rx_buf[p + 1],
-                                rx_buf[p + 2],
-                                rx_buf[p + 3],
-                            ]);
+                        if let Some(counter) = read_counter_payload(rx_buf) {
                             state.ack_payload_count += 1;
                             if counter < state.last_ack_counter {
                                 state.ack_inversions += 1;
@@ -820,18 +810,12 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     }
 
                     if state.acked_this_slot {
-                        state.pid = (state.pid + 1) & 0x03;
+                        state.pid = advance_pid(state.pid);
                         state.payload_byte = state.payload_byte.wrapping_add(1);
                     }
-                    r.shorts().modify(|w| {
-                        w.set_ready_start(false);
-                        w.set_end_disable(false);
-                    });
-                    r.intenclr().write(|w| w.set_disabled(true));
-                    r.tasks_disable().write_value(1);
-                    while r.events_disabled().read() == 0 {}
-                    r.events_disabled().write_value(0);
-                    compiler_fence(Ordering::Acquire);
+                    if !disable_radio_bounded(false, false) {
+                        state.counters.radio_disable_timeout += 1;
+                    }
 
                     state.phase = PtxPhase::Done;
                 }
@@ -853,16 +837,9 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 state.ack_timeout_count += 1;
 
                 let r = pac::RADIO;
-                r.shorts().modify(|w| {
-                    w.set_ready_start(false);
-                    w.set_end_disable(false);
-                    w.set_disabled_rxen(false);
-                });
-                r.intenclr().write(|w| w.set_disabled(true));
-                r.tasks_disable().write_value(1);
-                while r.events_disabled().read() == 0 {}
-                r.events_disabled().write_value(0);
-                compiler_fence(Ordering::Acquire);
+                if !disable_radio_bounded(true, false) {
+                    state.counters.radio_disable_timeout += 1;
+                }
 
                 if state.retry_count < state.max_retries {
                     state.retry_count += 1;
@@ -911,18 +888,9 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 });
 
                 if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
-                    let r = pac::RADIO;
-                    r.shorts().modify(|w| {
-                        w.set_ready_start(false);
-                        w.set_end_disable(false);
-                        w.set_disabled_rxen(false);
-                        w.set_disabled_txen(false);
-                    });
-                    r.intenclr().write(|w| w.set_disabled(true));
-                    r.tasks_disable().write_value(1);
-                    while r.events_disabled().read() == 0 {}
-                    r.events_disabled().write_value(0);
-                    compiler_fence(Ordering::Acquire);
+                    if !disable_radio_bounded(true, true) {
+                        state.counters.radio_disable_timeout += 1;
+                    }
                     state.phase = PtxPhase::Done;
                 }
 
@@ -1115,7 +1083,22 @@ pub async fn run_ptx_slots(
 
 // ---- PRX-in-timeslot ----
 
-const NUM_PIPES: usize = 8;
+/// Diagnostic coexistence tuning profiles.
+///
+/// These are starting points for hardware runs, not product guarantees. The
+/// explicit config structs can be edited after choosing a profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CoexistenceProfile {
+    /// Narrow pipe-1 diagnostic used to classify ACK misses.
+    DiagnosticPipe1,
+    /// Advertising-visible BLE coexistence smoke profile.
+    AdvertisingCoexistence,
+    /// Active BLE connection profile assuming relaxed connection parameters.
+    ConnectedRelaxedBle,
+    /// Low-density keyboard traffic starting point for RMK-style smoke tests.
+    RmkKeyboardLowLatency,
+}
 
 /// Result of a PRX timeslot session.
 #[derive(Debug, Clone, Copy)]
@@ -1437,7 +1420,9 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.events_compare(0).write_value(0);
             t.intenclr().write(|w| w.set_compare(0, true));
 
-            quiesce_radio_before_timeslot_end();
+            if !quiesce_radio_before_timeslot_end() {
+                state.counters.radio_disable_timeout += 1;
+            }
             state.phase = PrxPhase::Idle;
 
             let long_session = state.report_every > 0;
@@ -1654,10 +1639,7 @@ impl PrxSlotSession {
             }
 
             let counters = state.counters.saturating_sub(self.last_counters);
-            let mut rx_per_pipe = [0; NUM_PIPES];
-            for (idx, rx) in rx_per_pipe.iter_mut().enumerate() {
-                *rx = state.rx_per_pipe[idx].saturating_sub(self.last_rx_per_pipe[idx]);
-            }
+            let rx_per_pipe = delta_per_pipe(&state.rx_per_pipe, &self.last_rx_per_pipe);
 
             let result = PrxSlotResult {
                 counters,
@@ -1687,18 +1669,78 @@ impl Drop for PrxSlotSession {
     }
 }
 
+/// Configuration for a long-lived PRX timeslot session.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PrxSlotConfig {
+    /// Timeslot duration per PRX window.
+    pub slot_length_us: u32,
+    /// TIMER0 compare value within the slot. Must be less than `slot_length_us`.
+    pub in_slot_match_us: u32,
+    /// Number of slots per report.
+    pub report_every: u32,
+    /// Enabled ESB RX pipe mask.
+    pub enabled_pipes: u8,
+}
+
+impl PrxSlotConfig {
+    pub const fn for_profile(profile: CoexistenceProfile) -> Self {
+        match profile {
+            CoexistenceProfile::DiagnosticPipe1 => Self {
+                slot_length_us: 5000,
+                in_slot_match_us: 4500,
+                report_every: 20,
+                enabled_pipes: 0x02,
+            },
+            CoexistenceProfile::AdvertisingCoexistence => Self {
+                slot_length_us: 12_000,
+                in_slot_match_us: 11_500,
+                report_every: 50,
+                enabled_pipes: 0x06,
+            },
+            CoexistenceProfile::ConnectedRelaxedBle => Self {
+                slot_length_us: 5000,
+                in_slot_match_us: 4500,
+                report_every: 20,
+                enabled_pipes: 0x02,
+            },
+            CoexistenceProfile::RmkKeyboardLowLatency => Self {
+                slot_length_us: 3000,
+                in_slot_match_us: 2800,
+                report_every: 4,
+                enabled_pipes: 0x02,
+            },
+        }
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        if self.slot_length_us == 0
+            || self.in_slot_match_us == 0
+            || self.in_slot_match_us >= self.slot_length_us
+            || self.report_every == 0
+            || self.enabled_pipes == 0
+        {
+            return Err(Error::InvalidParam);
+        }
+
+        Ok(())
+    }
+}
+
 pub fn open_prx_session(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &EsbConfig,
     addresses: &EsbAddresses,
-    slot_length_us: u32,
-    in_slot_match_us: u32,
-    report_every: u32,
-    enabled_pipes: u8,
+    slot_config: PrxSlotConfig,
 ) -> Result<PrxSlotSession, Error> {
     let busy = PRX_STATE.try_enter()?;
-    if config.payload_length < 4 || report_every == 0 {
+    if config.payload_length < 4 {
+        drop(busy);
         return Err(Error::InvalidParam);
+    }
+    if let Err(e) = slot_config.validate() {
+        drop(busy);
+        return Err(e);
     }
 
     let mut session_id: u8 = 0;
@@ -1714,7 +1756,7 @@ pub fn open_prx_session(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = 0;
-        state.in_slot_match_us = in_slot_match_us;
+        state.in_slot_match_us = slot_config.in_slot_match_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PrxPhase::Idle;
@@ -1724,17 +1766,17 @@ pub fn open_prx_session(
         state.last_pid = [0; NUM_PIPES];
         state.last_crc = [0; NUM_PIPES];
         state.last_valid = [false; NUM_PIPES];
-        state.enabled_pipes = enabled_pipes;
+        state.enabled_pipes = slot_config.enabled_pipes;
         state.slot_active = false;
         state.ack_counter = [0; NUM_PIPES];
         state.rx_per_pipe = [0; NUM_PIPES];
-        state.report_every = report_every;
+        state.report_every = slot_config.report_every;
         state.last_report_start = 0;
         state.report_ready = false;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = slot_length_us;
+        state.request.params.earliest.length_us = slot_config.slot_length_us;
         state.request.params.earliest.timeout_us = 1_000_000;
     });
 
@@ -1795,6 +1837,44 @@ pub struct PtxPollConfig {
 }
 
 impl PtxPollConfig {
+    /// Build a poll config from a named coexistence profile.
+    pub const fn for_profile(profile: CoexistenceProfile) -> Self {
+        match profile {
+            CoexistenceProfile::DiagnosticPipe1 => Self {
+                slot_length_us: 1500,
+                in_slot_match_us: 1300,
+                pipe_mask: 0x02,
+                report_every: 1,
+                ack_timeout_us: 400,
+                max_retries: 0,
+            },
+            CoexistenceProfile::AdvertisingCoexistence => Self {
+                slot_length_us: 3000,
+                in_slot_match_us: 2800,
+                pipe_mask: 0x06,
+                report_every: 2,
+                ack_timeout_us: 400,
+                max_retries: 0,
+            },
+            CoexistenceProfile::ConnectedRelaxedBle => Self {
+                slot_length_us: 1500,
+                in_slot_match_us: 1300,
+                pipe_mask: 0x02,
+                report_every: 1,
+                ack_timeout_us: 400,
+                max_retries: 0,
+            },
+            CoexistenceProfile::RmkKeyboardLowLatency => Self {
+                slot_length_us: 3000,
+                in_slot_match_us: 2800,
+                pipe_mask: 0x02,
+                report_every: 1,
+                ack_timeout_us: 400,
+                max_retries: 1,
+            },
+        }
+    }
+
     /// Build a diagnostic poll config with no in-slot retries.
     pub const fn diagnostic(
         slot_length_us: u32,
@@ -1810,6 +1890,10 @@ impl PtxPollConfig {
             ack_timeout_us: 400,
             max_retries: 0,
         }
+    }
+
+    pub const fn pipe_count(self) -> u32 {
+        self.pipe_mask.count_ones()
     }
 
     fn validate(self) -> Result<(), Error> {
@@ -1867,13 +1951,8 @@ impl PtxPollSession {
             }
 
             let counters = state.counters.saturating_sub(self.last_counters);
-            let mut tx_per_pipe = [0u32; NUM_PIPES];
-            let mut ack_per_pipe = [0u32; NUM_PIPES];
-            for i in 0..NUM_PIPES {
-                tx_per_pipe[i] = state.tx_per_pipe[i].saturating_sub(self.last_tx_per_pipe[i]);
-                ack_per_pipe[i] =
-                    state.ack_ok_per_pipe[i].saturating_sub(self.last_ack_per_pipe[i]);
-            }
+            let tx_per_pipe = delta_per_pipe(&state.tx_per_pipe, &self.last_tx_per_pipe);
+            let ack_per_pipe = delta_per_pipe(&state.ack_ok_per_pipe, &self.last_ack_per_pipe);
 
             let result = PtxPollResult {
                 counters,

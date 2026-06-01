@@ -1,0 +1,154 @@
+//! Pure helpers shared by MPSL diagnostic code.
+//!
+//! This module intentionally has no `nrf-mpsl` or PAC dependency so protocol
+//! rules used by the MPSL diagnostics can be covered by host-side tests.
+
+use crate::header::EsbHeader;
+
+pub(crate) const NUM_PIPES: usize = 8;
+
+pub(crate) const fn advance_pid(pid: u8) -> u8 {
+    pid.wrapping_add(1) & 0x03
+}
+
+pub(crate) fn next_pipe_in_mask(current: u8, mask: u8) -> Option<u8> {
+    if mask == 0 {
+        return None;
+    }
+
+    let mut next = current;
+    for _ in 0..NUM_PIPES {
+        next = (next + 1) % NUM_PIPES as u8;
+        if mask & (1 << next) != 0 {
+            return Some(next);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn write_counter_packet(buf: &mut [u8; 256], pid: u8, counter: u32) {
+    let header = unsafe { &mut *(buf.as_mut_ptr().cast::<EsbHeader>()) };
+    header.length = 4;
+    header.pid_no_ack = 0;
+    header.set_pid(pid);
+    header.set_no_ack(false);
+
+    let p = EsbHeader::PAYLOAD_OFFSET;
+    buf[p..p + 4].copy_from_slice(&counter.to_le_bytes());
+}
+
+pub(crate) fn read_counter_payload(buf: &[u8]) -> Option<u32> {
+    let dma = EsbHeader::DMA_OFFSET;
+    let payload = EsbHeader::PAYLOAD_OFFSET;
+    if buf.get(dma).copied()? < 4 || buf.len() < payload + 4 {
+        return None;
+    }
+
+    Some(u32::from_le_bytes([
+        buf[payload],
+        buf[payload + 1],
+        buf[payload + 2],
+        buf[payload + 3],
+    ]))
+}
+
+pub(crate) fn delta_per_pipe(
+    current: &[u32; NUM_PIPES],
+    previous: &[u32; NUM_PIPES],
+) -> [u32; NUM_PIPES] {
+    let mut out = [0u32; NUM_PIPES];
+    for i in 0..NUM_PIPES {
+        out[i] = current[i].saturating_sub(previous[i]);
+    }
+    out
+}
+
+pub(crate) fn spin_until(mut condition: impl FnMut() -> bool, limit: u32) -> bool {
+    let mut spins = 0;
+    let mut done = condition();
+    while !done && spins < limit {
+        spins += 1;
+        done = condition();
+    }
+    done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
+        spin_until, write_counter_packet,
+    };
+    use crate::header::EsbHeader;
+
+    #[test]
+    fn pid_advances_in_two_bit_space() {
+        assert_eq!(advance_pid(0), 1);
+        assert_eq!(advance_pid(1), 2);
+        assert_eq!(advance_pid(2), 3);
+        assert_eq!(advance_pid(3), 0);
+        assert_eq!(advance_pid(7), 0);
+    }
+
+    #[test]
+    fn pipe_mask_round_robin_wraps_and_rejects_empty_mask() {
+        assert_eq!(next_pipe_in_mask(0, 0), None);
+        assert_eq!(next_pipe_in_mask(0, 0b0000_0110), Some(1));
+        assert_eq!(next_pipe_in_mask(1, 0b0000_0110), Some(2));
+        assert_eq!(next_pipe_in_mask(2, 0b0000_0110), Some(1));
+        assert_eq!(next_pipe_in_mask(7, 0b0000_0010), Some(1));
+    }
+
+    #[test]
+    fn counter_packet_uses_header_helpers_and_little_endian_payload() {
+        let mut buf = [0u8; 256];
+
+        write_counter_packet(&mut buf, 2, 0x4433_2211);
+
+        let header = unsafe { &*(buf.as_ptr().cast::<EsbHeader>()) };
+        assert_eq!(header.length, 4);
+        assert_eq!(header.pid(), 2);
+        assert!(!header.no_ack());
+        assert_eq!(read_counter_payload(&buf), Some(0x4433_2211));
+    }
+
+    #[test]
+    fn counter_payload_rejects_short_buffers_or_short_payloads() {
+        let mut buf = [0u8; 8];
+        buf[EsbHeader::DMA_OFFSET] = 3;
+        assert_eq!(read_counter_payload(&buf), None);
+        assert_eq!(
+            read_counter_payload(&buf[..EsbHeader::PAYLOAD_OFFSET + 3]),
+            None
+        );
+    }
+
+    #[test]
+    fn per_pipe_delta_saturates() {
+        let current = [10, 0, 5, 1, 2, 3, 4, 5];
+        let previous = [4, 1, 10, 1, 0, 10, 4, 6];
+        assert_eq!(
+            delta_per_pipe(&current, &previous),
+            [6, 0, 0, 0, 2, 0, 0, 0]
+        );
+        assert_eq!(
+            delta_per_pipe(&[0; NUM_PIPES], &[1; NUM_PIPES]),
+            [0; NUM_PIPES]
+        );
+    }
+
+    #[test]
+    fn spin_until_returns_false_at_limit_and_true_when_condition_flips() {
+        assert!(!spin_until(|| false, 3));
+
+        let mut polls = 0;
+        assert!(spin_until(
+            || {
+                polls += 1;
+                polls == 3
+            },
+            5
+        ));
+    }
+}

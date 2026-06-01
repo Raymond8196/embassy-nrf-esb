@@ -40,7 +40,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{PtxPollConfig, open_ptx_poll_session};
+use embassy_nrf_esb::mpsl_timeslot::{CoexistenceProfile, PtxPollConfig, open_ptx_poll_session};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -300,11 +300,7 @@ impl core::fmt::Write for WriteBuf<'_> {
     }
 }
 
-const SLOT_US: u32 = 1500;
-const MATCH_US: u32 = 1300;
-const PIPE_MASK: u8 = 0b0000_0010; // pipe 1 only
-const NUM_PIPES_IN_MASK: u32 = 1;
-const REPORT_EVERY: u32 = 1; // report after each poll
+const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1;
 const ACK_TIMEOUT_US: u32 = 400;
 const MAX_RETRIES: u8 = 0; // keep misses visible in diagnostic counters
 
@@ -395,7 +391,7 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let mut poll_cfg = PtxPollConfig::diagnostic(SLOT_US, MATCH_US, PIPE_MASK, REPORT_EVERY);
+    let mut poll_cfg = PtxPollConfig::for_profile(PROFILE);
     poll_cfg.ack_timeout_us = ACK_TIMEOUT_US;
     poll_cfg.max_retries = MAX_RETRIES;
 
@@ -410,8 +406,8 @@ async fn main(spawner: Spawner) {
 
     defmt::info!(
         "PTX poll session started ({} pipes, {}µs slot)",
-        NUM_PIPES_IN_MASK,
-        SLOT_US
+        poll_cfg.pipe_count(),
+        poll_cfg.slot_length_us
     );
     log(b"[POLL] started\r\n");
 
@@ -432,7 +428,7 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "r={} tx={} ack={} to={} crc={} s={} t0={} rd={}",
+            "r={} tx={} ack={} to={} crc={} s={} t0={} rd={} dt={}",
             round,
             r.tx_count,
             r.ack_ok_count,
@@ -441,9 +437,10 @@ async fn main(spawner: Spawner) {
             r.counters.start,
             r.counters.timer0,
             r.counters.radio,
+            r.counters.radio_disable_timeout,
         );
         for i in 0..8 {
-            if PIPE_MASK & (1 << i) != 0 {
+            if poll_cfg.pipe_mask & (1 << i) != 0 {
                 let _ = write!(w, " p{}:{}/{}", i, r.ack_per_pipe[i], r.tx_per_pipe[i]);
             }
         }
@@ -457,7 +454,7 @@ async fn main(spawner: Spawner) {
                 w2,
                 "[HZ] slots={} in ~{}ms\r\n",
                 r.counters.start,
-                r.counters.start * SLOT_US / 1000,
+                r.counters.start * poll_cfg.slot_length_us / 1000,
             );
             let hz_len = w2.pos;
             log(&buf[..hz_len]);
