@@ -40,7 +40,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::open_ptx_poll_session;
+use embassy_nrf_esb::mpsl_timeslot::{PtxPollConfig, open_ptx_poll_session};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -300,11 +300,13 @@ impl core::fmt::Write for WriteBuf<'_> {
     }
 }
 
-const SLOT_US: u32 = 3000;
-const MATCH_US: u32 = 2800;
-const PIPE_MASK: u8 = 0b0000_0110; // pipes 1 and 2 (2 PRX dongles)
-const NUM_PIPES_IN_MASK: u32 = 2;
-const REPORT_EVERY: u32 = NUM_PIPES_IN_MASK; // report after each full round
+const SLOT_US: u32 = 1500;
+const MATCH_US: u32 = 1300;
+const PIPE_MASK: u8 = 0b0000_0010; // pipe 1 only
+const NUM_PIPES_IN_MASK: u32 = 1;
+const REPORT_EVERY: u32 = 1; // report after each poll
+const ACK_TIMEOUT_US: u32 = 400;
+const MAX_RETRIES: u8 = 0; // keep misses visible in diagnostic counters
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -393,15 +395,11 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    let mut poll = match open_ptx_poll_session(
-        mpsl,
-        &esb_cfg,
-        &esb_addr,
-        SLOT_US,
-        MATCH_US,
-        PIPE_MASK,
-        REPORT_EVERY,
-    ) {
+    let mut poll_cfg = PtxPollConfig::diagnostic(SLOT_US, MATCH_US, PIPE_MASK, REPORT_EVERY);
+    poll_cfg.ack_timeout_us = ACK_TIMEOUT_US;
+    poll_cfg.max_retries = MAX_RETRIES;
+
+    let mut poll = match open_ptx_poll_session(mpsl, &esb_cfg, &esb_addr, poll_cfg) {
         Ok(s) => s,
         Err(e) => {
             defmt::error!("open_ptx_poll_session: {:?}", e);
@@ -434,10 +432,12 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "r={} tx={} ack={} s={} t0={} rd={}",
+            "r={} tx={} ack={} to={} crc={} s={} t0={} rd={}",
             round,
             r.tx_count,
             r.ack_ok_count,
+            r.ack_timeout_count,
+            r.ack_crc_fail_count,
             r.counters.start,
             r.counters.timer0,
             r.counters.radio,

@@ -547,6 +547,12 @@ struct PtxInnerState {
     poll_report_ready: bool,
     ack_ok_per_pipe: [u32; NUM_PIPES],
     tx_per_pipe: [u32; NUM_PIPES],
+    retry_count: u8,
+    max_retries: u8,
+    acked_this_slot: bool,
+    ack_timeout_us: u32,
+    ack_timeout_count: u32,
+    ack_crc_fail_count: u32,
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -636,6 +642,12 @@ impl PtxState {
                 poll_report_ready: false,
                 ack_ok_per_pipe: [0; NUM_PIPES],
                 tx_per_pipe: [0; NUM_PIPES],
+                retry_count: 0,
+                max_retries: 3,
+                acked_this_slot: false,
+                ack_timeout_us: 600,
+                ack_timeout_count: 0,
+                ack_crc_fail_count: 0,
             })),
         }
     }
@@ -699,17 +711,24 @@ unsafe extern "C" fn ptx_timeslot_callback(
             let counter = state.tx_count;
             write_counter_packet(tx_buf, state.pid, counter);
 
-            // Arm TIMER0 for slot end.
+            // Arm TIMER0 CC[0] for slot end, CC[1] for ACK timeout.
             let t = pac::TIMER0;
             t.events_compare(0).write_value(0);
+            t.events_compare(1).write_value(0);
             t.cc(0).write_value(state.in_slot_match_us);
-            t.intenset().write(|w| w.set_compare(0, true));
+            t.cc(1).write_value(0xFFFFFFFF);
+            t.intenset().write(|w| {
+                w.set_compare(0, true);
+                w.set_compare(1, true);
+            });
 
             // Trigger TX with ACK.
             let dma_ptr = unsafe { tx_buf.as_mut_ptr().add(dma_off) };
             radio.transmit(state.tx_pipe, dma_ptr, true);
             state.tx_count += 1;
             state.packets_sent_this_slot = 1;
+            state.retry_count = 0;
+            state.acked_this_slot = false;
             if state.poll_pipes > 0 {
                 let pipe = state.tx_pipe as usize;
                 if pipe < NUM_PIPES {
@@ -748,6 +767,13 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     r.packetptr().write_value(dma_ptr as u32);
                     r.shorts().modify(|w| w.set_disabled_rxen(false));
 
+                    let t = pac::TIMER0;
+                    t.tasks_capture(1).write_value(1);
+                    let now = t.cc(1).read();
+                    t.cc(1).write_value(now.wrapping_add(state.ack_timeout_us));
+                    t.events_compare(1).write_value(0);
+                    t.intenset().write(|w| w.set_compare(1, true));
+
                     state.phase = PtxPhase::WaitAck;
                 }
                 PtxPhase::WaitAck if disabled => {
@@ -758,7 +784,12 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     compiler_fence(Ordering::Acquire);
 
                     if crc_ok {
+                        let t = pac::TIMER0;
+                        t.intenclr().write(|w| w.set_compare(1, true));
+                        t.events_compare(1).write_value(0);
+
                         state.ack_ok_count += 1;
+                        state.acked_this_slot = true;
                         if state.poll_pipes > 0 {
                             let pipe = state.tx_pipe as usize;
                             if pipe < NUM_PIPES {
@@ -784,48 +815,25 @@ unsafe extern "C" fn ptx_timeslot_callback(
                         }
                     }
 
-                    state.pid = (state.pid + 1) & 0x03;
-                    state.payload_byte = state.payload_byte.wrapping_add(1);
-                    state.packets_sent_this_slot += 1;
-
-                    if state.packets_sent_this_slot < state.packets_per_slot {
-                        // Send next packet within this slot.
-                        state.phase = PtxPhase::Tx;
-                        let counter = state.tx_count;
-                        state.tx_count += 1;
-
-                        let tx_buf = unsafe { &mut *PTX_BUFS.tx.get() };
-                        let dma_off = crate::header::EsbHeader::DMA_OFFSET;
-                        write_counter_packet(tx_buf, state.pid, counter);
-
-                        r.shorts().modify(|w| w.set_disabled_rxen(true));
-                        r.intenset().write(|w| w.set_disabled(true));
-                        r.txaddress().write(|w| w.set_txaddress(state.tx_pipe));
-                        r.rxaddresses()
-                            .write_value(pac::radio::regs::Rxaddresses(1 << state.tx_pipe));
-                        let dma_ptr = unsafe { tx_buf.as_mut_ptr().add(dma_off) };
-                        r.packetptr().write_value(dma_ptr as u32);
-                        r.events_address().write_value(0);
-                        r.events_disabled().write_value(0);
-                        r.events_ready().write_value(0);
-                        r.events_end().write_value(0);
-                        r.events_payload().write_value(0);
-                        compiler_fence(Ordering::Release);
-                        r.tasks_txen().write_value(1);
-                    } else {
-                        // All packets for this slot done — stop radio.
-                        r.shorts().modify(|w| {
-                            w.set_ready_start(false);
-                            w.set_end_disable(false);
-                        });
-                        r.intenclr().write(|w| w.set_disabled(true));
-                        r.tasks_disable().write_value(1);
-                        while r.events_disabled().read() == 0 {}
-                        r.events_disabled().write_value(0);
-                        compiler_fence(Ordering::Acquire);
-
-                        state.phase = PtxPhase::Done;
+                    if !crc_ok {
+                        state.ack_crc_fail_count += 1;
                     }
+
+                    if state.acked_this_slot {
+                        state.pid = (state.pid + 1) & 0x03;
+                        state.payload_byte = state.payload_byte.wrapping_add(1);
+                    }
+                    r.shorts().modify(|w| {
+                        w.set_ready_start(false);
+                        w.set_end_disable(false);
+                    });
+                    r.intenclr().write(|w| w.set_disabled(true));
+                    r.tasks_disable().write_value(1);
+                    while r.events_disabled().read() == 0 {}
+                    r.events_disabled().write_value(0);
+                    compiler_fence(Ordering::Acquire);
+
+                    state.phase = PtxPhase::Done;
                 }
                 _ => {}
             }
@@ -838,32 +846,70 @@ unsafe extern "C" fn ptx_timeslot_callback(
             state.counters.timer0 += 1;
 
             let t = pac::TIMER0;
-            t.events_compare(0).write_value(0);
-            t.intenclr().write(|w| w.set_compare(0, true));
 
-            // Wind down any in-flight radio op so the slot ends in a clean
-            // state. Otherwise mid-cycle RX (waiting for ACK) would be
-            // clobbered by the next slot's power_cycle.
-            if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
+            // Check CC[1] first: ACK timeout → retry.
+            if t.events_compare(1).read() == 1 && state.phase == PtxPhase::WaitAck {
+                t.events_compare(1).write_value(0);
+                state.ack_timeout_count += 1;
+
                 let r = pac::RADIO;
                 r.shorts().modify(|w| {
                     w.set_ready_start(false);
                     w.set_end_disable(false);
                     w.set_disabled_rxen(false);
-                    w.set_disabled_txen(false);
                 });
                 r.intenclr().write(|w| w.set_disabled(true));
                 r.tasks_disable().write_value(1);
                 while r.events_disabled().read() == 0 {}
                 r.events_disabled().write_value(0);
                 compiler_fence(Ordering::Acquire);
-                state.phase = PtxPhase::Done;
+
+                if state.retry_count < state.max_retries {
+                    state.retry_count += 1;
+                    state.phase = PtxPhase::Tx;
+
+                    let tx_buf = unsafe { &mut *PTX_BUFS.tx.get() };
+                    let dma_off = crate::header::EsbHeader::DMA_OFFSET;
+                    write_counter_packet(tx_buf, state.pid, state.tx_count.wrapping_sub(1));
+
+                    r.shorts().modify(|w| w.set_disabled_rxen(true));
+                    r.intenset().write(|w| w.set_disabled(true));
+                    r.txaddress().write(|w| w.set_txaddress(state.tx_pipe));
+                    r.rxaddresses()
+                        .write_value(pac::radio::regs::Rxaddresses(1 << state.tx_pipe));
+                    let dma_ptr = unsafe { tx_buf.as_mut_ptr().add(dma_off) };
+                    r.packetptr().write_value(dma_ptr as u32);
+                    r.events_address().write_value(0);
+                    r.events_disabled().write_value(0);
+                    r.events_ready().write_value(0);
+                    r.events_end().write_value(0);
+                    r.events_payload().write_value(0);
+                    compiler_fence(Ordering::Release);
+                    r.tasks_txen().write_value(1);
+
+                    t.tasks_capture(1).write_value(1);
+                    let now = t.cc(1).read();
+                    t.cc(1).write_value(now.wrapping_add(state.ack_timeout_us));
+                    t.events_compare(1).write_value(0);
+                    t.intenset().write(|w| w.set_compare(1, true));
+
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                    return &mut state.return_param as *mut _;
+                } else {
+                    state.phase = PtxPhase::Done;
+                    t.intenclr().write(|w| w.set_compare(1, true));
+                }
             }
 
-            let chain = state.target_count > 0 && state.counters.start < state.target_count;
-            let poll_active = state.poll_pipes > 0;
+            // CC[0]: slot end.
+            if t.events_compare(0).read() == 1 {
+                t.events_compare(0).write_value(0);
+                t.intenclr().write(|w| {
+                    w.set_compare(0, true);
+                    w.set_compare(1, true);
+                });
 
-            if poll_active {
                 if state.phase != PtxPhase::Done && state.phase != PtxPhase::Idle {
                     let r = pac::RADIO;
                     r.shorts().modify(|w| {
@@ -873,34 +919,43 @@ unsafe extern "C" fn ptx_timeslot_callback(
                         w.set_disabled_txen(false);
                     });
                     r.intenclr().write(|w| w.set_disabled(true));
-                    r.events_disabled().write_value(0);
                     r.tasks_disable().write_value(1);
-                    let mut spins = 0u32;
-                    while r.events_disabled().read() == 0 && spins < 1000 {
-                        spins += 1;
-                    }
+                    while r.events_disabled().read() == 0 {}
                     r.events_disabled().write_value(0);
                     compiler_fence(Ordering::Acquire);
-                    state.phase = PtxPhase::Idle;
+                    state.phase = PtxPhase::Done;
                 }
 
-                state.poll_slots_since_report += 1;
-                if state.poll_slots_since_report >= state.poll_report_every {
-                    state.poll_slots_since_report = 0;
-                    state.poll_report_ready = true;
-                    state.waker.wake();
-                }
+                let poll_active = state.poll_pipes > 0;
 
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
-            } else if chain {
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
-            } else {
-                state.done = true;
-                state.waker.wake();
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                if poll_active {
+                    state.poll_slots_since_report += 1;
+                    if state.poll_slots_since_report >= state.poll_report_every {
+                        state.poll_slots_since_report = 0;
+                        state.poll_report_ready = true;
+                        state.waker.wake();
+                    }
+
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                    state.return_param.params.request.p_next =
+                        core::ptr::from_mut(&mut state.request);
+                } else {
+                    let chain = state.target_count > 0 && state.counters.start < state.target_count;
+                    if chain {
+                        state.return_param.callback_action =
+                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                        state.return_param.params.request.p_next =
+                            core::ptr::from_mut(&mut state.request);
+                    } else {
+                        state.done = true;
+                        state.waker.wake();
+                        state.return_param.callback_action =
+                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                    }
+                }
             }
+
             &mut state.return_param as *mut _
         }),
 
@@ -948,8 +1003,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 state.counters.overstayed += 1;
                 state.phase = PtxPhase::Idle;
                 if state.poll_pipes > 0 {
-                    state.request.params.earliest.priority =
-                        raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
+                    state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
                     state.request.params.earliest.timeout_us =
                         raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
                     state.return_param.callback_action =
@@ -959,8 +1013,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 } else {
                     state.done = true;
                     state.waker.wake();
-                    state.return_param.callback_action =
-                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                    state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
                 }
                 &mut state.return_param as *mut _
             });
@@ -1717,6 +1770,61 @@ pub struct PtxPollResult {
     pub tx_per_pipe: [u32; NUM_PIPES],
     /// Per-pipe ACK OK count.
     pub ack_per_pipe: [u32; NUM_PIPES],
+    /// ACK wait windows that reached the diagnostic timeout.
+    pub ack_timeout_count: u32,
+    /// ACK packets received with a bad CRC.
+    pub ack_crc_fail_count: u32,
+}
+
+/// Configuration for a long-lived PTX poll session.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PtxPollConfig {
+    /// Timeslot duration per poll.
+    pub slot_length_us: u32,
+    /// TIMER0 compare value within the slot. Must be less than `slot_length_us`.
+    pub in_slot_match_us: u32,
+    /// Bitmask of pipes to poll.
+    pub pipe_mask: u8,
+    /// Number of slots per report.
+    pub report_every: u32,
+    /// ACK wait window after TX completion.
+    pub ack_timeout_us: u32,
+    /// In-slot retries after ACK timeout. Use 0 to keep misses visible.
+    pub max_retries: u8,
+}
+
+impl PtxPollConfig {
+    /// Build a diagnostic poll config with no in-slot retries.
+    pub const fn diagnostic(
+        slot_length_us: u32,
+        in_slot_match_us: u32,
+        pipe_mask: u8,
+        report_every: u32,
+    ) -> Self {
+        Self {
+            slot_length_us,
+            in_slot_match_us,
+            pipe_mask,
+            report_every,
+            ack_timeout_us: 400,
+            max_retries: 0,
+        }
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        if self.slot_length_us == 0
+            || self.in_slot_match_us == 0
+            || self.in_slot_match_us >= self.slot_length_us
+            || self.pipe_mask == 0
+            || self.report_every == 0
+            || self.ack_timeout_us == 0
+        {
+            return Err(Error::InvalidParam);
+        }
+
+        Ok(())
+    }
 }
 
 /// Long-lived PTX poll session that round-robins across pipes.
@@ -1732,6 +1840,8 @@ pub struct PtxPollSession {
     last_ack_ok_count: u32,
     last_tx_per_pipe: [u32; NUM_PIPES],
     last_ack_per_pipe: [u32; NUM_PIPES],
+    last_ack_timeout_count: u32,
+    last_ack_crc_fail_count: u32,
 }
 
 impl PtxPollSession {
@@ -1761,17 +1871,22 @@ impl PtxPollSession {
             let mut ack_per_pipe = [0u32; NUM_PIPES];
             for i in 0..NUM_PIPES {
                 tx_per_pipe[i] = state.tx_per_pipe[i].saturating_sub(self.last_tx_per_pipe[i]);
-                ack_per_pipe[i] = state.ack_ok_per_pipe[i].saturating_sub(self.last_ack_per_pipe[i]);
+                ack_per_pipe[i] =
+                    state.ack_ok_per_pipe[i].saturating_sub(self.last_ack_per_pipe[i]);
             }
 
             let result = PtxPollResult {
                 counters,
                 tx_count: state.tx_count.saturating_sub(self.last_tx_count),
-                ack_ok_count: state
-                    .ack_ok_count
-                    .saturating_sub(self.last_ack_ok_count),
+                ack_ok_count: state.ack_ok_count.saturating_sub(self.last_ack_ok_count),
                 tx_per_pipe,
                 ack_per_pipe,
+                ack_timeout_count: state
+                    .ack_timeout_count
+                    .saturating_sub(self.last_ack_timeout_count),
+                ack_crc_fail_count: state
+                    .ack_crc_fail_count
+                    .saturating_sub(self.last_ack_crc_fail_count),
             };
 
             self.last_counters = state.counters;
@@ -1779,6 +1894,8 @@ impl PtxPollSession {
             self.last_ack_ok_count = state.ack_ok_count;
             self.last_tx_per_pipe = state.tx_per_pipe;
             self.last_ack_per_pipe = state.ack_ok_per_pipe;
+            self.last_ack_timeout_count = state.ack_timeout_count;
+            self.last_ack_crc_fail_count = state.ack_crc_fail_count;
 
             Ok(result)
         })?;
@@ -1795,23 +1912,22 @@ impl Drop for PtxPollSession {
 
 /// Open a long-lived PTX poll session that round-robins across the given pipes.
 ///
-/// - `slot_length_us`: timeslot duration per poll (e.g. 1500 for ~1ms poll).
-/// - `in_slot_match_us`: TIMER0 compare value within slot (should be < slot_length_us).
-/// - `pipe_mask`: bitmask of pipes to poll (e.g. `0b0111_1110` for pipes 1-7).
-/// - `report_every`: number of slots per report (e.g. 7 for one full round).
+/// `poll_config` controls the slot length, pipe mask, report cadence, ACK
+/// timeout, and optional in-slot retries.
 pub fn open_ptx_poll_session(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &EsbConfig,
     addresses: &EsbAddresses,
-    slot_length_us: u32,
-    in_slot_match_us: u32,
-    pipe_mask: u8,
-    report_every: u32,
+    poll_config: PtxPollConfig,
 ) -> Result<PtxPollSession, Error> {
     let busy = PTX_STATE.try_enter()?;
-    if config.payload_length < 4 || pipe_mask == 0 || report_every == 0 {
+    if config.payload_length < 4 {
         drop(busy);
         return Err(Error::InvalidParam);
+    }
+    if let Err(e) = poll_config.validate() {
+        drop(busy);
+        return Err(e);
     }
 
     let mut session_id: u8 = 0;
@@ -1823,13 +1939,13 @@ pub fn open_ptx_poll_session(
         return Err(e);
     }
 
-    let first_pipe = pipe_mask.trailing_zeros() as u8;
+    let first_pipe = poll_config.pipe_mask.trailing_zeros() as u8;
 
     PTX_STATE.with_inner(|state| {
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = 0;
-        state.in_slot_match_us = in_slot_match_us;
+        state.in_slot_match_us = poll_config.in_slot_match_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PtxPhase::Idle;
@@ -1843,17 +1959,21 @@ pub fn open_ptx_poll_session(
         state.ack_inversions = 0;
         state.last_ack_counter = 0;
         state.pid = 0;
-        state.poll_pipes = pipe_mask.count_ones() as u8;
-        state.poll_pipe_mask = pipe_mask;
-        state.poll_report_every = report_every;
+        state.poll_pipes = poll_config.pipe_mask.count_ones() as u8;
+        state.poll_pipe_mask = poll_config.pipe_mask;
+        state.poll_report_every = poll_config.report_every;
         state.poll_slots_since_report = 0;
         state.poll_report_ready = false;
         state.ack_ok_per_pipe = [0; NUM_PIPES];
         state.tx_per_pipe = [0; NUM_PIPES];
+        state.retry_count = 0;
+        state.max_retries = poll_config.max_retries;
+        state.acked_this_slot = false;
+        state.ack_timeout_us = poll_config.ack_timeout_us;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = slot_length_us;
+        state.request.params.earliest.length_us = poll_config.slot_length_us;
         state.request.params.earliest.timeout_us = 1_000_000;
     });
 
@@ -1873,5 +1993,7 @@ pub fn open_ptx_poll_session(
         last_ack_ok_count: 0,
         last_tx_per_pipe: [0; NUM_PIPES],
         last_ack_per_pipe: [0; NUM_PIPES],
+        last_ack_timeout_count: 0,
+        last_ack_crc_fail_count: 0,
     })
 }

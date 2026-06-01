@@ -378,9 +378,82 @@ DONE
   `50 * packets_per_slot`. This points to missing ACK timeout/retry machinery in
   the MPSL diagnostic PTX path, not to the exclusive ESB core.
 
+## 3-Mode Poll Diagnostic
+
+Status date: 2026-06-01.
+
+This section tracks the newer RMK-style 3-mode diagnostic pair:
+`mpsl_3mode_central` on the PRX/main side and `mpsl_3mode_poll` on the PTX
+poller side. It is separate from the older `mpsl_prx_ble` +
+`mpsl_ptx_in_slot` Step 7 checks above.
+
+Latest recorded hardware context from `session-ses_19c3.md`:
+
+- `mpsl_3mode_poll_v7_dfu.zip` was flashed to `/dev/ttyACM0`.
+- `mpsl_3mode_central_v6_dfu.zip` was flashed to `/dev/ttyACM1`.
+- The debugging checklist at that point had completed PRX config review, PTX
+  WaitAck review, pipe/address/frequency comparison, ACK timeout timing fix,
+  and PRX pipe mask fix.
+- Hardware verification was still in progress.
+- PTX CDC output showed intermittent pipe 1 ACK loss, for example:
+
+```text
+r=10936 tx=1 ack=1 s=1 t0=1 rd=2 p1:1/1
+r=10937 tx=1 ack=0 s=1 t0=164 rd=1 p1:0/1
+r=10938 tx=1 ack=1 s=1 t0=1 rd=2 p1:1/1
+```
+
+Current no-hardware diagnostic configuration:
+
+- `mpsl_3mode_poll`: 1500 us slot, 1300 us in-slot match, pipe 1 only
+  (`PIPE_MASK = 0x02`), one report per poll.
+- `mpsl_3mode_central`: batch size 20, 5000 us slot, 4500 us in-slot match,
+  pipe 1 only (`PIPES = 0x02`), no extra ESB idle delay.
+- `PtxPollConfig` now makes ACK timeout and in-slot retry count explicit.
+- The current diagnostic config uses `ack_timeout_us = 400` and
+  `max_retries = 0`, so missed ACKs remain visible as diagnostic counters
+  instead of being hidden by recovered retransmits.
+- `PtxPollResult` reports incremental ACK timeout and ACK CRC-fail counts.
+- PTX log lines now include `to=<ack_timeout_count>` and
+  `crc=<ack_crc_fail_count>`:
+
+```text
+r=<round> tx=<n> ack=<n> to=<n> crc=<n> s=<start> t0=<timer0> rd=<radio> p1:<ack>/<tx>
+```
+
+No-hardware verification on 2026-06-01:
+
+```bash
+cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+cargo check --example mpsl_smoke --features nrf52840,defmt,mpsl
+cargo check --example mpsl_request_basic --features nrf52840,defmt,mpsl
+cargo check --example mpsl_request_chained --features nrf52840,defmt,mpsl
+cargo check --example mpsl_ptx_in_slot --features nrf52840,defmt,mpsl
+cargo check --example mpsl_prx_in_slot --features nrf52840,defmt,mpsl
+cargo check --example mpsl_prx_ble --features nrf52840,defmt,mpsl
+cargo check --example mpsl_ble_connectable --features nrf52840,defmt,mpsl
+cargo check --example mpsl_3mode_poll --features nrf52840,defmt,mpsl
+cargo check --example mpsl_3mode_central --features nrf52840,defmt,mpsl
+cargo check --example mpsl_ptx_continuous --features nrf52840,defmt,mpsl
+```
+
+Result: all commands passed. The `nrf52840,mpsl,_cs-cortex` feature conflict
+check still fails as expected with the explicit compile error. `git diff
+--check` and targeted `rustfmt --check` for the touched MPSL files also pass.
+
+Next hardware pass:
+
+- Flash the current `mpsl_3mode_central` and `mpsl_3mode_poll` together.
+- Capture PTX CDC lines with the new `to=` and `crc=` fields.
+- Use `to > 0` with `crc = 0` as evidence of scheduling/ACK-window misses.
+- Use `crc > 0` as evidence of an ACK packet being received but corrupted.
+- Compare against the previous `t0=164`/`rd=1` miss pattern from the session log.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
+- Re-run the 3-mode poll diagnostic on hardware and classify pipe 1 misses using
+  the new timeout versus CRC-fail counters.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.
