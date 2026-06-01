@@ -570,12 +570,51 @@ Suggested order:
 4. `DiagnosticPipe1LongSlot` to test whether extra slot budget changes both
    `to_rate` and `rd/dt`.
 
+### 2026-06-02 Hardware Profile Sweep
+
+Setup:
+
+- Pulled `feat/mpsl-timeslot` to `4db1e1e`.
+- Rebuilt each profile with
+  `make -B mpsl_3mode_central_dfu.zip mpsl_3mode_poll_dfu.zip FEATURES=nrf52840,defmt,mpsl OBJCOPY=rust-objcopy`.
+- Flashed `mpsl_3mode_central` to `/dev/tty.usbmodemC2A1EFA145C41`
+  and `mpsl_3mode_poll` to `/dev/tty.usbmodemDC08665938A21`.
+- Captured each profile for 180 seconds from app CDC ports
+  `/dev/tty.usbmodem21201` and `/dev/tty.usbmodem21301`.
+
+Summary:
+
+| Profile | Poll ack_rate | Poll to_rate | Poll crc_rate | Poll rd_max | Poll dt_max | Poll p1 ack/tx/to/crc | Central rx | Central dup | Central crc | Central ack_tx | Central rd_max | Central bk/cn/dt | Central p1 rx/dup/crc/ack_tx |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `DiagnosticPipe1` | 0.6533 | 0.3418 | 0.0049 | 2 | 0 | 41232/63110/21570/308 | 43225 | 0 | 26 | 43225 | 70 | 0/0/0 | 43225/0/26/43225 |
+| `DiagnosticPipe1RelaxedAck` | 0.6531 | 0.3418 | 0.0051 | 2 | 0 | 41183/63061/21556/322 | 43171 | 0 | 15 | 43171 | 69 | 0/0/0 | 43171/0/15/43171 |
+| `DiagnosticPipe1Retry1` | 0.6507 | 0.3446 | 0.0047 | 2 | 0 | 41050/63084/21738/296 | 43014 | 0 | 20 | 43014 | 68 | 0/0/0 | 43014/0/20/43014 |
+| `DiagnosticPipe1LongSlot` | 0.6522 | 0.3435 | 0.0044 | 2 | 0 | 26634/40840/14028/178 | 27944 | 0 | 9 | 27944 | 41 | 0/0/0 | 27944/0/9/27944 |
+
+Observations:
+
+- The new diagnostic log format worked in all four profiles, including poll
+  `p1:<ack>/<tx>/<to>/<crc>` and central
+  `p1:<rx>/<dup>/<crc>/<ack_tx>`.
+- `DiagnosticPipe1RelaxedAck` did not improve timeout rate over the baseline:
+  both ended at `to_rate=0.3418`, so the 400 us ACK wait does not appear to be
+  the limiting factor by itself.
+- `DiagnosticPipe1Retry1` did not convert timeouts into ACKs; it ended slightly
+  worse than baseline at `ack_rate=0.6507` and `to_rate=0.3446`.
+- `DiagnosticPipe1LongSlot` also did not reduce timeout rate
+  (`to_rate=0.3435`). It reduced central `rd_max` from about 68-70 to 41, but
+  poll throughput dropped as expected because the PTX slot length doubled.
+- All four profiles kept poll `dt_max=0` and central `bk=0`, `cn=0`, `dt=0`.
+  There was no evidence of blocked/cancelled/disable-timeout accumulation.
+- Comparing poll `p1 tx` to central `p1 rx` shows many more poll attempts than
+  central receives in every profile. Comparing central `p1 ack_tx` to poll
+  `p1 ack` shows central ACK transmissions track received packets, while poll
+  still misses a similar fraction of ACKs. Poll `p1 to` dominates `p1 crc`,
+  so the remaining loss mode is mostly timeout, not CRC fail.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
-- Re-run the 3-mode poll diagnostic on hardware across the diagnostic profile
-  sweep variants and compare `to_rate`, `crc_rate`, per-pipe `to/crc`,
-  central-side `rx/ack_tx`, and `rd/dt/bk/cn`.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.
