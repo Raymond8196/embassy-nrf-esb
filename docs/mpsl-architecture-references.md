@@ -59,6 +59,13 @@ The following ideas have been folded into this repository:
    `rx/dup/crc/ack_tx` so the next hardware run can distinguish missed ACK
    windows from CRC failures and central-side receive/ACK behavior.
 
+5. **Continuous PRX report chaining**
+
+   Long-lived PRX sessions now wake the async report consumer while continuing
+   to request the next timeslot from the callback. This avoids ending the MPSL
+   session every report period and creating a receive gap while task-side code
+   prints logs and submits the next request.
+
 ## Recommended Study Order
 
 1. Read `too1/ncs-esb-ble-mpsl-demo` first for the closest BLE/ESB/MPSL

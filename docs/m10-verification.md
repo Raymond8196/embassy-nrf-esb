@@ -612,9 +612,39 @@ Observations:
   still misses a similar fraction of ACKs. Poll `p1 to` dominates `p1 crc`,
   so the remaining loss mode is mostly timeout, not CRC fail.
 
+Follow-up implementation after profile sweep:
+
+- The four profile variants produced essentially the same timeout rate in the
+  external hardware run summary (`to_rate` stayed around 34% while
+  `bk/cn/dt=0`). That makes ACK wait length, one retry, and longer PTX slot
+  unlikely to be the primary cause.
+- PRX long-lived reporting now keeps chaining timeslots from the TIMER0
+  callback when `report_every` is reached. It marks `report_ready`, wakes the
+  async task, and returns `MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST` instead of
+  ending the session and waiting for task-side re-request.
+- This change is intended to remove the PRX receive gap caused by returning a
+  report through `SESSION_IDLE` before requesting the next PRX slot.
+
+Next hardware check:
+
+1. Rebuild and flash `mpsl_3mode_central` and `mpsl_3mode_poll` with the
+   default `DiagnosticPipe1` profile.
+2. Run a 2-5 minute capture.
+3. Compare the new baseline against the earlier `DiagnosticPipe1`
+   `ack_rate=0.6533`, `to_rate=0.3418`, `crc_rate=0.0049`, `bk/cn/dt=0`.
+4. Use the per-pipe fields to classify the result:
+   - central `p1 rx` far below poll `p1 tx`: PRX receive window is still the
+     likely limiter.
+   - central `p1 ack_tx` far above poll `p1 ack`: ACK return path/timing is the
+     likely limiter.
+   - central `p1 rx` and `ack_tx` both track poll `p1 ack`: PTX packets are
+     mostly arriving only during PRX windows.
+
 ## Pending Work
 
 - Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
+- Re-run the 3-mode poll diagnostic on hardware after the continuous PRX report
+  change and compare the default profile against the earlier sweep baseline.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.

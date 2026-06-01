@@ -1090,6 +1090,7 @@ struct PrxInnerState {
     request: raw::mpsl_timeslot_request_t,
     return_param: raw::mpsl_timeslot_signal_return_param_t,
     in_slot_match_us: u32,
+    request_timeout_us: u32,
     target_count: u32,
     config: Option<EsbConfig>,
     addresses: Option<EsbAddresses>,
@@ -1169,6 +1170,7 @@ impl PrxState {
                     },
                 },
                 in_slot_match_us: 5500,
+                request_timeout_us: 1_000_000,
                 target_count: 0,
                 config: None,
                 addresses: None,
@@ -1417,8 +1419,14 @@ unsafe extern "C" fn prx_timeslot_callback(
             if batch_complete {
                 state.last_report_start = state.counters.start;
                 state.report_ready = true;
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                state.waker.wake();
+                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+                state.request.params.earliest.timeout_us = state.request_timeout_us;
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else if long_session || state.counters.start < state.target_count {
+                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+                state.request.params.earliest.timeout_us = state.request_timeout_us;
                 state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                 state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else {
@@ -1585,7 +1593,6 @@ pub async fn run_prx_slots(
 pub struct PrxSlotSession {
     _busy: BusyGuard,
     session_id: u8,
-    needs_request: bool,
     last_counters: SignalCounters,
     last_rx_count: u32,
     last_dup_count: u32,
@@ -1598,25 +1605,12 @@ pub struct PrxSlotSession {
 
 impl PrxSlotSession {
     pub async fn next_report(&mut self) -> Result<PrxSlotResult, Error> {
-        if self.needs_request {
-            PRX_STATE.with_inner(|state| {
-                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-                state.request.params.earliest.timeout_us = 1_000_000;
-            });
-            let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
-            let ret = unsafe { raw::mpsl_timeslot_request(self.session_id, request) };
-            mpsl_ok(ret)?;
-            self.needs_request = false;
-        }
-
         poll_fn(|cx| {
             PRX_STATE.with_inner(|state| {
                 state.waker.register(cx.waker());
                 if state.done {
                     Poll::Ready(())
-                } else if state.report_ready
-                    && state.counters.session_idle > self.last_counters.session_idle
-                {
+                } else if state.report_ready {
                     state.report_ready = false;
                     Poll::Ready(())
                 } else {
@@ -1662,7 +1656,6 @@ impl PrxSlotSession {
             Ok(result)
         })?;
 
-        self.needs_request = true;
         Ok(result)
     }
 }
@@ -1703,6 +1696,7 @@ pub fn open_prx_session(
         state.done = false;
         state.target_count = 0;
         state.in_slot_match_us = slot_config.in_slot_match_us;
+        state.request_timeout_us = slot_config.request.timeout_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PrxPhase::Idle;
@@ -1741,7 +1735,6 @@ pub fn open_prx_session(
     Ok(PrxSlotSession {
         _busy: busy,
         session_id,
-        needs_request: false,
         last_counters: SignalCounters::ZERO,
         last_rx_count: 0,
         last_dup_count: 0,
