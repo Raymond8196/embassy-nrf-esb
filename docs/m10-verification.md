@@ -451,13 +451,88 @@ Result: all commands passed. The `nrf52840,mpsl,_cs-cortex` feature conflict
 check still fails as expected with the explicit compile error. `git diff
 --check` and targeted `rustfmt --check` for the touched MPSL files also pass.
 
-Next hardware pass:
+Hardware pass on 2026-06-01:
 
-- Flash the current `mpsl_3mode_central` and `mpsl_3mode_poll` together.
-- Capture PTX CDC lines with the new `to=` and `crc=` fields.
-- Use `to > 0` with `crc = 0` as evidence of scheduling/ACK-window misses.
-- Use `crc > 0` as evidence of an ACK packet being received but corrupted.
-- Compare against the previous `t0=164`/`rd=1` miss pattern from the session log.
+- First re-established the exclusive ESB baseline with `prx_usb_dfu.zip` on
+  `/dev/tty.usbmodemC2A1EFA145C41` and `ptx_ack_echo_dfu.zip` on
+  `/dev/tty.usbmodemDC08665938A21`.
+- PTX reached `tx=1200 ack_rx=1199` in a 12 second CDC capture, with
+  monotonic ACK payload data and no observed lost/max-attempt burst.
+- PRX CDC did not emit text during the short capture, but the PTX ACK payload
+  stream confirmed that PRX was receiving and returning ACK payloads.
+- Built current `mpsl_3mode_central_dfu.zip` and `mpsl_3mode_poll_dfu.zip`
+  with `FEATURES=nrf52840,defmt,mpsl OBJCOPY=rust-objcopy`; the local host did
+  not have `arm-none-eabi-objcopy` in `PATH`.
+- Flashed `mpsl_3mode_central` to the first dongle and `mpsl_3mode_poll` to the
+  second dongle while both were in Open DFU Bootloader.
+- App CDC ports re-enumerated as `/dev/tty.usbmodem21201` for central/RX and
+  `/dev/tty.usbmodem21301` for poll/TX.
+
+Central/RX excerpt:
+
+```text
+b=620 rx=30 dup=0 crc=0 p0=0 p1=30 s=20 t0=20 rd=57 bk=0 cn=0 dt=0
+[CUM] rx=10586 p0=0 p1=10586 dup=0 blk=0
+```
+
+Poll/TX excerpt:
+
+```text
+r=17000 tx=1 ack=1 to=0 crc=0 s=1 t0=1 rd=2 dt=0 p1:1/1
+r=17004 tx=1 ack=0 to=1 crc=0 s=1 t0=2 rd=1 dt=0 p1:0/1
+```
+
+Result:
+
+- The profile/radio-helper split does not prevent the 3-mode pair from
+  starting, producing periodic reports, and exchanging pipe 1 packets.
+- `bk/blk=0`, `cn=0`, and `dt=0` in the short sample; no blocked, cancelled, or
+  radio-disable-timeout accumulation was observed.
+- `to` is visible on poll misses and `crc` is only occasional. The short sample
+  is suitable as a smoke result, not a stability result; follow it with a
+  5-10 minute aggregate capture of `ack/to/crc/rd/blk/cn/dt`.
+
+Five minute aggregate capture on 2026-06-01:
+
+- Reused the same flashed `mpsl_3mode_central` and `mpsl_3mode_poll` pair.
+- Captured central/RX from `/dev/tty.usbmodem21201` and poll/TX from
+  `/dev/tty.usbmodem21301` for 300 seconds.
+- Aggregation was done from CDC text lines instead of saving the full raw log.
+
+Poll/TX trend:
+
+```text
+[poll +061s] lines=21016 rounds=102748-123763 tx=21016 ack=13669 to=7186 crc=161 ack_rate=0.6504 to_rate=0.3419 crc_rate=0.0077 rd_sum=34846 rd_avg=1.66 rd_max=2 dt_sum=0 dt_max=0
+[poll +121s] lines=42054 rounds=102748-144801 tx=42054 ack=27317 to=14409 crc=328 ack_rate=0.6496 to_rate=0.3426 crc_rate=0.0078 rd_sum=69699 rd_avg=1.66 rd_max=2 dt_sum=0 dt_max=0
+[poll +181s] lines=63062 rounds=102748-165809 tx=63062 ack=41045 to=21519 crc=498 ack_rate=0.6509 to_rate=0.3412 crc_rate=0.0079 rd_sum=104605 rd_avg=1.66 rd_max=2 dt_sum=0 dt_max=0
+[poll +241s] lines=84084 rounds=102748-186831 tx=84084 ack=54734 to=28671 crc=679 ack_rate=0.6509 to_rate=0.3410 crc_rate=0.0081 rd_sum=139497 rd_avg=1.66 rd_max=2 dt_sum=0 dt_max=0
+[poll final] lines=105096 rounds=102748-207843 tx=105096 ack=68394 to=35854 crc=848 ack_rate=0.6508 to_rate=0.3412 crc_rate=0.0081 rd_sum=174338 rd_avg=1.66 rd_max=2 dt_sum=0 dt_max=0
+```
+
+Central/RX trend:
+
+```text
+[central +061s] lines=480 blocks=2611-3090 rx=14426 p0=0 p1=14426 dup=0 crc=4 crc_per_rx=0.00028 rd_sum=28184 rd_avg=58.72 rd_max=68 bk=0 cn=0 dt_sum=0 dt_max=0
+[central +121s] lines=959 blocks=2611-3569 rx=28764 p0=0 p1=28764 dup=0 crc=14 crc_per_rx=0.00049 rd_sum=56253 rd_avg=58.66 rd_max=69 bk=0 cn=0 dt_sum=0 dt_max=0
+[central +181s] lines=1438 blocks=2611-4048 rx=43221 p0=0 p1=43221 dup=0 crc=22 crc_per_rx=0.00051 rd_sum=84512 rd_avg=58.77 rd_max=70 bk=0 cn=0 dt_sum=0 dt_max=0
+[central +241s] lines=1916 blocks=2611-4526 rx=57588 p0=0 p1=57588 dup=0 crc=33 crc_per_rx=0.00057 rd_sum=112606 rd_avg=58.77 rd_max=72 bk=0 cn=0 dt_sum=0 dt_max=0
+[central final] lines=2395 blocks=2611-5005 rx=71939 p0=0 p1=71939 dup=0 crc=42 crc_per_rx=0.00058 rd_sum=140688 rd_avg=58.74 rd_max=72 bk=0 cn=0 dt_sum=0 dt_max=0
+```
+
+Result:
+
+- Poll timeout ratio was stable across the run: about 34.1-34.3% at each
+  minute boundary, with final `to_rate=0.3412`.
+- Poll ACK CRC-fail ratio was low and stable, ending at `crc_rate=0.0081`.
+- Poll `rd` stayed bounded (`rd_avg=1.66`, `rd_max=2`) and
+  `radio_disable_timeout` stayed at zero.
+- Central/RX `rd` stayed bounded around the same average across the run
+  (`rd_avg=58.66-58.77`, `rd_max=72`) rather than increasing monotonically.
+- Central/RX `bk=0`, `cn=0`, and `dt=0` throughout the capture; no blocked,
+  cancelled, or radio-disable-timeout accumulation was observed.
+- The remaining misses are stable ACK-window misses in the current diagnostic
+  profile, not an obvious profile/radio-helper regression or runaway MPSL
+  scheduling failure.
 
 ## Pending Work
 
