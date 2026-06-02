@@ -43,8 +43,8 @@ use crate::mpsl_common::{
     write_counter_packet, write_counter_schedule_packet,
 };
 pub use crate::mpsl_profile::{
-    BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxSlotConfig, PtxPollConfig,
-    PtxScheduleGateConfig, PtxScheduleMode, TimeslotRequestConfig,
+    BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxSlotConfig, PtxEventConfig,
+    PtxPollConfig, PtxScheduleGateConfig, PtxScheduleMode, TimeslotRequestConfig,
 };
 pub use crate::mpsl_radio::{RadioDisableResult, RadioQuiesceResult, RadioRecoveryPolicy};
 use crate::mpsl_radio::{disable_radio_bounded, quiesce_radio_before_timeslot_end};
@@ -590,6 +590,10 @@ struct PtxInnerState {
     ack_crc_fail_count: u32,
     ack_timeout_per_pipe: [u32; NUM_PIPES],
     ack_crc_fail_per_pipe: [u32; NUM_PIPES],
+    event_mode: bool,
+    event_pending: bool,
+    event_result_ready: bool,
+    event_ack_ok: bool,
 }
 
 unsafe impl Send for PtxInnerState {}
@@ -770,6 +774,10 @@ impl PtxState {
                 ack_crc_fail_count: 0,
                 ack_timeout_per_pipe: [0; NUM_PIPES],
                 ack_crc_fail_per_pipe: [0; NUM_PIPES],
+                event_mode: false,
+                event_pending: false,
+                event_result_ready: false,
+                event_ack_ok: false,
             })),
         }
     }
@@ -793,6 +801,13 @@ unsafe extern "C" fn ptx_timeslot_callback(
     match signal {
         raw::MPSL_TIMESLOT_SIGNAL_START => PTX_STATE.with_inner(|state| {
             state.counters.start += 1;
+
+            if state.event_mode && !state.event_pending {
+                state.return_param.callback_action =
+                    raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                return &mut state.return_param as *mut _;
+            }
+
             state.phase = PtxPhase::Tx;
 
             let (Some(config), Some(addresses)) = (state.config.as_ref(), state.addresses.as_ref())
@@ -1069,8 +1084,16 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 }
 
                 let poll_active = state.poll_pipes > 0;
+                let event_active = state.event_mode;
 
-                if poll_active {
+                if event_active {
+                    state.event_result_ready = true;
+                    state.event_pending = false;
+                    state.event_ack_ok = state.acked_this_slot;
+                    state.waker.wake();
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                } else if poll_active {
                     state.poll_slots_since_report += 1;
                     if state.poll_slots_since_report >= state.poll_report_every {
                         state.poll_slots_since_report = 0;
@@ -1199,9 +1222,18 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     state.return_param.params.request.p_next =
                         core::ptr::from_mut(&mut state.request);
                 } else {
-                    state.done = true;
-                    state.waker.wake();
-                    state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                    if state.event_mode {
+                        state.event_result_ready = true;
+                        state.event_pending = false;
+                        state.event_ack_ok = false;
+                        state.waker.wake();
+                        state.return_param.callback_action =
+                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                    } else {
+                        state.done = true;
+                        state.waker.wake();
+                        state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                    }
                 }
                 &mut state.return_param as *mut _
             });
@@ -2329,4 +2361,196 @@ pub fn open_ptx_poll_session(
         last_ack_timeout_per_pipe: [0; NUM_PIPES],
         last_ack_crc_fail_per_pipe: [0; NUM_PIPES],
     })
+}
+
+// ---- Event-driven PTX ----
+
+/// Result of a single event-driven PTX send attempt.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PtxSendResult {
+    /// Whether the packet was ACKed by the PRX.
+    pub ack_ok: bool,
+    /// Cumulative signal counters.
+    pub counters: SignalCounters,
+}
+
+/// A long-lived event-driven PTX session.
+///
+/// The session keeps the MPSL timeslot session open but does **not**
+/// continuously chain slots. Instead, each `send()` call requests one
+/// timeslot, transmits the pending payload, and returns the ACK result.
+///
+/// If ACK is not received, the caller should retry by calling `send()`
+/// again after a short delay to align with the next PRX receive window.
+pub struct PtxEventSession {
+    _busy: BusyGuard,
+    session_id: u8,
+    pid: u8,
+    tx_count: u32,
+    last_counters: SignalCounters,
+}
+
+/// Open an event-driven PTX session.
+///
+/// Unlike `open_ptx_poll_session`, this does **not** start sending
+/// immediately. The caller calls `send()` when a key event (or other
+/// application event) triggers a transmission.
+pub fn open_event_session(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    event_config: PtxEventConfig,
+) -> Result<PtxEventSession, Error> {
+    let busy = PTX_STATE.try_enter()?;
+    if config.payload_length < 4 {
+        drop(busy);
+        return Err(Error::InvalidParam);
+    }
+    if let Err(e) = event_config.validate() {
+        drop(busy);
+        return Err(e);
+    }
+
+    let mut session_id: u8 = 0;
+    let ret = unsafe {
+        raw::mpsl_timeslot_session_open(Some(ptx_timeslot_callback), (&mut session_id) as *mut _)
+    };
+    if let Err(e) = mpsl_ok(ret) {
+        drop(busy);
+        return Err(e);
+    }
+
+    PTX_STATE.with_inner(|state| {
+        state.counters = SignalCounters::ZERO;
+        state.done = false;
+        state.target_count = 0;
+        state.in_slot_match_us = event_config.in_slot_match_us;
+        state.config = Some(config.clone());
+        state.addresses = Some(addresses.clone());
+        state.phase = PtxPhase::Idle;
+        state.tx_count = 0;
+        state.ack_ok_count = 0;
+        state.tx_pipe = event_config.pipe;
+        state.payload_byte = 0;
+        state.packets_per_slot = 1;
+        state.packets_sent_this_slot = 0;
+        state.ack_payload_count = 0;
+        state.ack_inversions = 0;
+        state.last_ack_counter = 0;
+        state.pid = 0;
+        state.poll_pipes = 0;
+        state.poll_pipe_mask = 0;
+        state.poll_report_every = 0;
+        state.poll_slots_since_report = 0;
+        state.poll_report_ready = false;
+        state.ack_ok_per_pipe = [0; NUM_PIPES];
+        state.tx_per_pipe = [0; NUM_PIPES];
+        state.ack_timeout_per_pipe = [0; NUM_PIPES];
+        state.ack_crc_fail_per_pipe = [0; NUM_PIPES];
+        state.retry_count = 0;
+        state.max_retries = event_config.max_retries;
+        state.acked_this_slot = false;
+        state.ack_timeout_us = event_config.ack_timeout_us;
+        state.event_mode = true;
+        state.event_pending = false;
+        state.event_result_ready = false;
+        state.event_ack_ok = false;
+        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+        state.request.params.earliest.length_us = event_config.slot_length_us;
+        state.request.params.earliest.timeout_us = event_config.request.timeout_us;
+    });
+
+    Ok(PtxEventSession {
+        _busy: busy,
+        session_id,
+        pid: 0,
+        tx_count: 0,
+        last_counters: SignalCounters::ZERO,
+    })
+}
+
+impl PtxEventSession {
+    /// Send a key report payload and wait for ACK.
+    ///
+    /// `payload` is written into the ESB TX buffer starting at the
+    /// payload offset. The first byte after the ESB header will be
+    /// the payload length seen by the PRX.
+    ///
+    /// If ACK is not received within the timeslot (including in-slot
+    /// retries), returns `ack_ok: false`. The caller should retry.
+    pub async fn send(&mut self, payload: &[u8]) -> Result<PtxSendResult, Error> {
+        let max_payload = PTX_STATE.with_inner(|state| {
+            state.config.as_ref().map(|c| c.payload_length as usize).unwrap_or(0)
+        });
+        if payload.len() > max_payload {
+            return Err(Error::InvalidParam);
+        }
+
+        PTX_STATE.with_inner(|state| {
+            let tx_buf = unsafe { &mut *PTX_BUFS.tx.get() };
+            write_counter_packet(tx_buf, self.pid, self.tx_count);
+            let p_off = EsbHeader::PAYLOAD_OFFSET;
+            let plen = payload.len().min(max_payload);
+            tx_buf[p_off + 4..p_off + 4 + plen].copy_from_slice(&payload[..plen]);
+            let header = unsafe { &mut *(tx_buf.as_mut_ptr().cast::<EsbHeader>()) };
+            header.length = (4 + plen) as u8;
+
+            state.event_pending = true;
+            state.event_result_ready = false;
+            state.event_ack_ok = false;
+            state.done = false;
+            state.counters = SignalCounters::ZERO;
+        });
+
+        let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+        let ret = unsafe { raw::mpsl_timeslot_request(self.session_id, request) };
+        mpsl_ok(ret)?;
+
+        poll_fn(|cx| {
+            PTX_STATE.with_inner(|state| {
+                state.waker.register(cx.waker());
+                if state.event_result_ready || state.done {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await;
+
+        let result = PTX_STATE.with_inner(|state| {
+            if state.done && !state.event_result_ready {
+                return Err(Error::Mpsl);
+            }
+
+            let ack_ok = state.event_ack_ok;
+            if ack_ok {
+                self.pid = advance_pid(self.pid);
+            }
+            self.tx_count += 1;
+
+            let counters = state.counters.saturating_sub(self.last_counters);
+            self.last_counters = state.counters;
+
+            state.event_result_ready = false;
+            state.event_pending = false;
+
+            Ok(PtxSendResult { ack_ok, counters })
+        })?;
+
+        Ok(result)
+    }
+}
+
+impl Drop for PtxEventSession {
+    fn drop(&mut self) {
+        PTX_STATE.with_inner(|state| {
+            state.event_mode = false;
+            state.event_pending = false;
+        });
+        let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
+    }
 }

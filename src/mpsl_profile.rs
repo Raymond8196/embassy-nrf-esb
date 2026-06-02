@@ -254,12 +254,54 @@ impl PtxPollConfig {
     }
 }
 
+/// Configuration for an event-driven PTX session.
+///
+/// Unlike `PtxPollConfig`, this does not auto-chain timeslots.
+/// Each `send()` call requests one timeslot on demand.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PtxEventConfig {
+    /// Timeslot duration per send attempt.
+    pub slot_length_us: u32,
+    /// TIMER0 compare value within the slot.
+    pub in_slot_match_us: u32,
+    /// Target ESB pipe for transmissions.
+    pub pipe: u8,
+    /// ACK wait window after TX completion.
+    pub ack_timeout_us: u32,
+    /// In-slot retries after ACK timeout.
+    pub max_retries: u8,
+    /// Timeslot request policy.
+    pub request: TimeslotRequestConfig,
+}
+
+impl PtxEventConfig {
+    pub const fn for_profile(profile: CoexistenceProfile) -> Self {
+        CoexistenceProfileConfig::for_profile(profile).ptx_event
+    }
+
+    pub fn validate(self) -> Result<(), Error> {
+        if self.slot_length_us == 0
+            || self.in_slot_match_us == 0
+            || self.in_slot_match_us >= self.slot_length_us
+            || self.pipe >= 8
+            || self.ack_timeout_us == 0
+        {
+            return Err(Error::InvalidParam);
+        }
+
+        self.request.validate()?;
+        Ok(())
+    }
+}
+
 /// Single source for the PRX/PTX/MPSL assumptions attached to a named profile.
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CoexistenceProfileConfig {
     pub prx: PrxSlotConfig,
     pub ptx: PtxPollConfig,
+    pub ptx_event: PtxEventConfig,
     pub ble_hint: BleCoexistenceHint,
 }
 
@@ -267,6 +309,15 @@ impl CoexistenceProfileConfig {
     pub const fn for_profile(profile: CoexistenceProfile) -> Self {
         let request = TimeslotRequestConfig::diagnostic_default();
         let recovery = RadioRecoveryPolicy::ForceResetAfterBoundedDisable;
+
+        let ptx_event = PtxEventConfig {
+            slot_length_us: 1500,
+            in_slot_match_us: 1300,
+            pipe: 1,
+            ack_timeout_us: 400,
+            max_retries: 0,
+            request,
+        };
 
         match profile {
             CoexistenceProfile::DiagnosticPipe1 => Self {
@@ -288,6 +339,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe1RelaxedAck => Self {
@@ -308,6 +360,10 @@ impl CoexistenceProfileConfig {
                     max_retries: 0,
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event: PtxEventConfig {
+                    ack_timeout_us: 600,
+                    ..ptx_event
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -330,6 +386,10 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event: PtxEventConfig {
+                    max_retries: 1,
+                    ..ptx_event
+                },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe1LongSlot => Self {
@@ -350,6 +410,13 @@ impl CoexistenceProfileConfig {
                     max_retries: 1,
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event: PtxEventConfig {
+                    slot_length_us: 3000,
+                    in_slot_match_us: 2800,
+                    ack_timeout_us: 600,
+                    max_retries: 1,
+                    ..ptx_event
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -372,6 +439,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe2ScheduledGate => Self {
@@ -393,6 +461,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe5ScheduledGate => Self {
@@ -413,6 +482,13 @@ impl CoexistenceProfileConfig {
                     max_retries: 1,
                     request,
                     schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
+                },
+                ptx_event: PtxEventConfig {
+                    slot_length_us: 3000,
+                    in_slot_match_us: 2800,
+                    ack_timeout_us: 600,
+                    max_retries: 1,
+                    ..ptx_event
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -435,6 +511,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe1Prx12ms => Self {
@@ -456,6 +533,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::DiagnosticPipe1Prx20ms => Self {
@@ -477,6 +555,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
             CoexistenceProfile::AdvertisingCoexistence => Self {
@@ -497,6 +576,11 @@ impl CoexistenceProfileConfig {
                     max_retries: 0,
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event: PtxEventConfig {
+                    slot_length_us: 3000,
+                    in_slot_match_us: 2800,
+                    ..ptx_event
                 },
                 ble_hint: BleCoexistenceHint::AdvertisingVisible,
             },
@@ -519,6 +603,7 @@ impl CoexistenceProfileConfig {
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
+                ptx_event,
                 ble_hint: BleCoexistenceHint::ConnectedRelaxed,
             },
             CoexistenceProfile::RmkKeyboardLowLatency => Self {
@@ -539,6 +624,12 @@ impl CoexistenceProfileConfig {
                     max_retries: 1,
                     request,
                     schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event: PtxEventConfig {
+                    slot_length_us: 3000,
+                    in_slot_match_us: 2800,
+                    max_retries: 1,
+                    ..ptx_event
                 },
                 ble_hint: BleCoexistenceHint::RmkKeyboardLowLatency,
             },

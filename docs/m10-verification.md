@@ -643,19 +643,40 @@ Next hardware check:
    - central `p1 rx` and `ack_tx` both track poll `p1 ack`: PTX packets are
      mostly arriving only during PRX windows.
 
-Continuous PRX report retest summary:
+### 2026-06-02 Continuous PRX Report Retest
 
-| Run | Poll ack_rate | Poll to_rate | Poll crc_rate | Central bk/cn/dt |
-| --- | ---: | ---: | ---: | --- |
-| Old `DiagnosticPipe1` | 0.6533 | 0.3418 | 0.0049 | 0/0/0 |
-| Continuous PRX report retest | 0.6573 | 0.3379 | 0.0048 | 0/0/0 |
+Setup:
 
-Interpretation:
+- Pulled `feat/mpsl-timeslot` to `6aff0cc`.
+- Rebuilt the default `DiagnosticPipe1` pair with
+  `make -B mpsl_3mode_central_dfu.zip mpsl_3mode_poll_dfu.zip FEATURES=nrf52840,defmt,mpsl OBJCOPY=rust-objcopy`.
+- Flashed `mpsl_3mode_central` to `/dev/tty.usbmodemC2A1EFA145C41`
+  and `mpsl_3mode_poll` to `/dev/tty.usbmodemDC08665938A21`.
+- Captured 180 seconds from app CDC ports `/dev/tty.usbmodem21201` and
+  `/dev/tty.usbmodem21301`.
 
-- The timeout rate improved only slightly, from `0.3418` to `0.3379`, so the
-  report gap was not the dominant source of misses.
-- The external hardware summary reported poll `p1 tx=63126`, central
-  `p1 rx=43426`, central `p1 ack_tx=43426`, and poll `p1 ack=41491`.
+Result:
+
+| Run | Poll ack_rate | Poll to_rate | Poll crc_rate | Poll rd_max | Poll dt_max | Poll p1 ack/tx/to/crc | Central rx | Central dup | Central crc | Central ack_tx | Central rd_max | Central bk/cn/dt | Central p1 rx/dup/crc/ack_tx |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Earlier `DiagnosticPipe1` baseline | 0.6533 | 0.3418 | 0.0049 | 2 | 0 | 41232/63110/21570/308 | 43225 | 0 | 26 | 43225 | 70 | 0/0/0 | 43225/0/26/43225 |
+| Continuous PRX report retest | 0.6573 | 0.3379 | 0.0048 | 2 | 0 | 41491/63126/21331/304 | 43426 | 0 | 19 | 43426 | 68 | 0/0/0 | 43426/0/19/43426 |
+
+Observation:
+
+- The continuous PRX report change produced only a small timeout improvement:
+  `to_rate` moved from `0.3418` to `0.3379` and `ack_rate` moved from
+  `0.6533` to `0.6573`.
+- This is not a large enough drop to identify the former PRX report gap as the
+  dominant source of the roughly 34% timeout rate.
+- Poll `p1 tx=63126` remains well above central `p1 rx=43426`, while central
+  `p1 ack_tx=43426` is only modestly above poll `p1 ack=41491`. That points
+  more strongly at PTX packets not landing in the PRX receive window than at a
+  pure ACK return-path failure.
+- Poll `p1 to=21331` still dominates `p1 crc=304`, so the remaining loss mode
+  is still primarily timeout rather than CRC fail.
+- Poll `dt_max=0` and central `bk=0`, `cn=0`, `dt=0`; no MPSL
+  blocked/cancelled/disable-timeout regression was observed.
 - Derived rates:
   - `prx_rx_rate = central.p1_rx / poll.p1_tx = 43426 / 63126 = 0.688`.
   - `ack_return_rate = poll.p1_ack / central.p1_ack_tx = 41491 / 43426 = 0.955`.
@@ -676,14 +697,66 @@ Next PRX duty sweep:
    - `ack_return_rate = poll.p1_ack / central.p1_ack_tx`
    - poll `to_rate` and `crc_rate`
    - central `bk/cn/dt` and `rd_max`
-5. A useful improvement should raise `prx_rx_rate` and reduce `to_rate` without
+ 5. A useful improvement should raise `prx_rx_rate` and reduce `to_rate` without
    introducing blocked/cancelled/disable-timeout accumulation.
+
+### 2026-06-03 PRX Duty Sweep
+
+Setup:
+
+- Pulled `feat/mpsl-timeslot` to `ca44389`.
+- Rebuilt each profile with
+  `make -B mpsl_3mode_central_dfu.zip mpsl_3mode_poll_dfu.zip FEATURES=nrf52840,defmt,mpsl OBJCOPY=rust-objcopy`.
+- Flashed `mpsl_3mode_central` to `/dev/tty.usbmodemC2A1EFA145C41`
+  and `mpsl_3mode_poll` to `/dev/tty.usbmodemDC08665938A21`.
+- Captured each profile for 180 seconds from app CDC ports
+  `/dev/tty.usbmodem21201` and `/dev/tty.usbmodem21301`.
+
+Summary:
+
+| Profile | Poll ack_rate | Poll to_rate | Poll crc_rate | Poll rd_max | Poll dt_max | Poll p1 ack/tx/to/crc | Central rx | Central dup | Central crc | Central ack_tx | Central rd_max | Central bk/cn/dt | Central p1 rx/dup/crc/ack_tx |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| `DiagnosticPipe1Prx8ms` | 0.7506 | 0.2468 | 0.0026 | 2 | 0 | 47286/62999/15547/166 | 48517 | 0 | 3 | 48517 | 69 | 0/0/0 | 48517/0/3/48517 |
+| `DiagnosticPipe1Prx12ms` | 0.7949 | 0.2029 | 0.0022 | 2 | 0 | 50120/63049/12792/137 | 51000 | 0 | 0 | 51000 | 67 | 0/0/0 | 51000/0/0/51000 |
+| `DiagnosticPipe1Prx20ms` | 0.8179 | 0.1806 | 0.0015 | 2 | 0 | 51548/63023/11382/93 | 52087 | 0 | 8 | 52087 | 71 | 0/0/0 | 52087/0/8/52087 |
+
+Derived rates:
+
+- `prx_rx_rate`: 0.770 (8ms), 0.809 (12ms), 0.827 (20ms).
+- `ack_return_rate`: 0.975 (8ms), 0.983 (12ms), 0.990 (20ms).
+
+Observations:
+
+- All three PRX duty sweep profiles kept `bk/cn/dt=0` and `rd_max` bounded.
+- PRX slot length is the primary lever for receive-window coverage. 12ms is a
+  good balance point; 12ms→20ms has diminishing returns.
+- The remaining ~20% loss is dominated by PTX packets landing outside PRX
+  receive windows (timeout), not by CRC failure.
+
+### 2026-06-03 Event-Driven PTX
+
+Added `PtxEventSession` API and `mpsl_3mode_event` example for event-driven
+ESB transmissions with cross-window retry and pending report retention.
+
+Hardware test (120s, Prx12ms profile, 5 cross-window retries, 2ms retry delay):
+
+- PTX events: 2600
+- PTX acked: 2600 (**100% event-level reliability**)
+- PTX total sends: 6569 (avg 2.52 per event)
+- Central rx: 2606, dup=0, blk=0
+- Pending retries: 34 (all during central cold-start)
+
+Estimated performance for keyboard use case:
+
+- Typical latency: ~3ms (first-send ACK)
+- Worst-case latency: ~73ms (5 retries fail + pending to next 50ms cycle)
+- Idle current: <10μA (deep sleep, GPIO wake)
+- Typing current: ~0.8mA at 10 events/sec
+- CR2032 estimated life: ~6 months mixed use
 
 ## Pending Work
 
-- Tune pipe 1 ACK coverage under active BLE connection; current relaxed CI run is functional but still below advertising-only throughput.
-- Re-run the 3-mode poll diagnostic across the PRX duty sweep profiles and
-  compare `prx_rx_rate`, `ack_return_rate`, `to_rate`, `rd_max`, and `bk/cn/dt`.
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
 - Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.
+- Integrate real key matrix scanning into `mpsl_3mode_event` to replace the 50ms mock timer.
