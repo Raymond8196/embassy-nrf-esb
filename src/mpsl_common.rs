@@ -4,6 +4,10 @@
 //! rules used by the MPSL diagnostics can be covered by host-side tests.
 
 use crate::header::EsbHeader;
+use crate::mpsl_schedule::{
+    SCHEDULE_COUNTER_HINT_PAYLOAD_LEN, SCHEDULE_HINT_PAYLOAD_OFFSET, ScheduleHint,
+    encode_schedule_hint,
+};
 
 pub(crate) const NUM_PIPES: usize = 8;
 
@@ -36,6 +40,27 @@ pub(crate) fn write_counter_packet(buf: &mut [u8; 256], pid: u8, counter: u32) {
 
     let p = EsbHeader::PAYLOAD_OFFSET;
     buf[p..p + 4].copy_from_slice(&counter.to_le_bytes());
+}
+
+pub(crate) fn write_counter_schedule_packet(
+    buf: &mut [u8; 256],
+    pid: u8,
+    counter: u32,
+    hint: ScheduleHint,
+) {
+    let header = unsafe { &mut *(buf.as_mut_ptr().cast::<EsbHeader>()) };
+    header.length = SCHEDULE_COUNTER_HINT_PAYLOAD_LEN as u8;
+    header.pid_no_ack = 0;
+    header.set_pid(pid);
+    header.set_no_ack(false);
+
+    let p = EsbHeader::PAYLOAD_OFFSET;
+    buf[p..p + 4].copy_from_slice(&counter.to_le_bytes());
+    let _ = encode_schedule_hint(
+        &mut buf[p + SCHEDULE_HINT_PAYLOAD_OFFSET
+            ..p + SCHEDULE_HINT_PAYLOAD_OFFSET + crate::mpsl_schedule::SCHEDULE_HINT_ENCODED_LEN],
+        hint,
+    );
 }
 
 pub(crate) fn read_counter_payload(buf: &[u8]) -> Option<u32> {
@@ -78,9 +103,12 @@ pub(crate) fn spin_until(mut condition: impl FnMut() -> bool, limit: u32) -> boo
 mod tests {
     use super::{
         NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
-        spin_until, write_counter_packet,
+        spin_until, write_counter_packet, write_counter_schedule_packet,
     };
     use crate::header::EsbHeader;
+    use crate::mpsl_schedule::{
+        SCHEDULE_COUNTER_HINT_PAYLOAD_LEN, ScheduleHint, decode_counter_payload_schedule_hint,
+    };
 
     #[test]
     fn pid_advances_in_two_bit_space() {
@@ -122,6 +150,23 @@ mod tests {
             read_counter_payload(&buf[..EsbHeader::PAYLOAD_OFFSET + 3]),
             None
         );
+    }
+
+    #[test]
+    fn scheduled_counter_packet_keeps_legacy_counter_prefix() {
+        let mut buf = [0u8; 256];
+        let hint = ScheduleHint::new(0, 9, 1500, 5000, 4500);
+
+        write_counter_schedule_packet(&mut buf, 1, 0x4433_2211, hint);
+
+        let header = unsafe { &*(buf.as_ptr().cast::<EsbHeader>()) };
+        assert_eq!(header.length, SCHEDULE_COUNTER_HINT_PAYLOAD_LEN as u8);
+        assert_eq!(header.pid(), 1);
+        assert_eq!(read_counter_payload(&buf), Some(0x4433_2211));
+
+        let payload = &buf[EsbHeader::PAYLOAD_OFFSET
+            ..EsbHeader::PAYLOAD_OFFSET + SCHEDULE_COUNTER_HINT_PAYLOAD_LEN];
+        assert_eq!(decode_counter_payload_schedule_hint(payload), Ok(hint));
     }
 
     #[test]

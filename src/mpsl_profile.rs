@@ -16,6 +16,10 @@ pub enum CoexistenceProfile {
     DiagnosticPipe1Retry1,
     /// Same narrow pipe-1 diagnostic with a longer PTX slot and ACK window.
     DiagnosticPipe1LongSlot,
+    /// Same narrow pipe-1 diagnostic with PRX-hint phase-locked PTX scheduling.
+    DiagnosticPipe1ScheduledGate,
+    DiagnosticPipe2ScheduledGate,
+    DiagnosticPipe5ScheduledGate,
     /// Same narrow pipe-1 diagnostic with an 8 ms PRX receive window.
     DiagnosticPipe1Prx8ms,
     /// Same narrow pipe-1 diagnostic with a 12 ms PRX receive window.
@@ -123,6 +127,85 @@ pub struct PtxPollConfig {
     pub max_retries: u8,
     /// Timeslot request policy.
     pub request: TimeslotRequestConfig,
+    /// Optional PTX scheduling policy derived from PRX ACK hints.
+    pub schedule_gate: PtxScheduleGateConfig,
+}
+
+/// PTX scheduling mode derived from PRX schedule hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PtxScheduleMode {
+    /// Always request the next PTX timeslot as soon as MPSL can provide it.
+    Disabled,
+    /// Diagnostic-only policy that skips a fixed number of PTX slots after a hint.
+    FixedSkipAfterHint,
+    /// Lock subsequent PTX timeslots to the hinted PRX period using MPSL NORMAL requests.
+    PhaseLocked,
+}
+
+/// PTX pacing policy derived from PRX schedule hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PtxScheduleGateConfig {
+    /// Scheduling strategy.
+    pub mode: PtxScheduleMode,
+    /// Number of PTX timeslots to skip after receiving a valid hint in fixed-skip mode.
+    pub skip_after_hint_slots: u8,
+    /// Consecutive TX misses tolerated before phase-locked mode falls back to scanning.
+    pub lock_miss_limit: u8,
+    /// Extra offset from the estimated PRX window start before transmitting.
+    pub lock_tx_offset_us: u32,
+}
+
+impl PtxScheduleGateConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            mode: PtxScheduleMode::Disabled,
+            skip_after_hint_slots: 0,
+            lock_miss_limit: 0,
+            lock_tx_offset_us: 0,
+        }
+    }
+
+    pub const fn conservative_pipe1() -> Self {
+        Self::phase_locked_pipe1()
+    }
+
+    pub const fn fixed_skip_pipe1() -> Self {
+        Self {
+            mode: PtxScheduleMode::FixedSkipAfterHint,
+            skip_after_hint_slots: 2,
+            lock_miss_limit: 0,
+            lock_tx_offset_us: 0,
+        }
+    }
+
+    pub const fn phase_locked_pipe1() -> Self {
+        Self {
+            mode: PtxScheduleMode::PhaseLocked,
+            skip_after_hint_slots: 0,
+            lock_miss_limit: 4,
+            lock_tx_offset_us: 250,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), Error> {
+        match self.mode {
+            PtxScheduleMode::Disabled => {}
+            PtxScheduleMode::FixedSkipAfterHint => {
+                if self.skip_after_hint_slots == 0 {
+                    return Err(Error::InvalidParam);
+                }
+            }
+            PtxScheduleMode::PhaseLocked => {
+                if self.lock_miss_limit == 0 {
+                    return Err(Error::InvalidParam);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl PtxPollConfig {
@@ -146,6 +229,7 @@ impl PtxPollConfig {
             ack_timeout_us: 400,
             max_retries: 0,
             request: TimeslotRequestConfig::diagnostic_default(),
+            schedule_gate: PtxScheduleGateConfig::disabled(),
         }
     }
 
@@ -165,6 +249,7 @@ impl PtxPollConfig {
         }
 
         self.request.validate()?;
+        self.schedule_gate.validate()?;
         Ok(())
     }
 }
@@ -201,6 +286,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -221,6 +307,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 600,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -241,6 +328,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 1,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -261,6 +349,70 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 600,
                     max_retries: 1,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe1ScheduledGate => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 5000,
+                    in_slot_match_us: 4500,
+                    report_every: 20,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                    schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe2ScheduledGate => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 5000,
+                    in_slot_match_us: 4500,
+                    report_every: 20,
+                    enabled_pipes: 0x06,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x06,
+                    report_every: 2,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                    schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
+                },
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe5ScheduledGate => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 5000,
+                    in_slot_match_us: 4500,
+                    report_every: 20,
+                    enabled_pipes: 0x3E,
+                    request,
+                    recovery,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 2500,
+                    in_slot_match_us: 2300,
+                    pipe_mask: 0x3E,
+                    report_every: 5,
+                    ack_timeout_us: 400,
+                    max_retries: 1,
+                    request,
+                    schedule_gate: PtxScheduleGateConfig::phase_locked_pipe1(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -281,6 +433,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -301,6 +454,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -321,6 +475,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::DiagnosticOnly,
             },
@@ -341,6 +496,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::AdvertisingVisible,
             },
@@ -361,6 +517,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 0,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::ConnectedRelaxed,
             },
@@ -381,6 +538,7 @@ impl CoexistenceProfileConfig {
                     ack_timeout_us: 400,
                     max_retries: 1,
                     request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
                 },
                 ble_hint: BleCoexistenceHint::RmkKeyboardLowLatency,
             },

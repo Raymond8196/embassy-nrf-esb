@@ -40,22 +40,59 @@ use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 use crate::error::Error;
 use crate::mpsl_common::{
     NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
-    write_counter_packet,
+    write_counter_packet, write_counter_schedule_packet,
 };
 pub use crate::mpsl_profile::{
     BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxSlotConfig, PtxPollConfig,
-    TimeslotRequestConfig,
+    PtxScheduleGateConfig, PtxScheduleMode, TimeslotRequestConfig,
 };
 pub use crate::mpsl_radio::{RadioDisableResult, RadioQuiesceResult, RadioRecoveryPolicy};
 use crate::mpsl_radio::{disable_radio_bounded, quiesce_radio_before_timeslot_end};
+use crate::mpsl_schedule::{
+    ScheduleHint, ScheduleTracker, ScheduleTrackerSnapshot, decode_counter_payload_schedule_hint,
+};
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
+
+const TIMESLOT_HFCLK: u8 = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+const TIMESLOT_PRIORITY_NORMAL: u8 = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
+const TIMESLOT_PRIORITY_HIGH: u8 = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
 
 fn mpsl_ok(ret: i32) -> Result<(), Error> {
     RetVal::from(ret)
         .to_result()
         .map(|_| ())
         .map_err(|_| Error::Mpsl)
+}
+
+fn configure_earliest_request(
+    request: &mut raw::mpsl_timeslot_request_t,
+    priority: u8,
+    length_us: u32,
+    timeout_us: u32,
+) {
+    request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
+    request.params.earliest = raw::mpsl_timeslot_request_earliest_t {
+        hfclk: TIMESLOT_HFCLK,
+        priority,
+        length_us,
+        timeout_us,
+    };
+}
+
+fn configure_normal_request(
+    request: &mut raw::mpsl_timeslot_request_t,
+    priority: u8,
+    distance_us: u32,
+    length_us: u32,
+) {
+    request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_NORMAL as u8;
+    request.params.normal = raw::mpsl_timeslot_request_normal_t {
+        hfclk: TIMESLOT_HFCLK,
+        priority,
+        distance_us,
+        length_us,
+    };
 }
 
 struct Timer0RawMutex;
@@ -508,7 +545,9 @@ struct PtxInnerState {
     waker: WakerRegistration,
     request: raw::mpsl_timeslot_request_t,
     return_param: raw::mpsl_timeslot_signal_return_param_t,
+    slot_length_us: u32,
     in_slot_match_us: u32,
+    request_timeout_us: u32,
     target_count: u32,
     config: Option<crate::config::EsbConfig>,
     addresses: Option<crate::addresses::EsbAddresses>,
@@ -523,6 +562,19 @@ struct PtxInnerState {
     ack_payload_count: u32,
     ack_inversions: u32,
     last_ack_counter: u32,
+    schedule_hint_count: u32,
+    schedule_hint_bad_count: u32,
+    last_schedule_window_id: u32,
+    schedule_tracker: ScheduleTracker,
+    schedule_gate: PtxScheduleGateConfig,
+    schedule_skip_slots_remaining: u8,
+    schedule_skip_count: u32,
+    schedule_lock_active: bool,
+    schedule_lock_miss_streak: u8,
+    schedule_lock_count: u32,
+    schedule_reacquire_count: u32,
+    schedule_period_us: u32,
+    schedule_next_distance_us: u32,
     poll_pipes: u8,
     poll_pipe_mask: u8,
     poll_report_every: u32,
@@ -563,6 +615,88 @@ static PTX_BUFS: PtxBuffers = PtxBuffers {
     rx: UnsafeCell::new([0u8; 256]),
 };
 
+fn ptx_set_earliest_request(state: &mut PtxInnerState, priority: u8, timeout_us: u32) {
+    configure_earliest_request(
+        &mut state.request,
+        priority,
+        state.slot_length_us,
+        timeout_us,
+    );
+}
+
+fn ptx_set_normal_request(state: &mut PtxInnerState, distance_us: u32) {
+    configure_normal_request(
+        &mut state.request,
+        TIMESLOT_PRIORITY_NORMAL,
+        distance_us,
+        state.slot_length_us,
+    );
+}
+
+fn ptx_configure_next_poll_request(state: &mut PtxInnerState) {
+    if state.schedule_gate.mode == PtxScheduleMode::PhaseLocked && state.schedule_lock_active {
+        let distance_us = if state.schedule_next_distance_us > 0 {
+            let distance = state.schedule_next_distance_us;
+            state.schedule_next_distance_us = 0;
+            distance
+        } else {
+            state.schedule_period_us
+        };
+
+        if distance_us > 0 && distance_us <= raw::MPSL_TIMESLOT_DISTANCE_MAX_US {
+            ptx_set_normal_request(state, distance_us);
+            return;
+        }
+
+        state.schedule_lock_active = false;
+        state.schedule_lock_miss_streak = 0;
+        state.schedule_reacquire_count += 1;
+    }
+
+    ptx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, state.request_timeout_us);
+}
+
+fn ptx_observe_schedule_hint(state: &mut PtxInnerState, hint: ScheduleHint, ack_offset_us: u32) {
+    state.schedule_hint_count += 1;
+    state.last_schedule_window_id = hint.window_id;
+    state.schedule_tracker.observe_hint(hint);
+
+    match state.schedule_gate.mode {
+        PtxScheduleMode::Disabled => {}
+        PtxScheduleMode::FixedSkipAfterHint => {
+            state.schedule_skip_slots_remaining = state.schedule_gate.skip_after_hint_slots;
+        }
+        PtxScheduleMode::PhaseLocked => {
+            if !state.schedule_lock_active {
+                state.schedule_lock_count += 1;
+            }
+            state.schedule_lock_active = true;
+            state.schedule_lock_miss_streak = 0;
+            state.schedule_period_us = hint.period_us;
+
+            let min_distance = state.in_slot_match_us.saturating_add(100);
+            let hinted_distance = ack_offset_us
+                .saturating_add(hint.next_delay_us)
+                .saturating_add(state.schedule_gate.lock_tx_offset_us);
+            state.schedule_next_distance_us = hinted_distance.max(min_distance);
+        }
+    }
+}
+
+fn ptx_observe_schedule_miss(state: &mut PtxInnerState) {
+    state.schedule_tracker.observe_miss();
+
+    if state.schedule_gate.mode == PtxScheduleMode::PhaseLocked && state.schedule_lock_active {
+        state.schedule_lock_miss_streak = state.schedule_lock_miss_streak.saturating_add(1);
+        if state.schedule_lock_miss_streak >= state.schedule_gate.lock_miss_limit {
+            state.schedule_lock_active = false;
+            state.schedule_lock_miss_streak = 0;
+            state.schedule_next_distance_us = 0;
+            state.schedule_reacquire_count += 1;
+        }
+    }
+}
+
 impl PtxState {
     const fn new() -> Self {
         Self {
@@ -591,7 +725,9 @@ impl PtxState {
                             },
                     },
                 },
+                slot_length_us: 0,
                 in_slot_match_us: 5500,
+                request_timeout_us: 1_000_000,
                 target_count: 0,
                 config: None,
                 addresses: None,
@@ -606,6 +742,19 @@ impl PtxState {
                 ack_payload_count: 0,
                 ack_inversions: 0,
                 last_ack_counter: 0,
+                schedule_hint_count: 0,
+                schedule_hint_bad_count: 0,
+                last_schedule_window_id: 0,
+                schedule_tracker: ScheduleTracker::new(),
+                schedule_gate: PtxScheduleGateConfig::disabled(),
+                schedule_skip_slots_remaining: 0,
+                schedule_skip_count: 0,
+                schedule_lock_active: false,
+                schedule_lock_miss_streak: 0,
+                schedule_lock_count: 0,
+                schedule_reacquire_count: 0,
+                schedule_period_us: 0,
+                schedule_next_distance_us: 0,
                 poll_pipes: 0,
                 poll_pipe_mask: 0,
                 poll_report_every: 0,
@@ -660,6 +809,27 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 if let Some(next) = next_pipe_in_mask(state.tx_pipe, state.poll_pipe_mask) {
                     state.tx_pipe = next;
                 }
+            }
+
+            if state.schedule_gate.mode == PtxScheduleMode::FixedSkipAfterHint
+                && state.schedule_skip_slots_remaining > 0
+            {
+                state.schedule_skip_slots_remaining -= 1;
+                state.schedule_skip_count += 1;
+                state.phase = PtxPhase::Done;
+
+                let t = pac::TIMER0;
+                t.events_compare(0).write_value(0);
+                t.events_compare(1).write_value(0);
+                t.cc(0).write_value(state.in_slot_match_us);
+                t.cc(1).write_value(0xFFFFFFFF);
+                t.intenset().write(|w| {
+                    w.set_compare(0, true);
+                    w.set_compare(1, false);
+                });
+
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                return &mut state.return_param as *mut _;
             }
 
             // Power cycle RADIO.
@@ -771,11 +941,37 @@ unsafe extern "C" fn ptx_timeslot_callback(
                                 state.ack_inversions += 1;
                             }
                             state.last_ack_counter = counter;
+
+                            let dma = crate::header::EsbHeader::DMA_OFFSET;
+                            let payload = crate::header::EsbHeader::PAYLOAD_OFFSET;
+                            let len = rx_buf[dma] as usize;
+                            let end = payload.saturating_add(len);
+                            if end <= rx_buf.len() {
+                                let t = pac::TIMER0;
+                                t.tasks_capture(2).write_value(1);
+                                let ack_offset_us = t.cc(2).read();
+                                match decode_counter_payload_schedule_hint(&rx_buf[payload..end]) {
+                                    Ok(hint) => {
+                                        ptx_observe_schedule_hint(state, hint, ack_offset_us)
+                                    }
+                                    Err(_) => {
+                                        state.schedule_hint_bad_count += 1;
+                                        state.schedule_tracker.observe_bad_hint();
+                                    }
+                                }
+                            } else {
+                                state.schedule_hint_bad_count += 1;
+                                state.schedule_tracker.observe_bad_hint();
+                            }
+                        } else {
+                            state.schedule_hint_bad_count += 1;
+                            state.schedule_tracker.observe_bad_hint();
                         }
                     }
 
                     if !crc_ok {
                         state.ack_crc_fail_count += 1;
+                        ptx_observe_schedule_miss(state);
                         let pipe = state.tx_pipe as usize;
                         if pipe < NUM_PIPES {
                             state.ack_crc_fail_per_pipe[pipe] += 1;
@@ -808,6 +1004,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
             if t.events_compare(1).read() == 1 && state.phase == PtxPhase::WaitAck {
                 t.events_compare(1).write_value(0);
                 state.ack_timeout_count += 1;
+                ptx_observe_schedule_miss(state);
                 let pipe = state.tx_pipe as usize;
                 if pipe < NUM_PIPES {
                     state.ack_timeout_per_pipe[pipe] += 1;
@@ -881,6 +1078,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                         state.waker.wake();
                     }
 
+                    ptx_configure_next_poll_request(state);
                     state.return_param.callback_action =
                         raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                     state.return_param.params.request.p_next =
@@ -904,14 +1102,43 @@ unsafe extern "C" fn ptx_timeslot_callback(
             &mut state.return_param as *mut _
         }),
 
-        raw::MPSL_TIMESLOT_SIGNAL_SESSION_IDLE => PTX_STATE.with_inner(|state| {
-            state.counters.session_idle += 1;
-            if state.poll_pipes > 0 {
-                state.poll_report_ready = true;
+        raw::MPSL_TIMESLOT_SIGNAL_SESSION_IDLE => {
+            let request = PTX_STATE.with_inner(|state| {
+                state.counters.session_idle += 1;
+                if state.poll_pipes > 0 {
+                    if state.schedule_gate.mode == PtxScheduleMode::PhaseLocked {
+                        state.schedule_lock_active = false;
+                        state.schedule_lock_miss_streak = 0;
+                        state.schedule_next_distance_us = 0;
+                        state.schedule_reacquire_count += 1;
+                    }
+                    ptx_set_earliest_request(
+                        state,
+                        TIMESLOT_PRIORITY_NORMAL,
+                        state.request_timeout_us,
+                    );
+                    state.poll_report_ready = true;
+                    state.waker.wake();
+                    Some(core::ptr::from_ref(&state.request))
+                } else {
+                    state.waker.wake();
+                    None
+                }
+            });
+
+            if let Some(request) = request {
+                let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+                if ret < 0 {
+                    PTX_STATE.with_inner(|state| {
+                        state.counters.invalid_return += 1;
+                        state.done = true;
+                        state.waker.wake();
+                    });
+                }
             }
-            state.waker.wake();
+
             core::ptr::null_mut()
-        }),
+        }
 
         raw::MPSL_TIMESLOT_SIGNAL_BLOCKED | raw::MPSL_TIMESLOT_SIGNAL_CANCELLED => {
             let request = PTX_STATE.with_inner(|state| {
@@ -920,9 +1147,19 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 } else {
                     state.counters.cancelled += 1;
                 }
-                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
-                state.request.params.earliest.timeout_us =
-                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
+                if state.schedule_gate.mode == PtxScheduleMode::PhaseLocked
+                    && state.schedule_lock_active
+                {
+                    state.schedule_lock_active = false;
+                    state.schedule_lock_miss_streak = 0;
+                    state.schedule_next_distance_us = 0;
+                    state.schedule_reacquire_count += 1;
+                }
+                ptx_set_earliest_request(
+                    state,
+                    TIMESLOT_PRIORITY_HIGH,
+                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US,
+                );
                 core::ptr::from_ref(&state.request)
             });
             let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
@@ -948,9 +1185,15 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 state.counters.overstayed += 1;
                 state.phase = PtxPhase::Idle;
                 if state.poll_pipes > 0 {
-                    state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
-                    state.request.params.earliest.timeout_us =
-                        raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
+                    state.schedule_lock_active = false;
+                    state.schedule_lock_miss_streak = 0;
+                    state.schedule_next_distance_us = 0;
+                    state.schedule_reacquire_count += 1;
+                    ptx_set_earliest_request(
+                        state,
+                        TIMESLOT_PRIORITY_HIGH,
+                        raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US,
+                    );
                     state.return_param.callback_action =
                         raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                     state.return_param.params.request.p_next =
@@ -1006,7 +1249,9 @@ pub async fn run_ptx_slots(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = count;
+        state.slot_length_us = slot_length_us;
         state.in_slot_match_us = in_slot_match_us;
+        state.request_timeout_us = 1_000_000;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PtxPhase::Idle;
@@ -1015,15 +1260,24 @@ pub async fn run_ptx_slots(
         state.ack_payload_count = 0;
         state.ack_inversions = 0;
         state.last_ack_counter = 0;
+        state.schedule_hint_count = 0;
+        state.schedule_hint_bad_count = 0;
+        state.last_schedule_window_id = 0;
+        state.schedule_tracker.reset();
+        state.schedule_gate = PtxScheduleGateConfig::disabled();
+        state.schedule_skip_slots_remaining = 0;
+        state.schedule_skip_count = 0;
+        state.schedule_lock_active = false;
+        state.schedule_lock_miss_streak = 0;
+        state.schedule_lock_count = 0;
+        state.schedule_reacquire_count = 0;
+        state.schedule_period_us = 0;
+        state.schedule_next_distance_us = 0;
         state.tx_pipe = tx_pipe;
         state.payload_byte = 0;
         state.packets_per_slot = packets_per_slot;
         state.packets_sent_this_slot = 0;
-        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
-        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = slot_length_us;
-        state.request.params.earliest.timeout_us = 1_000_000;
+        ptx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, 1_000_000);
     });
 
     let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
@@ -1089,6 +1343,7 @@ struct PrxInnerState {
     waker: WakerRegistration,
     request: raw::mpsl_timeslot_request_t,
     return_param: raw::mpsl_timeslot_signal_return_param_t,
+    slot_length_us: u32,
     in_slot_match_us: u32,
     request_timeout_us: u32,
     target_count: u32,
@@ -1137,8 +1392,41 @@ static PRX_BUFS: PrxBuffers = PrxBuffers {
     ack_tx: UnsafeCell::new([0u8; 256]),
 };
 
-fn write_ack_counter_packet(buf: &mut [u8; 256], counter: u32) {
-    write_counter_packet(buf, 0, counter);
+fn prx_set_earliest_request(state: &mut PrxInnerState, priority: u8, timeout_us: u32) {
+    configure_earliest_request(
+        &mut state.request,
+        priority,
+        state.slot_length_us,
+        timeout_us,
+    );
+}
+
+fn prx_set_normal_request(state: &mut PrxInnerState) {
+    configure_normal_request(
+        &mut state.request,
+        TIMESLOT_PRIORITY_NORMAL,
+        state.slot_length_us,
+        state.slot_length_us,
+    );
+}
+
+fn prx_next_window_delay_us(state: &PrxInnerState) -> u32 {
+    let t = pac::TIMER0;
+    t.tasks_capture(2).write_value(1);
+    let elapsed_us = t.cc(2).read();
+    state.slot_length_us.saturating_sub(elapsed_us)
+}
+
+fn write_ack_counter_packet(
+    buf: &mut [u8; 256],
+    counter: u32,
+    window_id: u32,
+    next_delay_us: u32,
+    period_us: u32,
+    window_us: u32,
+) {
+    let hint = ScheduleHint::new(0, window_id, next_delay_us, period_us, window_us);
+    write_counter_schedule_packet(buf, 0, counter, hint);
 }
 
 impl PrxState {
@@ -1169,6 +1457,7 @@ impl PrxState {
                             },
                     },
                 },
+                slot_length_us: 0,
                 in_slot_match_us: 5500,
                 request_timeout_us: 1_000_000,
                 target_count: 0,
@@ -1316,7 +1605,15 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     0
                                 };
                                 let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
-                                write_ack_counter_packet(ack_buf, counter);
+                                let next_delay_us = prx_next_window_delay_us(state);
+                                write_ack_counter_packet(
+                                    ack_buf,
+                                    counter,
+                                    state.counters.start,
+                                    next_delay_us,
+                                    state.slot_length_us,
+                                    state.in_slot_match_us,
+                                );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
                                 let mut radio = EsbRadio::new(pac::RADIO);
@@ -1353,7 +1650,15 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     0
                                 };
                                 let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
-                                write_ack_counter_packet(ack_buf, counter);
+                                let next_delay_us = prx_next_window_delay_us(state);
+                                write_ack_counter_packet(
+                                    ack_buf,
+                                    counter,
+                                    state.counters.start,
+                                    next_delay_us,
+                                    state.slot_length_us,
+                                    state.in_slot_match_us,
+                                );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
                                 let mut radio = EsbRadio::new(pac::RADIO);
@@ -1420,13 +1725,11 @@ unsafe extern "C" fn prx_timeslot_callback(
                 state.last_report_start = state.counters.start;
                 state.report_ready = true;
                 state.waker.wake();
-                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-                state.request.params.earliest.timeout_us = state.request_timeout_us;
+                prx_set_normal_request(state);
                 state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                 state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else if long_session || state.counters.start < state.target_count {
-                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-                state.request.params.earliest.timeout_us = state.request_timeout_us;
+                prx_set_normal_request(state);
                 state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
                 state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
             } else {
@@ -1450,9 +1753,11 @@ unsafe extern "C" fn prx_timeslot_callback(
                 } else {
                     state.counters.cancelled += 1;
                 }
-                state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
-                state.request.params.earliest.timeout_us =
-                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US;
+                prx_set_earliest_request(
+                    state,
+                    TIMESLOT_PRIORITY_HIGH,
+                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US,
+                );
                 core::ptr::from_ref(&state.request)
             });
             let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
@@ -1524,7 +1829,9 @@ pub async fn run_prx_slots(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = count;
+        state.slot_length_us = slot_length_us;
         state.in_slot_match_us = in_slot_match_us;
+        state.request_timeout_us = 1_000_000;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PrxPhase::Idle;
@@ -1544,11 +1851,7 @@ pub async fn run_prx_slots(
         state.report_every = 0;
         state.last_report_start = 0;
         state.report_ready = false;
-        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
-        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = slot_length_us;
-        state.request.params.earliest.timeout_us = 1_000_000;
+        prx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, 1_000_000);
     });
 
     let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
@@ -1695,6 +1998,7 @@ pub fn open_prx_session(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = 0;
+        state.slot_length_us = slot_config.slot_length_us;
         state.in_slot_match_us = slot_config.in_slot_match_us;
         state.request_timeout_us = slot_config.request.timeout_us;
         state.config = Some(config.clone());
@@ -1717,11 +2021,11 @@ pub fn open_prx_session(
         state.report_every = slot_config.report_every;
         state.last_report_start = 0;
         state.report_ready = false;
-        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
-        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = slot_config.slot_length_us;
-        state.request.params.earliest.timeout_us = slot_config.request.timeout_us;
+        prx_set_earliest_request(
+            state,
+            TIMESLOT_PRIORITY_NORMAL,
+            slot_config.request.timeout_us,
+        );
     });
 
     let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
@@ -1766,6 +2070,26 @@ pub struct PtxPollResult {
     pub ack_timeout_per_pipe: [u32; NUM_PIPES],
     /// Per-pipe ACK packets received with a bad CRC.
     pub ack_crc_fail_per_pipe: [u32; NUM_PIPES],
+    /// ACK payloads that carried a valid passive schedule hint.
+    pub schedule_hint_count: u32,
+    /// ACK payloads whose schedule hint was missing or invalid.
+    pub schedule_hint_bad_count: u32,
+    /// Last valid PRX window id observed in a schedule hint.
+    pub last_schedule_window_id: u32,
+    /// Passive schedule relationship diagnostics for this report.
+    pub schedule: ScheduleTrackerSnapshot,
+    /// PTX timeslots intentionally skipped by the schedule gate.
+    pub schedule_skip_count: u32,
+    /// Whether phase-locked scheduling is currently active.
+    pub schedule_lock_active: bool,
+    /// New phase-lock acquisitions in this period.
+    pub schedule_lock_count: u32,
+    /// Phase-lock fallbacks to scanning in this period.
+    pub schedule_reacquire_count: u32,
+    /// Consecutive misses while phase-locked.
+    pub schedule_lock_miss_streak: u8,
+    /// Current phase-locked request distance.
+    pub schedule_period_us: u32,
 }
 
 /// Long-lived PTX poll session that round-robins across pipes.
@@ -1783,6 +2107,12 @@ pub struct PtxPollSession {
     last_ack_per_pipe: [u32; NUM_PIPES],
     last_ack_timeout_count: u32,
     last_ack_crc_fail_count: u32,
+    last_schedule_hint_count: u32,
+    last_schedule_hint_bad_count: u32,
+    last_schedule: ScheduleTrackerSnapshot,
+    last_schedule_skip_count: u32,
+    last_schedule_lock_count: u32,
+    last_schedule_reacquire_count: u32,
     last_ack_timeout_per_pipe: [u32; NUM_PIPES],
     last_ack_crc_fail_per_pipe: [u32; NUM_PIPES],
 }
@@ -1818,6 +2148,10 @@ impl PtxPollSession {
                 &state.ack_crc_fail_per_pipe,
                 &self.last_ack_crc_fail_per_pipe,
             );
+            let schedule = state
+                .schedule_tracker
+                .snapshot()
+                .saturating_sub(self.last_schedule);
 
             let result = PtxPollResult {
                 counters,
@@ -1833,6 +2167,26 @@ impl PtxPollSession {
                     .saturating_sub(self.last_ack_crc_fail_count),
                 ack_timeout_per_pipe,
                 ack_crc_fail_per_pipe,
+                schedule_hint_count: state
+                    .schedule_hint_count
+                    .saturating_sub(self.last_schedule_hint_count),
+                schedule_hint_bad_count: state
+                    .schedule_hint_bad_count
+                    .saturating_sub(self.last_schedule_hint_bad_count),
+                last_schedule_window_id: state.last_schedule_window_id,
+                schedule,
+                schedule_skip_count: state
+                    .schedule_skip_count
+                    .saturating_sub(self.last_schedule_skip_count),
+                schedule_lock_active: state.schedule_lock_active,
+                schedule_lock_count: state
+                    .schedule_lock_count
+                    .saturating_sub(self.last_schedule_lock_count),
+                schedule_reacquire_count: state
+                    .schedule_reacquire_count
+                    .saturating_sub(self.last_schedule_reacquire_count),
+                schedule_lock_miss_streak: state.schedule_lock_miss_streak,
+                schedule_period_us: state.schedule_period_us,
             };
 
             self.last_counters = state.counters;
@@ -1842,6 +2196,12 @@ impl PtxPollSession {
             self.last_ack_per_pipe = state.ack_ok_per_pipe;
             self.last_ack_timeout_count = state.ack_timeout_count;
             self.last_ack_crc_fail_count = state.ack_crc_fail_count;
+            self.last_schedule_hint_count = state.schedule_hint_count;
+            self.last_schedule_hint_bad_count = state.schedule_hint_bad_count;
+            self.last_schedule = state.schedule_tracker.snapshot();
+            self.last_schedule_skip_count = state.schedule_skip_count;
+            self.last_schedule_lock_count = state.schedule_lock_count;
+            self.last_schedule_reacquire_count = state.schedule_reacquire_count;
             self.last_ack_timeout_per_pipe = state.ack_timeout_per_pipe;
             self.last_ack_crc_fail_per_pipe = state.ack_crc_fail_per_pipe;
 
@@ -1893,7 +2253,9 @@ pub fn open_ptx_poll_session(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = 0;
+        state.slot_length_us = poll_config.slot_length_us;
         state.in_slot_match_us = poll_config.in_slot_match_us;
+        state.request_timeout_us = poll_config.request.timeout_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
         state.phase = PtxPhase::Idle;
@@ -1906,6 +2268,19 @@ pub fn open_ptx_poll_session(
         state.ack_payload_count = 0;
         state.ack_inversions = 0;
         state.last_ack_counter = 0;
+        state.schedule_hint_count = 0;
+        state.schedule_hint_bad_count = 0;
+        state.last_schedule_window_id = 0;
+        state.schedule_tracker.reset();
+        state.schedule_gate = poll_config.schedule_gate;
+        state.schedule_skip_slots_remaining = 0;
+        state.schedule_skip_count = 0;
+        state.schedule_lock_active = false;
+        state.schedule_lock_miss_streak = 0;
+        state.schedule_lock_count = 0;
+        state.schedule_reacquire_count = 0;
+        state.schedule_period_us = 0;
+        state.schedule_next_distance_us = 0;
         state.pid = 0;
         state.poll_pipes = poll_config.pipe_mask.count_ones() as u8;
         state.poll_pipe_mask = poll_config.pipe_mask;
@@ -1920,11 +2295,11 @@ pub fn open_ptx_poll_session(
         state.max_retries = poll_config.max_retries;
         state.acked_this_slot = false;
         state.ack_timeout_us = poll_config.ack_timeout_us;
-        state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
-        state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
-        state.request.params.earliest.length_us = poll_config.slot_length_us;
-        state.request.params.earliest.timeout_us = poll_config.request.timeout_us;
+        ptx_set_earliest_request(
+            state,
+            TIMESLOT_PRIORITY_NORMAL,
+            poll_config.request.timeout_us,
+        );
     });
 
     let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
@@ -1945,6 +2320,12 @@ pub fn open_ptx_poll_session(
         last_ack_per_pipe: [0; NUM_PIPES],
         last_ack_timeout_count: 0,
         last_ack_crc_fail_count: 0,
+        last_schedule_hint_count: 0,
+        last_schedule_hint_bad_count: 0,
+        last_schedule: ScheduleTrackerSnapshot::ZERO,
+        last_schedule_skip_count: 0,
+        last_schedule_lock_count: 0,
+        last_schedule_reacquire_count: 0,
         last_ack_timeout_per_pipe: [0; NUM_PIPES],
         last_ack_crc_fail_per_pipe: [0; NUM_PIPES],
     })

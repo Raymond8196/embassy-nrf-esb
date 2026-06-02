@@ -79,7 +79,11 @@ async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
 }
 
 async fn cdc_log(class: &mut CdcAcmClass<'static, MyUsbDriver>, data: &[u8]) {
-    let _ = with_deadline(embassy_time::Instant::from_millis(10), class.write_packet(data)).await;
+    let _ = with_deadline(
+        embassy_time::Instant::from_millis(10),
+        class.write_packet(data),
+    )
+    .await;
 }
 
 #[embassy_executor::main]
@@ -124,9 +128,7 @@ async fn main(spawner: Spawner) {
 
     let ptx = {
         static ESB: static_cell::StaticCell<EsbPtx<TIMER1>> = static_cell::StaticCell::new();
-        &*ESB.init(
-            EsbPtx::new(p.TIMER1, p.RADIO, &POOL, &esb_config, &addresses, 0).unwrap(),
-        )
+        &*ESB.init(EsbPtx::new(p.TIMER1, p.RADIO, &POOL, &esb_config, &addresses, 0).unwrap())
     };
     unsafe { PTX_REF = Some(ptx) };
 
@@ -150,14 +152,8 @@ async fn main(spawner: Spawner) {
 
         let serialized = postcard::to_slice(&msg, &mut serial_buf).unwrap();
 
-        let frame_len = transport::encode_frame(
-            0,
-            sequence,
-            0,
-            serialized,
-            &mut frame_buf,
-        )
-        .unwrap();
+        let frame_len =
+            transport::encode_frame(0, sequence, 0, serialized, &mut frame_buf).unwrap();
 
         match ptx.send(&frame_buf[..frame_len]).await {
             Ok(()) => {}

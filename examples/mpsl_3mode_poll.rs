@@ -46,6 +46,7 @@ type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 
 const LOG_BUF_SIZE: usize = 256;
+const POLL_REPORT_TIMEOUT_MS: u64 = 500;
 
 static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_SIZE>, 4> =
     Channel::new();
@@ -300,7 +301,7 @@ impl core::fmt::Write for WriteBuf<'_> {
     }
 }
 
-const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe5ScheduledGate;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -408,14 +409,41 @@ async fn main(spawner: Spawner) {
     log(b"[POLL] started\r\n");
 
     let mut round: u32 = 0;
+    let mut timeout_count: u32 = 0;
     loop {
         round += 1;
-        let r = match poll.next_report().await {
-            Ok(r) => r,
-            Err(e) => {
+        let r = match embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(POLL_REPORT_TIMEOUT_MS),
+            poll.next_report(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 defmt::warn!("poll error: {:?}", e);
                 log(b"[ERR]\r\n");
                 embassy_time::Timer::after_millis(100).await;
+                continue;
+            }
+            Err(_) => {
+                timeout_count += 1;
+                defmt::warn!("poll report timeout; reopening session ({})", timeout_count);
+                log(b"[TIMEOUT]\r\n");
+                drop(poll);
+
+                poll = loop {
+                    match open_ptx_poll_session(mpsl, &esb_cfg, &esb_addr, poll_cfg) {
+                        Ok(session) => {
+                            log(b"[RECOVER]\r\n");
+                            break session;
+                        }
+                        Err(e) => {
+                            defmt::warn!("reopen poll session failed: {:?}", e);
+                            log(b"[REOPEN_ERR]\r\n");
+                            embassy_time::Timer::after_millis(100).await;
+                        }
+                    }
+                };
                 continue;
             }
         };
@@ -424,12 +452,27 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "r={} tx={} ack={} to={} crc={} s={} t0={} rd={} dt={}",
+            "r={} tx={} ack={} to={} crc={} sh={}/{} sid={} sj={}/{}/{}/{} ms={}/{} sk={} sl={}/{}/{} rq={} sp={} s={} t0={} rd={} dt={}",
             round,
             r.tx_count,
             r.ack_ok_count,
             r.ack_timeout_count,
             r.ack_crc_fail_count,
+            r.schedule_hint_count,
+            r.schedule_hint_bad_count,
+            r.last_schedule_window_id,
+            r.schedule.repeat_count,
+            r.schedule.jump_count,
+            r.schedule.regress_count,
+            r.schedule.missed_window_count,
+            r.schedule.current_miss_streak,
+            r.schedule.max_miss_streak,
+            r.schedule_skip_count,
+            r.schedule_lock_active as u8,
+            r.schedule_lock_count,
+            r.schedule_lock_miss_streak,
+            r.schedule_reacquire_count,
+            r.schedule_period_us,
             r.counters.start,
             r.counters.timer0,
             r.counters.radio,

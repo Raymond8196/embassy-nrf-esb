@@ -17,7 +17,9 @@ use embassy_nrf::usb::Driver as UsbDriver;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_usb::UsbDevice;
-use embassy_usb::class::hid::{Config as HidConfig, HidWriter, State as HidState, HidBootProtocol, HidSubclass};
+use embassy_usb::class::hid::{
+    Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState,
+};
 
 use embassy_nrf::pac;
 use embassy_nrf_esb::addresses::EsbAddresses;
@@ -28,7 +30,7 @@ use embassy_nrf_esb::transport::{self, SequenceTracker, StaticBindingTable};
 
 use serde::{Deserialize, Serialize};
 
-use {panic_halt as _};
+use panic_halt as _;
 mod interrupt {
     pub use embassy_nrf::pac::Interrupt::*;
 }
@@ -63,29 +65,9 @@ pub enum SplitMessage {
 const SPLIT_MESSAGE_MAX_SIZE: usize = 32;
 
 const HID_REPORT_DESC: &[u8] = &[
-    0x05, 0x01,
-    0x09, 0x06,
-    0xA1, 0x01,
-    0x05, 0x07,
-    0x19, 0xE0,
-    0x29, 0xE7,
-    0x15, 0x00,
-    0x25, 0x01,
-    0x75, 0x01,
-    0x95, 0x08,
-    0x81, 0x02,
-    0x95, 0x01,
-    0x75, 0x08,
-    0x81, 0x01,
-    0x95, 0x06,
-    0x75, 0x08,
-    0x15, 0x00,
-    0x25, 0x65,
-    0x05, 0x07,
-    0x19, 0x00,
-    0x29, 0x65,
-    0x81, 0x00,
-    0xC0,
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x06, 0x75, 0x08,
+    0x15, 0x00, 0x25, 0x65, 0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
 ];
 
 const KEY_NONE: u8 = 0x00;
@@ -109,7 +91,9 @@ async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
 }
 
 fn make_report(key: u8) -> [u8; REPORT_SIZE] {
-    [0u8, 0, key, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE]
+    [
+        0u8, 0, key, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE, KEY_NONE,
+    ]
 }
 
 #[embassy_executor::main]
@@ -189,42 +173,34 @@ async fn main(spawner: Spawner) {
         let data = pkt.payload();
         let pipe = pkt.pipe();
 
-        let accept_result = transport::accept_bound_frame(
-            &bindings,
-            &mut seq_tracker,
-            pipe,
-            data,
-        );
+        let accept_result = transport::accept_bound_frame(&bindings, &mut seq_tracker, pipe, data);
 
         match accept_result {
-            Ok(Some((_header, payload))) => {
-                match postcard::from_bytes::<SplitMessage>(payload) {
-                    Ok(SplitMessage::Key(ev)) => {
-                        match ev.pos {
-                            KeyboardEventPos::Key(kp) => {
-                                let hid_key = if (kp.row as usize) < 1 && (kp.col as usize) < KEY_MAP.len() {
-                                    KEY_MAP[kp.col as usize]
-                                } else {
-                                    continue;
-                                };
+            Ok(Some((_header, payload))) => match postcard::from_bytes::<SplitMessage>(payload) {
+                Ok(SplitMessage::Key(ev)) => match ev.pos {
+                    KeyboardEventPos::Key(kp) => {
+                        let hid_key = if (kp.row as usize) < 1 && (kp.col as usize) < KEY_MAP.len()
+                        {
+                            KEY_MAP[kp.col as usize]
+                        } else {
+                            continue;
+                        };
 
-                                if ev.pressed {
-                                    let report = make_report(hid_key);
-                                    let _ = hid_writer.write(&report).await;
-                                    key_count += 1;
-                                } else {
-                                    let report = make_report(KEY_NONE);
-                                    let _ = hid_writer.write(&report).await;
-                                }
-
-                                let ack = key_count.to_le_bytes();
-                                let _ = prx.send_ack_payload(pipe, &ack).await;
-                            }
+                        if ev.pressed {
+                            let report = make_report(hid_key);
+                            let _ = hid_writer.write(&report).await;
+                            key_count += 1;
+                        } else {
+                            let report = make_report(KEY_NONE);
+                            let _ = hid_writer.write(&report).await;
                         }
+
+                        let ack = key_count.to_le_bytes();
+                        let _ = prx.send_ack_payload(pipe, &ack).await;
                     }
-                    Err(_) => {}
-                }
-            }
+                },
+                Err(_) => {}
+            },
             Ok(None) => {
                 let ack = key_count.to_le_bytes();
                 let _ = prx.send_ack_payload(pipe, &ack).await;

@@ -43,6 +43,8 @@ pub(crate) mod mpsl_common;
 pub mod mpsl_profile;
 #[cfg(feature = "mpsl")]
 pub mod mpsl_radio;
+#[cfg(any(test, feature = "mpsl"))]
+pub mod mpsl_schedule;
 pub mod payload;
 pub(crate) mod radio;
 pub mod state_machine;

@@ -90,8 +90,7 @@ async fn main(spawner: Spawner) {
         skip_wait_lfclk_started: false,
     };
 
-    let mpsl_p =
-        Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
+    let mpsl_p = Peripherals::new(p.RTC0, p.TIMER0, p.TEMP, p.PPI_CH19, p.PPI_CH30, p.PPI_CH31);
 
     static SESSION_MEM: StaticCell<SessionMem<1>> = StaticCell::new();
     let session_mem = SESSION_MEM.init(SessionMem::new());
@@ -207,13 +206,7 @@ async fn main(spawner: Spawner) {
             let _ = write!(
                 w,
                 "pipe={} tx={} ack={} ackpl={} round={} tot_tx={} tot_ack={}\r\n",
-                pipe,
-                r.tx_count,
-                r.ack_ok_count,
-                r.ack_payload_count,
-                round,
-                total_tx,
-                total_ack,
+                pipe, r.tx_count, r.ack_ok_count, r.ack_payload_count, round, total_tx, total_ack,
             );
             let pos = w.pos;
             for chunk in buf[..pos].chunks(64) {

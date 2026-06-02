@@ -135,21 +135,47 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
             handle
         );
         request_relaxed_conn_params(sdc, handle).await;
+    } else if status == 0 && subevent == 0x00 {
+        defmt::info!("LE Connection Update Complete: {:?}", data);
+    } else if status == 0 && subevent == 0x00 {
+        defmt::info!("LE Connection Update Complete: {:?}", data);
+    } else if subevent == 0x06 && data.len() >= 14 {
+        let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
+        let interval_min = u16::from_le_bytes([data[4], data[5]]);
+        let interval_max = u16::from_le_bytes([data[6], data[7]]);
+        let latency = u16::from_le_bytes([data[8], data[9]]);
+        let timeout = u16::from_le_bytes([data[10], data[11]]);
+        defmt::info!(
+            "Remote conn param req handle={} interval={}..{} lat={} to={}",
+            handle, interval_min, interval_max, latency, timeout
+        );
+        let _ = LeConnUpdate::new(
+            ConnHandle::new(handle),
+            bt_hci::param::Duration::from_millis(interval_max as u32 * 125 / 100),
+            bt_hci::param::Duration::from_millis(interval_max as u32 * 125 / 100),
+            latency,
+            bt_hci::param::Duration::from_millis(timeout as u32 * 10),
+            bt_hci::param::Duration::from_millis(0),
+            bt_hci::param::Duration::from_millis(0),
+        )
+        .exec(sdc)
+        .await;
     }
 }
 
 async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16) {
-    let _ = LeConnUpdate::new(
+    let result = LeConnUpdate::new(
         ConnHandle::new(handle),
         bt_hci::param::Duration::from_millis(100),
-        bt_hci::param::Duration::from_millis(100),
-        4,
+        bt_hci::param::Duration::from_millis(200),
+        50,
         bt_hci::param::Duration::from_millis(6000),
         bt_hci::param::Duration::from_millis(0),
         bt_hci::param::Duration::from_millis(0),
     )
     .exec(sdc)
     .await;
+    defmt::info!("LeConnUpdate result: {:?}", result);
 }
 
 fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
@@ -417,7 +443,7 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
 
 // ---- Main ----
 
-const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe5ScheduledGate;
 const ESB_IDLE_MS: u64 = 0;
 
 #[embassy_executor::main]
