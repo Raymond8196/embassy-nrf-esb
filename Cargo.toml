@@ -16,6 +16,10 @@ defmt = { version = "0.3", optional = true }
 # nrf-mpsl: tracked via git because crates.io 0.3.0 still pins embassy-nrf 0.7,
 # while this crate uses 0.10. The git head migrated nrf-mpsl to embassy-nrf 0.10.
 # Pin to a known-good SHA for reproducibility.
+# RELEASE BLOCKER: this git dependency prevents publishing to crates.io
+# (cargo refuses git deps in published crates). Publishing the `mpsl` feature
+# must wait until nrf-mpsl cuts a crates.io release built against embassy-nrf
+# 0.10. Until then, only the default (non-mpsl) feature set is publishable.
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
 
 [features]

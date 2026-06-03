@@ -24,6 +24,8 @@ pub enum CoexistenceProfile {
     DiagnosticPipe1Prx8ms,
     /// Same narrow pipe-1 diagnostic with a 12 ms PRX receive window.
     DiagnosticPipe1Prx12ms,
+    /// 11 ms PRX receive window requested every 12 ms, paired with PTX alignment.
+    DiagnosticPipe1Prx11msPaced12ms,
     /// Same narrow pipe-1 diagnostic with a 20 ms PRX receive window.
     DiagnosticPipe1Prx20ms,
     /// Advertising-visible BLE coexistence smoke profile.
@@ -592,6 +594,29 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event,
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::DiagnosticPipe1Prx11msPaced12ms => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 11_000,
+                    in_slot_match_us: 10_500,
+                    report_every: 8,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                    schedule: PrxScheduleConfig::paced(12_000),
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,

@@ -1,8 +1,19 @@
 //! Three-mode event-driven PTX: ESB send-on-event + BLE + USB CDC.
 //!
 //! Unlike the continuous-poll `mpsl_3mode_poll`, this example sends ESB
-//! packets only when a simulated key event triggers. Each send attempts
-//! one timeslot; if ACK is not received, it retries after a short delay.
+//! packets only when a real key event triggers. A GPIO matrix-scan task
+//! detects press/release transitions and pushes them onto a channel; the
+//! main loop blocks on that channel, so when no keys change the PTX issues
+//! zero timeslot requests. Each event attempts one timeslot; if ACK is not
+//! received, it retries a few times before the event is dropped.
+//!
+//! Event sources:
+//! - On-board button SW1 (P1.06 on the nRF52840 dongle): press it to emit a
+//!   single key event with no external wiring. This is the easiest way to
+//!   verify the event-driven path.
+//! - Optional 2x2 GPIO matrix: rows are driven outputs (P0.13/P0.15), columns
+//!   are pulled-down inputs (P0.17/P0.20). Shorting a row pad to a column pad
+//!   emits a key `(row, col)`. Adapt the pins to a board's real matrix.
 //!
 //! Pair with `mpsl_3mode_central` running on the PRX/main dongle.
 //!
@@ -21,12 +32,14 @@ use bt_hci::param::{
     AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
 };
 use embassy_executor::Spawner;
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::usb::Driver as UsbDriver;
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 use embassy_nrf::{bind_interrupts, peripherals, rng, usb};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Instant;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
@@ -37,6 +50,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
+use embassy_nrf_esb::mpsl_schedule::{LinkTiming, LinkTimingConfig, LinkTimingMode};
 use embassy_nrf_esb::mpsl_timeslot::{
     CoexistenceProfile, PtxEventConfig, SignalCounters, open_event_session,
 };
@@ -47,9 +61,79 @@ type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 const LOG_BUF_SIZE: usize = 256;
 const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY_MS: u64 = 2;
+const ENABLE_FIRST_ATTEMPT_ALIGNMENT: bool = false;
+const ENABLE_HINT_RETRY_WAIT: bool = false;
+const MIN_HINT_RETRY_GAP_US: u32 = 500;
+const LINK_TIMING_CONFIG: LinkTimingConfig = LinkTimingConfig {
+    hint_valid_us: 200_000,
+    max_wait_us: 2_000,
+    window_guard_us: 400,
+    miss_limit: 4,
+};
 
 static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_SIZE>, 4> =
     Channel::new();
+
+// ---- Key matrix event source ----
+
+const MATRIX_ROWS: usize = 2;
+const MATRIX_COLS: usize = 2;
+// Scan cadence. Scanning itself never requests a timeslot; only an actual
+// press/release transition is pushed onto KEY_CHANNEL, so an untouched matrix
+// keeps the PTX fully idle.
+const SCAN_INTERVAL_MS: u64 = 2;
+const ROW_SETTLE_US: u64 = 5;
+
+#[derive(Clone, Copy)]
+struct KeyEvent {
+    key_id: u8,
+    pressed: bool,
+}
+
+static KEY_CHANNEL: Channel<CriticalSectionRawMutex, KeyEvent, 16> = Channel::new();
+
+// Key id reported by the on-board button, distinct from any matrix position.
+const BUTTON_KEY_ID: u8 = 0xFF;
+
+#[embassy_executor::task]
+async fn matrix_scan_task(
+    mut rows: [Output<'static>; MATRIX_ROWS],
+    cols: [Input<'static>; MATRIX_COLS],
+    button: Input<'static>,
+) {
+    let mut state = [[false; MATRIX_COLS]; MATRIX_ROWS];
+    let mut button_state = false;
+    loop {
+        for (r, row) in rows.iter_mut().enumerate() {
+            row.set_high();
+            embassy_time::Timer::after_micros(ROW_SETTLE_US).await;
+            for (c, col) in cols.iter().enumerate() {
+                let pressed = col.is_high();
+                if pressed != state[r][c] {
+                    state[r][c] = pressed;
+                    let key_id = (r * MATRIX_COLS + c) as u8;
+                    // Drop on overflow: a full channel means the link is far
+                    // behind; losing an edge is better than blocking the scan.
+                    let _ = KEY_CHANNEL.try_send(KeyEvent { key_id, pressed });
+                }
+            }
+            row.set_low();
+        }
+
+        // On-board button (active low with pull-up). Lets a bare dongle be
+        // verified by pressing SW1, with no external matrix wiring.
+        let button_pressed = button.is_low();
+        if button_pressed != button_state {
+            button_state = button_pressed;
+            let _ = KEY_CHANNEL.try_send(KeyEvent {
+                key_id: BUTTON_KEY_ID,
+                pressed: button_pressed,
+            });
+        }
+
+        embassy_time::Timer::after_millis(SCAN_INTERVAL_MS).await;
+    }
+}
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -128,6 +212,14 @@ impl core::fmt::Write for WriteBuf<'_> {
         self.buf[self.pos..end].copy_from_slice(&bytes[..count]);
         self.pos = end;
         Ok(())
+    }
+}
+
+fn link_mode_id(mode: LinkTimingMode) -> u8 {
+    match mode {
+        LinkTimingMode::Unsynced => 0,
+        LinkTimingMode::Synced => 1,
+        LinkTimingMode::Degraded => 2,
     }
 }
 
@@ -378,6 +470,19 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_task(usb_dev).unwrap());
     spawner.spawn(cdc_logger_task(cdc_class).unwrap());
 
+    // Real key-matrix event source. Rows drive, columns read with pulldown.
+    let rows: [Output<'static>; MATRIX_ROWS] = [
+        Output::new(p.P0_13, Level::Low, OutputDrive::Standard),
+        Output::new(p.P0_15, Level::Low, OutputDrive::Standard),
+    ];
+    let cols: [Input<'static>; MATRIX_COLS] = [
+        Input::new(p.P0_17, Pull::Down),
+        Input::new(p.P0_20, Pull::Down),
+    ];
+    // On-board SW1 (P1.06 on the nRF52840 dongle), active low.
+    let button = Input::new(p.P1_06, Pull::Up);
+    spawner.spawn(matrix_scan_task(rows, cols, button).unwrap());
+
     let esb_cfg = EsbConfig::default();
     let esb_addr = EsbAddresses::new(
         [0xE7, 0xE7, 0xE7, 0xE7],
@@ -392,7 +497,7 @@ async fn main(spawner: Spawner) {
     let mut startup = WriteBuf::new(&mut startup_buf);
     let _ = write!(
         startup,
-        "[START] role=event profile={:?} cfg={}/{} pipe={} ack_to={} retries={} req_to={} retry_hi={}\r\n",
+        "[START] role=event profile={:?} cfg={}/{} pipe={} ack_to={} retries={} req_to={} retry_hi={} align={} retry_wait={}\r\n",
         PROFILE,
         event_cfg.slot_length_us,
         event_cfg.in_slot_match_us,
@@ -401,6 +506,8 @@ async fn main(spawner: Spawner) {
         event_cfg.max_retries,
         event_cfg.request.timeout_us,
         event_cfg.request.retry_blocked_at_high_priority as u8,
+        ENABLE_FIRST_ATTEMPT_ALIGNMENT as u8,
+        ENABLE_HINT_RETRY_WAIT as u8,
     );
     let startup_len = startup.pos;
     log(&startup_buf[..startup_len]);
@@ -420,25 +527,35 @@ async fn main(spawner: Spawner) {
     let mut event_count: u32 = 0;
     let mut total_acked: u32 = 0;
     let mut total_sends: u32 = 0;
-    let mut pending: Option<[u8; 4]> = None;
+    let mut link_timing = LinkTiming::new();
 
     loop {
-        embassy_time::Timer::after_millis(50).await;
-
-        if pending.is_none() {
-            event_count += 1;
-            pending = Some([
-                (event_count & 0xFF) as u8,
-                ((event_count >> 8) & 0xFF) as u8,
-                0,
-                0,
-            ]);
-        }
-
-        let report = pending.unwrap();
+        // Block until a real key transition arrives. An untouched matrix
+        // produces no wakeup here, so the PTX issues no timeslot requests.
+        let key_ev = KEY_CHANNEL.receive().await;
+        event_count += 1;
+        let event_since_us = Instant::now().as_micros();
+        let report = [
+            key_ev.key_id,
+            key_ev.pressed as u8,
+            (event_count & 0xFF) as u8,
+            ((event_count >> 8) & 0xFF) as u8,
+        ];
         let mut acked = false;
         let mut attempts: u8 = 0;
         let mut event_counters = SignalCounters::ZERO;
+        let mut wait_us: u32 = 0;
+        let mut fallback_count: u8 = 0;
+
+        if ENABLE_FIRST_ATTEMPT_ALIGNMENT {
+            let wait = link_timing.bounded_wait(Instant::now().as_micros(), LINK_TIMING_CONFIG);
+            if wait.fallback.is_some() {
+                fallback_count = fallback_count.saturating_add(1);
+            } else if wait.wait_us > 0 {
+                wait_us = wait_us.saturating_add(wait.wait_us);
+                embassy_time::Timer::after_micros(wait.wait_us as u64).await;
+            }
+        }
 
         loop {
             attempts += 1;
@@ -457,30 +574,51 @@ async fn main(spawner: Spawner) {
 
             if result.ack_ok {
                 acked = true;
+                if let Some(hint) = result.schedule_hint {
+                    link_timing.observe_hint(Instant::now().as_micros(), hint);
+                }
                 break;
             }
+
+            link_timing.observe_miss(LINK_TIMING_CONFIG);
 
             if attempts >= MAX_RETRIES {
                 break;
             }
 
-            embassy_time::Timer::after_millis(RETRY_DELAY_MS).await;
+            if ENABLE_HINT_RETRY_WAIT {
+                let wait = link_timing.bounded_wait(Instant::now().as_micros(), LINK_TIMING_CONFIG);
+                if wait.fallback.is_some() {
+                    fallback_count = fallback_count.saturating_add(1);
+                    embassy_time::Timer::after_millis(RETRY_DELAY_MS).await;
+                } else {
+                    let actual_wait_us = wait.wait_us.max(MIN_HINT_RETRY_GAP_US);
+                    wait_us = wait_us.saturating_add(actual_wait_us);
+                    embassy_time::Timer::after_micros(actual_wait_us as u64).await;
+                }
+            } else {
+                fallback_count = fallback_count.saturating_add(1);
+                embassy_time::Timer::after_millis(RETRY_DELAY_MS).await;
+            }
         }
 
         if acked {
             total_acked += 1;
-            pending = None;
         }
+
+        let now_us = Instant::now().as_micros();
+        let latency_us = now_us.saturating_sub(event_since_us);
+        let link = link_timing.snapshot(now_us);
 
         let mut buf = [0u8; LOG_BUF_SIZE];
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "e={} ok={} att={} pend={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={}\r\n",
+            "e={} ok={} att={} drop={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} lat={} sync={} wait={} fb={} lock={} miss={} age={}\r\n",
             event_count,
             acked,
             attempts,
-            pending.is_some(),
+            !acked,
             event_counters.start,
             event_counters.timer0,
             event_counters.radio,
@@ -491,6 +629,13 @@ async fn main(spawner: Spawner) {
             event_counters.session_closed,
             event_counters.overstayed,
             event_counters.invalid_return,
+            latency_us,
+            link_mode_id(link.mode),
+            wait_us,
+            fallback_count,
+            link.lock_count,
+            link.miss_streak,
+            link.hint_age_us,
         );
         let log_len = w.pos;
         log(&buf[..log_len]);

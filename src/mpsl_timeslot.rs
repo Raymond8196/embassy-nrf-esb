@@ -97,9 +97,18 @@ fn configure_normal_request(
 }
 
 struct Timer0RawMutex;
+// SAFETY: this RawMutex serializes task context against the high-priority MPSL
+// timeslot callback (which runs from the TIMER0/RADIO IRQ during a granted
+// slot) by masking the timeslot timer interrupt for the duration of `f`. The
+// callback is the only other code touching the guarded state, so masking its
+// IRQ line is sufficient mutual exclusion on this single-core part. The
+// compiler fences keep the critical-section body from being reordered outside
+// the masked window.
 unsafe impl RawMutex for Timer0RawMutex {
     const INIT: Self = Timer0RawMutex;
     fn lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        // SAFETY: NVIC::PTR is a valid static register block; we set/clear only
+        // the single timeslot-timer interrupt bit and restore it after `f`.
         unsafe {
             let nvic = &*NVIC::PTR;
             let irq = TIMESLOT_TIMER_INTERRUPT as usize;
@@ -199,6 +208,12 @@ struct InnerState {
     target_count: u32,
 }
 
+// SAFETY: InnerState is never accessed concurrently without synchronization.
+// It lives inside `Mutex<Timer0RawMutex, RefCell<_>>`, so every read/write from
+// task context masks the timeslot IRQ first, and the only other accessor (the
+// timeslot callback) runs in that masked window. The raw MPSL request/return
+// params it holds are plain POD with no thread-affinity, so moving the state
+// between contexts is sound.
 unsafe impl Send for InnerState {}
 unsafe impl Sync for InnerState {}
 
@@ -274,6 +289,12 @@ impl Drop for BusyGuard {
     }
 }
 
+// SAFETY: invoked by MPSL from the high-priority timeslot signal context with a
+// valid `session_id` for the open session and a `signal` from the MPSL signal
+// enum. It must stay deterministic and minimal (no allocation, no async, no
+// unmasked locking) and either return a pointer to a `'static` return-param
+// struct that outlives the call or null. We only ever return `&STATE`'s
+// return_param (a static) or null, satisfying the lifetime contract.
 unsafe extern "C" fn timeslot_callback(
     session_id: u8,
     signal: u32,
@@ -585,6 +606,7 @@ struct PtxInnerState {
     schedule_hint_count: u32,
     schedule_hint_bad_count: u32,
     last_schedule_window_id: u32,
+    last_schedule_hint: Option<ScheduleHint>,
     schedule_tracker: ScheduleTracker,
     schedule_gate: PtxScheduleGateConfig,
     schedule_skip_slots_remaining: u8,
@@ -616,6 +638,11 @@ struct PtxInnerState {
     event_ack_ok: bool,
 }
 
+// SAFETY: same invariant as InnerState — PtxInnerState is only reached through
+// `Mutex<Timer0RawMutex, RefCell<_>>`, which masks the timeslot IRQ around task
+// access, and the timeslot callback (the only other accessor) runs inside that
+// masked window. Its fields are POD counters/flags plus raw MPSL params with no
+// thread-affinity.
 unsafe impl Send for PtxInnerState {}
 unsafe impl Sync for PtxInnerState {}
 
@@ -631,6 +658,13 @@ struct PtxBuffers {
     tx: UnsafeCell<[u8; 256]>,
     rx: UnsafeCell<[u8; 256]>,
 }
+// SAFETY: the UnsafeCell DMA buffers are only ever dereferenced from inside the
+// PTX timeslot callback, which MPSL runs in a single high-priority context with
+// at most one timeslot active at a time. There is no concurrent aliasing: task
+// code never touches PTX_BUFS, and the radio's EasyDMA reads/writes the buffer
+// only while the callback owns the slot. `#[link_section = ".data"]` keeps it in
+// RAM so EasyDMA can address it. The `align(4)` satisfies the RADIO PACKETPTR
+// alignment requirement.
 unsafe impl Sync for PtxBuffers {}
 
 #[unsafe(link_section = ".data")]
@@ -683,6 +717,14 @@ fn ptx_configure_next_poll_request(state: &mut PtxInnerState) {
 fn ptx_observe_schedule_hint(state: &mut PtxInnerState, hint: ScheduleHint, ack_offset_us: u32) {
     state.schedule_hint_count += 1;
     state.last_schedule_window_id = hint.window_id;
+    let elapsed_after_ack_us = state.in_slot_match_us.saturating_sub(ack_offset_us);
+    state.last_schedule_hint = Some(ScheduleHint::new(
+        hint.flags,
+        hint.window_id,
+        hint.next_delay_us.saturating_sub(elapsed_after_ack_us),
+        hint.period_us,
+        hint.window_us,
+    ));
     state.schedule_tracker.observe_hint(hint);
 
     match state.schedule_gate.mode {
@@ -769,6 +811,7 @@ impl PtxState {
                 schedule_hint_count: 0,
                 schedule_hint_bad_count: 0,
                 last_schedule_window_id: 0,
+                last_schedule_hint: None,
                 schedule_tracker: ScheduleTracker::new(),
                 schedule_gate: PtxScheduleGateConfig::disabled(),
                 schedule_skip_slots_remaining: 0,
@@ -814,6 +857,12 @@ impl PtxState {
     }
 }
 
+// SAFETY: same MPSL contract as `timeslot_callback` — called from the
+// high-priority timeslot signal context with a valid `session_id`/`signal`,
+// must stay deterministic and minimal, and returns either a pointer into the
+// static `PTX_STATE` return_param or null. The PTX_BUFS EasyDMA buffers it
+// programs are only ever touched from this single-context callback (see the
+// `unsafe impl Sync for PtxBuffers` note).
 unsafe extern "C" fn ptx_timeslot_callback(
     session_id: u8,
     signal: u32,
@@ -1319,6 +1368,7 @@ pub async fn run_ptx_slots(
         state.schedule_hint_count = 0;
         state.schedule_hint_bad_count = 0;
         state.last_schedule_window_id = 0;
+        state.last_schedule_hint = None;
         state.schedule_tracker.reset();
         state.schedule_gate = PtxScheduleGateConfig::disabled();
         state.schedule_skip_slots_remaining = 0;
@@ -1457,6 +1507,10 @@ struct PrxInnerState {
     earliest_cancelled: u32,
 }
 
+// SAFETY: same invariant as InnerState/PtxInnerState — PrxInnerState is reached
+// only through `Mutex<Timer0RawMutex, RefCell<_>>` (task access masks the
+// timeslot IRQ) and the PRX timeslot callback runs inside that masked window.
+// Fields are POD counters/flags plus raw MPSL params with no thread-affinity.
 unsafe impl Send for PrxInnerState {}
 unsafe impl Sync for PrxInnerState {}
 
@@ -1472,6 +1526,11 @@ struct PrxBuffers {
     rx: UnsafeCell<[u8; 256]>,
     ack_tx: UnsafeCell<[u8; 256]>,
 }
+// SAFETY: identical invariant to PtxBuffers. The rx/ack_tx EasyDMA buffers are
+// dereferenced only from inside the PRX timeslot callback (single high-priority
+// MPSL context, one slot at a time), never from task code, so there is no
+// concurrent aliasing with the radio's DMA access. `.data` placement keeps them
+// in RAM and `align(4)` meets the PACKETPTR alignment requirement.
 unsafe impl Sync for PrxBuffers {}
 
 #[unsafe(link_section = ".data")]
@@ -1521,7 +1580,15 @@ fn prx_next_window_delay_us(state: &PrxInnerState) -> u32 {
     let t = pac::TIMER0;
     t.tasks_capture(2).write_value(1);
     let elapsed_us = t.cc(2).read();
-    state.slot_length_us.saturating_sub(elapsed_us)
+    prx_schedule_period_us(state).saturating_sub(elapsed_us)
+}
+
+fn prx_schedule_period_us(state: &PrxInnerState) -> u32 {
+    if state.prx_schedule.normal_distance_us > 0 {
+        state.prx_schedule.normal_distance_us
+    } else {
+        state.slot_length_us
+    }
 }
 
 fn write_ack_counter_packet(
@@ -1612,6 +1679,12 @@ impl PrxState {
     }
 }
 
+// SAFETY: same MPSL contract as `timeslot_callback` — called from the
+// high-priority timeslot signal context with a valid `session_id`/`signal`,
+// must stay deterministic and minimal, and returns either a pointer into the
+// static `PRX_STATE` return_param or null. The PRX_BUFS EasyDMA buffers it
+// programs are only ever touched from this single-context callback (see the
+// `unsafe impl Sync for PrxBuffers` note).
 unsafe extern "C" fn prx_timeslot_callback(
     session_id: u8,
     signal: u32,
@@ -1721,12 +1794,13 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 };
                                 let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
                                 let next_delay_us = prx_next_window_delay_us(state);
+                                let period_us = prx_schedule_period_us(state);
                                 write_ack_counter_packet(
                                     ack_buf,
                                     counter,
                                     state.counters.start,
                                     next_delay_us,
-                                    state.slot_length_us,
+                                    period_us,
                                     state.in_slot_match_us,
                                 );
                                 let dma_ptr =
@@ -1766,12 +1840,13 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 };
                                 let ack_buf = unsafe { &mut *PRX_BUFS.ack_tx.get() };
                                 let next_delay_us = prx_next_window_delay_us(state);
+                                let period_us = prx_schedule_period_us(state);
                                 write_ack_counter_packet(
                                     ack_buf,
                                     counter,
                                     state.counters.start,
                                     next_delay_us,
-                                    state.slot_length_us,
+                                    period_us,
                                     state.in_slot_match_us,
                                 );
                                 let dma_ptr =
@@ -2459,6 +2534,7 @@ pub fn open_ptx_poll_session(
         state.schedule_hint_count = 0;
         state.schedule_hint_bad_count = 0;
         state.last_schedule_window_id = 0;
+        state.last_schedule_hint = None;
         state.schedule_tracker.reset();
         state.schedule_gate = poll_config.schedule_gate;
         state.schedule_skip_slots_remaining = 0;
@@ -2529,6 +2605,8 @@ pub struct PtxSendResult {
     pub ack_ok: bool,
     /// Signal counters observed during this send attempt.
     pub counters: SignalCounters,
+    /// Valid PRX schedule hint carried in the ACK payload, if present.
+    pub schedule_hint: Option<ScheduleHint>,
 }
 
 /// A long-lived event-driven PTX session.
@@ -2580,6 +2658,7 @@ pub fn open_event_session(
         state.counters = SignalCounters::ZERO;
         state.done = false;
         state.target_count = 0;
+        state.slot_length_us = event_config.slot_length_us;
         state.in_slot_match_us = event_config.in_slot_match_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
@@ -2593,6 +2672,20 @@ pub fn open_event_session(
         state.ack_payload_count = 0;
         state.ack_inversions = 0;
         state.last_ack_counter = 0;
+        state.schedule_hint_count = 0;
+        state.schedule_hint_bad_count = 0;
+        state.last_schedule_window_id = 0;
+        state.last_schedule_hint = None;
+        state.schedule_tracker.reset();
+        state.schedule_gate = PtxScheduleGateConfig::disabled();
+        state.schedule_skip_slots_remaining = 0;
+        state.schedule_skip_count = 0;
+        state.schedule_lock_active = false;
+        state.schedule_lock_miss_streak = 0;
+        state.schedule_lock_count = 0;
+        state.schedule_reacquire_count = 0;
+        state.schedule_period_us = 0;
+        state.schedule_next_distance_us = 0;
         state.pid = 0;
         state.poll_pipes = 0;
         state.poll_pipe_mask = 0;
@@ -2657,6 +2750,7 @@ impl PtxEventSession {
             state.event_pending = true;
             state.event_result_ready = false;
             state.event_ack_ok = false;
+            state.last_schedule_hint = None;
             state.done = false;
             state.counters = SignalCounters::ZERO;
             true
@@ -2700,11 +2794,16 @@ impl PtxEventSession {
             self.tx_count += 1;
 
             let counters = state.counters;
+            let schedule_hint = state.last_schedule_hint;
 
             state.event_result_ready = false;
             state.event_pending = false;
 
-            Ok(PtxSendResult { ack_ok, counters })
+            Ok(PtxSendResult {
+                ack_ok,
+                counters,
+                schedule_hint,
+            })
         })?;
 
         Ok(result)

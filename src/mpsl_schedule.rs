@@ -215,9 +215,192 @@ impl ScheduleTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum LinkTimingMode {
+    Unsynced,
+    Synced,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum LinkTimingFallback {
+    NoHint,
+    HintExpired,
+    WaitTooLong,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LinkTimingSnapshot {
+    pub mode: LinkTimingMode,
+    pub lock_count: u32,
+    pub fallback_count: u32,
+    pub miss_streak: u8,
+    pub last_window_id: u32,
+    pub hint_age_us: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BoundedWindowWait {
+    pub wait_us: u32,
+    pub fallback: Option<LinkTimingFallback>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LinkTimingConfig {
+    pub hint_valid_us: u32,
+    pub max_wait_us: u32,
+    pub window_guard_us: u32,
+    pub miss_limit: u8,
+}
+
+impl LinkTimingConfig {
+    pub const fn keyboard_default() -> Self {
+        Self {
+            hint_valid_us: 200_000,
+            max_wait_us: 4_000,
+            window_guard_us: 400,
+            miss_limit: 4,
+        }
+    }
+
+    pub fn validate(self) -> bool {
+        self.hint_valid_us > 0 && self.max_wait_us > 0 && self.miss_limit > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LinkTiming {
+    mode: LinkTimingMode,
+    last_hint: Option<ScheduleHint>,
+    last_hint_at_us: u64,
+    next_window_at_us: u64,
+    lock_count: u32,
+    fallback_count: u32,
+    miss_streak: u8,
+}
+
+impl LinkTiming {
+    pub const fn new() -> Self {
+        Self {
+            mode: LinkTimingMode::Unsynced,
+            last_hint: None,
+            last_hint_at_us: 0,
+            next_window_at_us: 0,
+            lock_count: 0,
+            fallback_count: 0,
+            miss_streak: 0,
+        }
+    }
+
+    pub fn observe_hint(&mut self, now_us: u64, hint: ScheduleHint) {
+        let was_synced = matches!(self.mode, LinkTimingMode::Synced);
+        self.mode = LinkTimingMode::Synced;
+        self.last_hint = Some(hint);
+        self.last_hint_at_us = now_us;
+        self.next_window_at_us = now_us.saturating_add(hint.next_delay_us as u64);
+        self.miss_streak = 0;
+        if !was_synced {
+            self.lock_count = self.lock_count.saturating_add(1);
+        }
+    }
+
+    pub fn observe_miss(&mut self, config: LinkTimingConfig) {
+        self.miss_streak = self.miss_streak.saturating_add(1);
+        if self.miss_streak >= config.miss_limit {
+            self.mode = LinkTimingMode::Degraded;
+        }
+    }
+
+    pub fn reset_to_scan(&mut self) {
+        self.mode = LinkTimingMode::Unsynced;
+        self.last_hint = None;
+        self.next_window_at_us = 0;
+        self.miss_streak = 0;
+    }
+
+    pub fn bounded_wait(&mut self, now_us: u64, config: LinkTimingConfig) -> BoundedWindowWait {
+        if !config.validate() {
+            self.fallback_count = self.fallback_count.saturating_add(1);
+            return BoundedWindowWait {
+                wait_us: 0,
+                fallback: Some(LinkTimingFallback::NoHint),
+            };
+        }
+
+        if matches!(self.mode, LinkTimingMode::Degraded) {
+            self.fallback_count = self.fallback_count.saturating_add(1);
+            return BoundedWindowWait {
+                wait_us: 0,
+                fallback: Some(LinkTimingFallback::Degraded),
+            };
+        }
+
+        let Some(hint) = self.last_hint else {
+            self.fallback_count = self.fallback_count.saturating_add(1);
+            return BoundedWindowWait {
+                wait_us: 0,
+                fallback: Some(LinkTimingFallback::NoHint),
+            };
+        };
+
+        let age_us = now_us.saturating_sub(self.last_hint_at_us);
+        if age_us > config.hint_valid_us as u64 {
+            self.mode = LinkTimingMode::Unsynced;
+            self.last_hint = None;
+            self.fallback_count = self.fallback_count.saturating_add(1);
+            return BoundedWindowWait {
+                wait_us: 0,
+                fallback: Some(LinkTimingFallback::HintExpired),
+            };
+        }
+
+        while self.next_window_at_us.saturating_add(hint.window_us as u64) <= now_us {
+            self.next_window_at_us = self.next_window_at_us.saturating_add(hint.period_us as u64);
+        }
+
+        let target_us = self
+            .next_window_at_us
+            .saturating_sub(config.window_guard_us as u64);
+        let wait_us = target_us.saturating_sub(now_us);
+        if wait_us > config.max_wait_us as u64 {
+            self.fallback_count = self.fallback_count.saturating_add(1);
+            return BoundedWindowWait {
+                wait_us: 0,
+                fallback: Some(LinkTimingFallback::WaitTooLong),
+            };
+        }
+
+        BoundedWindowWait {
+            wait_us: wait_us as u32,
+            fallback: None,
+        }
+    }
+
+    pub fn snapshot(&self, now_us: u64) -> LinkTimingSnapshot {
+        LinkTimingSnapshot {
+            mode: self.mode,
+            lock_count: self.lock_count,
+            fallback_count: self.fallback_count,
+            miss_streak: self.miss_streak,
+            last_window_id: self.last_hint.map(|h| h.window_id).unwrap_or(0),
+            hint_age_us: now_us
+                .saturating_sub(self.last_hint_at_us)
+                .min(u32::MAX as u64) as u32,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        LinkTiming, LinkTimingConfig, LinkTimingFallback, LinkTimingMode,
         SCHEDULE_COUNTER_HINT_PAYLOAD_LEN, SCHEDULE_HINT_PAYLOAD_OFFSET, ScheduleHint,
         ScheduleHintError, ScheduleTracker, ScheduleTrackerSnapshot,
         decode_counter_payload_schedule_hint, decode_schedule_hint, encode_schedule_hint,
@@ -333,5 +516,84 @@ mod tests {
                 last_window_id: 20,
             }
         );
+    }
+
+    #[test]
+    fn link_timing_locks_on_hint_and_waits_inside_budget() {
+        let mut timing = LinkTiming::new();
+        let config = LinkTimingConfig::keyboard_default();
+
+        timing.observe_hint(1_000, ScheduleHint::new(0, 7, 2_000, 11_000, 10_500));
+
+        let wait = timing.bounded_wait(2_000, config);
+        assert_eq!(wait.fallback, None);
+        assert_eq!(wait.wait_us, 600);
+
+        let snapshot = timing.snapshot(2_000);
+        assert_eq!(snapshot.mode, LinkTimingMode::Synced);
+        assert_eq!(snapshot.lock_count, 1);
+        assert_eq!(snapshot.last_window_id, 7);
+    }
+
+    #[test]
+    fn link_timing_falls_back_when_wait_exceeds_latency_budget() {
+        let mut timing = LinkTiming::new();
+        let config = LinkTimingConfig {
+            max_wait_us: 500,
+            ..LinkTimingConfig::keyboard_default()
+        };
+
+        timing.observe_hint(1_000, ScheduleHint::new(0, 1, 4_000, 11_000, 10_500));
+
+        let wait = timing.bounded_wait(1_100, config);
+        assert_eq!(wait.wait_us, 0);
+        assert_eq!(wait.fallback, Some(LinkTimingFallback::WaitTooLong));
+        assert_eq!(timing.snapshot(1_100).fallback_count, 1);
+    }
+
+    #[test]
+    fn link_timing_expires_old_hints_and_degrades_after_misses() {
+        let mut timing = LinkTiming::new();
+        let config = LinkTimingConfig {
+            hint_valid_us: 1_000,
+            miss_limit: 2,
+            ..LinkTimingConfig::keyboard_default()
+        };
+
+        assert_eq!(
+            timing.bounded_wait(100, config).fallback,
+            Some(LinkTimingFallback::NoHint)
+        );
+
+        timing.observe_hint(1_000, ScheduleHint::new(0, 3, 1_000, 11_000, 10_500));
+        assert_eq!(
+            timing.bounded_wait(3_001, config).fallback,
+            Some(LinkTimingFallback::HintExpired)
+        );
+        assert_eq!(timing.snapshot(3_001).mode, LinkTimingMode::Unsynced);
+
+        timing.observe_hint(4_000, ScheduleHint::new(0, 4, 1_000, 11_000, 10_500));
+        timing.observe_miss(config);
+        timing.observe_miss(config);
+        assert_eq!(
+            timing.bounded_wait(4_100, config).fallback,
+            Some(LinkTimingFallback::Degraded)
+        );
+        assert_eq!(timing.snapshot(4_100).mode, LinkTimingMode::Degraded);
+    }
+
+    #[test]
+    fn link_timing_advances_past_stale_windows() {
+        let mut timing = LinkTiming::new();
+        let config = LinkTimingConfig {
+            max_wait_us: 20_000,
+            ..LinkTimingConfig::keyboard_default()
+        };
+
+        timing.observe_hint(1_000, ScheduleHint::new(0, 9, 1_000, 11_000, 10_500));
+
+        let wait = timing.bounded_wait(12_500, config);
+        assert_eq!(wait.fallback, None);
+        assert_eq!(wait.wait_us, 100);
     }
 }

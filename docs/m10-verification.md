@@ -829,6 +829,126 @@ Next direction B steps:
    - session lifecycle issue: `si/sc/iv/ov` grows.
    - USB/reboot issue: CDC port disappears or event counters restart.
 
+### 2026-06-03 Hint-Aware Event Retry Increment
+
+Implementation update:
+
+- Added a pure `LinkTiming` helper in `mpsl_schedule` with
+  `Unsynced`/`Synced`/`Degraded` states, bounded wait calculation, hint expiry,
+  wait-budget fallback, and miss-streak degradation.
+- `PtxSendResult` now exposes the valid PRX `ScheduleHint` parsed from ACK
+  payloads. The hint returned to async Event code is adjusted for the elapsed
+  time between ACK reception and PTX slot end.
+- `mpsl_3mode_event` now records event latency (`lat`) and appends
+  `sync/wait/fb/lock/miss/age` diagnostics while preserving the old
+  `e=... ok=... att=... pend=...` prefix for the existing stats script.
+- Event retry is now conservative hint-aware:
+  - First attempt remains immediate.
+  - After a miss, if a valid hint predicts a PRX window within the 4ms wait
+    budget, Event waits until `window_start - 400us`.
+  - Hint-driven retry waits are clamped to a minimum 500us gap to avoid
+    back-to-back MPSL timeslot requests after a zero-wait prediction.
+  - If no hint is available, the hint is stale, the wait exceeds budget, or the
+    link is degraded, Event falls back to the existing 2ms retry delay.
+
+Host/build verification:
+
+```bash
+cargo fmt
+cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+cargo check --release --example mpsl_3mode_event --features nrf52840,defmt,mpsl
+cargo check --release --example mpsl_3mode_central --features nrf52840,defmt,mpsl
+```
+
+Result:
+
+- Host unit tests: 52 passed, including 4 new `LinkTiming` tests.
+- First hardware smoke of the pre-clamp build showed the new fields working
+  (`lat/sync/wait/fb/lock/miss/age`) but also exposed `[ERR] send` after
+  zero-wait synced retries. The minimum 500us hint retry gap was added after
+  that observation.
+- Post-clamp 120s hardware validation was stable but did not improve the
+  primary metric:
+  - `ack_rate=1.0000`
+  - `avg_att=1.15`
+  - `attempt_dist={1: 1980, 2: 218, 3: 15, 4: 11, 5: 12}`
+  - latency: `p50=2808us`, `p95=6134us`, `p99=12726us`, `max=20325us`
+  - hint wait was active: `wait_nonzero=256`, `wait_sum=158500us`,
+    `fb_sum=12`, `sync_counts={1: 2236}`
+  - central remained healthy: `rd_avg=3.55`, `rd_max=5`,
+    `bk_sum=1147`, `cn=0`, `dt=0`
+- Compared with the previous healthy 11ms baseline (`ack_rate=1.0000`,
+  `avg_att=1.12`, `rd_avg/max=3.56/5`), hint-aware retry wait is stable but
+  not beneficial. The default Event path was therefore restored to the fixed
+  2ms retry delay (`ENABLE_HINT_RETRY_WAIT=false`) while keeping the pure helper
+  and diagnostics for future scheduler experiments.
+- A follow-up 120s validation of the default-disabled path confirmed the
+  baseline behavior:
+  - `ack_rate=1.0000`
+  - `avg_att=1.12`
+  - `attempt_dist={1: 2000, 2: 206, 3: 20, 4: 8}`
+  - latency: `p50=2808us`, `p95=7629us`, `p99=12421us`, `max=17334us`
+  - hint wait disabled as expected: `wait_nonzero=0`, `wait_sum=0`,
+    `fb_sum=270`, `sync_counts={1: 2234}`
+  - central remained healthy: `rd_avg=3.54`, `rd_max=5`,
+    `bk_sum=1147`, `cn=0`, `dt=0`
+
+Conclusion:
+
+- ACK-carried schedule hints are useful as observability and as a future input
+  to a fuller admission/scheduler design.
+- Using the hint only after a failed Event send does not address the current
+  average-attempt shortfall. The remaining shortfall is more likely in the
+  timeslot admission/first-attempt placement and retry granularity than in
+  knowing the next PRX window after a miss.
+
+### 2026-06-03 PRX Paced Schedule + First-Attempt Alignment Trial
+
+Implementation update:
+
+- Added `DiagnosticPipe1Prx11msPaced12ms`:
+  - PRX slot: `11000us`
+  - PRX in-slot match: `10500us`
+  - PRX NORMAL request distance: `12000us`
+- Corrected PRX schedule hints for paced schedules:
+  - `period_us` now reports the PRX schedule period, not only slot length.
+  - `next_delay_us` is based on `period - elapsed`, so PTX does not aim for
+    the old continuous-chain slot boundary.
+- Added bounded Event first-attempt alignment using the existing `LinkTiming`
+  helper. The experiment used a `2000us` max wait budget, `400us` window guard,
+  fixed 2ms retries, and hint-retry wait disabled.
+
+Hardware result, 120s:
+
+- `ack_rate=1.0000`
+- `avg_att=1.21`
+- `attempt_dist={1: 1843, 2: 312, 3: 34, 4: 24, 5: 1}`
+- latency: `p50=2808us`, `p95=7630us`, `p99=17212us`, `max=22065us`
+- first-attempt alignment was active: `wait_nonzero=260`,
+  `wait_sum=137932us`, `sync_counts={1: 2214}`
+- central remained session-healthy but did not reduce blocked pressure:
+  `rd_avg=3.87`, `rd_max=7`, `bk_sum=1147`, `central_batches=1162`,
+  `bk/batch=0.987`, `cn=0`, `dt=0`
+
+Comparison to healthy 11ms continuous baseline:
+
+- Baseline: `avg_att=1.12`, `bk/batch≈0.898`, `rd_avg/max=3.56/5`,
+  `p95=7629us`, `p99=12421us`.
+- Paced 11/12ms: `avg_att=1.21`, `bk/batch≈0.987`, `rd_avg/max=3.87/7`,
+  `p95=7630us`, `p99=17212us`.
+
+Conclusion:
+
+- The 1ms planned gap is too small to reduce MPSL blocked pressure. It still
+  produces almost one blocked NORMAL request per central report and makes
+  average attempts worse.
+- First-attempt alignment with a 2ms budget is active and bounded, but it does
+  not compensate for the reduced PRX availability in this profile.
+- The default examples were restored to `DiagnosticPipe1Prx12ms` with
+  first-attempt alignment disabled. Keep the paced profile and corrected hint
+  semantics for future sweeps with larger gaps, for example 11/13ms, 10/13ms,
+  or an adaptive backoff policy.
+
 ## Pending Work
 
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.

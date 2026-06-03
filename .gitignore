@@ -3,3 +3,5 @@
 *.uf2
 *_dfu.zip
 opencode.json
+/.agents/
+session-*.md
