@@ -646,6 +646,57 @@ struct PtxInnerState {
 unsafe impl Send for PtxInnerState {}
 unsafe impl Sync for PtxInnerState {}
 
+impl PtxInnerState {
+    /// Clear all per-session runtime accumulators, counters, and flags back to
+    /// their initial values. Config-derived fields (slot timing, pipe, mode,
+    /// retry limits, and the MPSL request) are left for the session opener to
+    /// set after this call.
+    fn reset_runtime(&mut self) {
+        self.counters = SignalCounters::ZERO;
+        self.done = false;
+        self.target_count = 0;
+        self.phase = PtxPhase::Idle;
+        self.tx_count = 0;
+        self.ack_ok_count = 0;
+        self.payload_byte = 0;
+        self.packets_sent_this_slot = 0;
+        self.ack_payload_count = 0;
+        self.ack_inversions = 0;
+        self.last_ack_counter = 0;
+        self.schedule_hint_count = 0;
+        self.schedule_hint_bad_count = 0;
+        self.last_schedule_window_id = 0;
+        self.last_schedule_hint = None;
+        self.schedule_tracker.reset();
+        self.schedule_skip_slots_remaining = 0;
+        self.schedule_skip_count = 0;
+        self.schedule_lock_active = false;
+        self.schedule_lock_miss_streak = 0;
+        self.schedule_lock_count = 0;
+        self.schedule_reacquire_count = 0;
+        self.schedule_period_us = 0;
+        self.schedule_next_distance_us = 0;
+        self.pid = 0;
+        self.poll_pipes = 0;
+        self.poll_pipe_mask = 0;
+        self.poll_report_every = 0;
+        self.poll_slots_since_report = 0;
+        self.poll_report_ready = false;
+        self.ack_ok_per_pipe = [0; NUM_PIPES];
+        self.tx_per_pipe = [0; NUM_PIPES];
+        self.ack_timeout_count = 0;
+        self.ack_crc_fail_count = 0;
+        self.ack_timeout_per_pipe = [0; NUM_PIPES];
+        self.ack_crc_fail_per_pipe = [0; NUM_PIPES];
+        self.retry_count = 0;
+        self.acked_this_slot = false;
+        self.event_mode = false;
+        self.event_pending = false;
+        self.event_result_ready = false;
+        self.event_ack_ok = false;
+    }
+}
+
 struct PtxState {
     busy: AtomicBool,
     inner: Mutex<Timer0RawMutex, RefCell<PtxInnerState>>,
@@ -1351,38 +1402,17 @@ pub async fn run_ptx_slots(
     });
 
     PTX_STATE.with_inner(|state| {
-        state.counters = SignalCounters::ZERO;
-        state.done = false;
+        state.reset_runtime();
+
         state.target_count = count;
         state.slot_length_us = slot_length_us;
         state.in_slot_match_us = in_slot_match_us;
         state.request_timeout_us = 1_000_000;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
-        state.phase = PtxPhase::Idle;
-        state.tx_count = 0;
-        state.ack_ok_count = 0;
-        state.ack_payload_count = 0;
-        state.ack_inversions = 0;
-        state.last_ack_counter = 0;
-        state.schedule_hint_count = 0;
-        state.schedule_hint_bad_count = 0;
-        state.last_schedule_window_id = 0;
-        state.last_schedule_hint = None;
-        state.schedule_tracker.reset();
         state.schedule_gate = PtxScheduleGateConfig::disabled();
-        state.schedule_skip_slots_remaining = 0;
-        state.schedule_skip_count = 0;
-        state.schedule_lock_active = false;
-        state.schedule_lock_miss_streak = 0;
-        state.schedule_lock_count = 0;
-        state.schedule_reacquire_count = 0;
-        state.schedule_period_us = 0;
-        state.schedule_next_distance_us = 0;
         state.tx_pipe = tx_pipe;
-        state.payload_byte = 0;
         state.packets_per_slot = packets_per_slot;
-        state.packets_sent_this_slot = 0;
         ptx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, 1_000_000);
     });
 
@@ -1513,6 +1543,39 @@ struct PrxInnerState {
 // Fields are POD counters/flags plus raw MPSL params with no thread-affinity.
 unsafe impl Send for PrxInnerState {}
 unsafe impl Sync for PrxInnerState {}
+
+impl PrxInnerState {
+    /// Clear all per-session runtime accumulators, counters, and per-pipe state
+    /// back to their initial values. Config-derived fields (slot timing, pipe
+    /// enables, schedule, recovery policy, report cadence, and the MPSL request)
+    /// are left for the session opener to set after this call.
+    fn reset_runtime(&mut self) {
+        self.counters = SignalCounters::ZERO;
+        self.done = false;
+        self.target_count = 0;
+        self.phase = PrxPhase::Idle;
+        self.rx_count = 0;
+        self.dup_count = 0;
+        self.bad_crc_count = 0;
+        self.last_pid = [0; NUM_PIPES];
+        self.last_crc = [0; NUM_PIPES];
+        self.last_valid = [false; NUM_PIPES];
+        self.slot_active = false;
+        self.ack_counter = [0; NUM_PIPES];
+        self.rx_per_pipe = [0; NUM_PIPES];
+        self.dup_per_pipe = [0; NUM_PIPES];
+        self.bad_crc_per_pipe = [0; NUM_PIPES];
+        self.ack_tx_per_pipe = [0; NUM_PIPES];
+        self.last_report_start = 0;
+        self.report_ready = false;
+        self.prx_windows_since_gap = 0;
+        self.last_request_kind = PRX_REQ_EARLIEST;
+        self.normal_blocked = 0;
+        self.earliest_blocked = 0;
+        self.normal_cancelled = 0;
+        self.earliest_cancelled = 0;
+    }
+}
 
 struct PrxState {
     busy: AtomicBool,
@@ -2033,39 +2096,18 @@ pub async fn run_prx_slots(
     });
 
     PRX_STATE.with_inner(|state| {
-        state.counters = SignalCounters::ZERO;
-        state.done = false;
+        state.reset_runtime();
+
         state.target_count = count;
         state.slot_length_us = slot_length_us;
         state.in_slot_match_us = in_slot_match_us;
         state.request_timeout_us = 1_000_000;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
-        state.phase = PrxPhase::Idle;
-        state.rx_count = 0;
-        state.dup_count = 0;
-        state.bad_crc_count = 0;
-        state.last_pid = [0; NUM_PIPES];
-        state.last_crc = [0; NUM_PIPES];
-        state.last_valid = [false; NUM_PIPES];
         state.enabled_pipes = enabled_pipes;
-        state.slot_active = false;
-        state.ack_counter = [0; NUM_PIPES];
-        state.rx_per_pipe = [0; NUM_PIPES];
-        state.dup_per_pipe = [0; NUM_PIPES];
-        state.bad_crc_per_pipe = [0; NUM_PIPES];
-        state.ack_tx_per_pipe = [0; NUM_PIPES];
         state.report_every = 0;
-        state.last_report_start = 0;
-        state.report_ready = false;
         state.prx_schedule = PrxScheduleConfig::continuous();
-        state.prx_windows_since_gap = 0;
         state.retry_blocked_at_high_priority = true;
-        state.last_request_kind = PRX_REQ_EARLIEST;
-        state.normal_blocked = 0;
-        state.earliest_blocked = 0;
-        state.normal_cancelled = 0;
-        state.earliest_cancelled = 0;
         prx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, 1_000_000);
     });
 
@@ -2246,40 +2288,18 @@ pub fn open_prx_session(
     }
 
     PRX_STATE.with_inner(|state| {
-        state.counters = SignalCounters::ZERO;
-        state.done = false;
-        state.target_count = 0;
+        state.reset_runtime();
+
         state.slot_length_us = slot_config.slot_length_us;
         state.in_slot_match_us = slot_config.in_slot_match_us;
         state.request_timeout_us = slot_config.request.timeout_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
-        state.phase = PrxPhase::Idle;
-        state.rx_count = 0;
-        state.dup_count = 0;
-        state.bad_crc_count = 0;
-        state.last_pid = [0; NUM_PIPES];
-        state.last_crc = [0; NUM_PIPES];
-        state.last_valid = [false; NUM_PIPES];
         state.enabled_pipes = slot_config.enabled_pipes;
         state.recovery_policy = slot_config.recovery;
-        state.slot_active = false;
-        state.ack_counter = [0; NUM_PIPES];
-        state.rx_per_pipe = [0; NUM_PIPES];
-        state.dup_per_pipe = [0; NUM_PIPES];
-        state.bad_crc_per_pipe = [0; NUM_PIPES];
-        state.ack_tx_per_pipe = [0; NUM_PIPES];
         state.report_every = slot_config.report_every;
-        state.last_report_start = 0;
-        state.report_ready = false;
         state.prx_schedule = slot_config.schedule;
-        state.prx_windows_since_gap = 0;
         state.retry_blocked_at_high_priority = slot_config.request.retry_blocked_at_high_priority;
-        state.last_request_kind = PRX_REQ_EARLIEST;
-        state.normal_blocked = 0;
-        state.earliest_blocked = 0;
-        state.normal_cancelled = 0;
-        state.earliest_cancelled = 0;
         prx_set_earliest_request(
             state,
             TIMESLOT_PRIORITY_NORMAL,
@@ -2513,51 +2533,20 @@ pub fn open_ptx_poll_session(
     let first_pipe = poll_config.pipe_mask.trailing_zeros() as u8;
 
     PTX_STATE.with_inner(|state| {
-        state.counters = SignalCounters::ZERO;
-        state.done = false;
-        state.target_count = 0;
+        state.reset_runtime();
+
         state.slot_length_us = poll_config.slot_length_us;
         state.in_slot_match_us = poll_config.in_slot_match_us;
         state.request_timeout_us = poll_config.request.timeout_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
-        state.phase = PtxPhase::Idle;
-        state.tx_count = 0;
-        state.ack_ok_count = 0;
         state.tx_pipe = first_pipe;
-        state.payload_byte = 0;
         state.packets_per_slot = 1;
-        state.packets_sent_this_slot = 0;
-        state.ack_payload_count = 0;
-        state.ack_inversions = 0;
-        state.last_ack_counter = 0;
-        state.schedule_hint_count = 0;
-        state.schedule_hint_bad_count = 0;
-        state.last_schedule_window_id = 0;
-        state.last_schedule_hint = None;
-        state.schedule_tracker.reset();
         state.schedule_gate = poll_config.schedule_gate;
-        state.schedule_skip_slots_remaining = 0;
-        state.schedule_skip_count = 0;
-        state.schedule_lock_active = false;
-        state.schedule_lock_miss_streak = 0;
-        state.schedule_lock_count = 0;
-        state.schedule_reacquire_count = 0;
-        state.schedule_period_us = 0;
-        state.schedule_next_distance_us = 0;
-        state.pid = 0;
         state.poll_pipes = poll_config.pipe_mask.count_ones() as u8;
         state.poll_pipe_mask = poll_config.pipe_mask;
         state.poll_report_every = poll_config.report_every;
-        state.poll_slots_since_report = 0;
-        state.poll_report_ready = false;
-        state.ack_ok_per_pipe = [0; NUM_PIPES];
-        state.tx_per_pipe = [0; NUM_PIPES];
-        state.ack_timeout_per_pipe = [0; NUM_PIPES];
-        state.ack_crc_fail_per_pipe = [0; NUM_PIPES];
-        state.retry_count = 0;
         state.max_retries = poll_config.max_retries;
-        state.acked_this_slot = false;
         state.ack_timeout_us = poll_config.ack_timeout_us;
         ptx_set_earliest_request(
             state,
@@ -2655,55 +2644,20 @@ pub fn open_event_session(
     }
 
     PTX_STATE.with_inner(|state| {
-        state.counters = SignalCounters::ZERO;
-        state.done = false;
-        state.target_count = 0;
+        // Clear all runtime accumulators/flags from any prior session.
+        state.reset_runtime();
+
+        // Apply this event session's configuration.
         state.slot_length_us = event_config.slot_length_us;
         state.in_slot_match_us = event_config.in_slot_match_us;
         state.config = Some(config.clone());
         state.addresses = Some(addresses.clone());
-        state.phase = PtxPhase::Idle;
-        state.tx_count = 0;
-        state.ack_ok_count = 0;
         state.tx_pipe = event_config.pipe;
-        state.payload_byte = 0;
         state.packets_per_slot = 1;
-        state.packets_sent_this_slot = 0;
-        state.ack_payload_count = 0;
-        state.ack_inversions = 0;
-        state.last_ack_counter = 0;
-        state.schedule_hint_count = 0;
-        state.schedule_hint_bad_count = 0;
-        state.last_schedule_window_id = 0;
-        state.last_schedule_hint = None;
-        state.schedule_tracker.reset();
         state.schedule_gate = PtxScheduleGateConfig::disabled();
-        state.schedule_skip_slots_remaining = 0;
-        state.schedule_skip_count = 0;
-        state.schedule_lock_active = false;
-        state.schedule_lock_miss_streak = 0;
-        state.schedule_lock_count = 0;
-        state.schedule_reacquire_count = 0;
-        state.schedule_period_us = 0;
-        state.schedule_next_distance_us = 0;
-        state.pid = 0;
-        state.poll_pipes = 0;
-        state.poll_pipe_mask = 0;
-        state.poll_report_every = 0;
-        state.poll_slots_since_report = 0;
-        state.poll_report_ready = false;
-        state.ack_ok_per_pipe = [0; NUM_PIPES];
-        state.tx_per_pipe = [0; NUM_PIPES];
-        state.ack_timeout_per_pipe = [0; NUM_PIPES];
-        state.ack_crc_fail_per_pipe = [0; NUM_PIPES];
-        state.retry_count = 0;
         state.max_retries = event_config.max_retries;
-        state.acked_this_slot = false;
         state.ack_timeout_us = event_config.ack_timeout_us;
         state.event_mode = true;
-        state.event_pending = false;
-        state.event_result_ready = false;
-        state.event_ack_ok = false;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
         state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
