@@ -132,6 +132,40 @@ pub struct SignalCounters {
 }
 
 impl SignalCounters {
+    pub const ZERO: Self = Self {
+        start: 0,
+        timer0: 0,
+        radio: 0,
+        blocked: 0,
+        cancelled: 0,
+        session_idle: 0,
+        session_closed: 0,
+        overstayed: 0,
+        invalid_return: 0,
+        extend_failed: 0,
+        extend_succeeded: 0,
+        radio_disable_timeout: 0,
+    };
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            start: self.start.saturating_add(other.start),
+            timer0: self.timer0.saturating_add(other.timer0),
+            radio: self.radio.saturating_add(other.radio),
+            blocked: self.blocked.saturating_add(other.blocked),
+            cancelled: self.cancelled.saturating_add(other.cancelled),
+            session_idle: self.session_idle.saturating_add(other.session_idle),
+            session_closed: self.session_closed.saturating_add(other.session_closed),
+            overstayed: self.overstayed.saturating_add(other.overstayed),
+            invalid_return: self.invalid_return.saturating_add(other.invalid_return),
+            extend_failed: self.extend_failed.saturating_add(other.extend_failed),
+            extend_succeeded: self.extend_succeeded.saturating_add(other.extend_succeeded),
+            radio_disable_timeout: self
+                .radio_disable_timeout
+                .saturating_add(other.radio_disable_timeout),
+        }
+    }
+
     fn saturating_sub(self, previous: Self) -> Self {
         Self {
             start: self.start.saturating_sub(previous.start),
@@ -152,21 +186,6 @@ impl SignalCounters {
                 .saturating_sub(previous.radio_disable_timeout),
         }
     }
-
-    const ZERO: Self = Self {
-        start: 0,
-        timer0: 0,
-        radio: 0,
-        blocked: 0,
-        cancelled: 0,
-        session_idle: 0,
-        session_closed: 0,
-        overstayed: 0,
-        invalid_return: 0,
-        extend_failed: 0,
-        extend_succeeded: 0,
-        radio_disable_timeout: 0,
-    };
 }
 
 struct InnerState {

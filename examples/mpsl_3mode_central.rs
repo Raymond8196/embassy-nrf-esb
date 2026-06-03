@@ -564,6 +564,25 @@ async fn main(spawner: Spawner) {
 
     let mut err_count: u32 = 0;
     let prx_cfg = PrxSlotConfig::for_profile(PROFILE);
+    let mut startup_buf = [0u8; LOG_BUF_SIZE];
+    let mut startup = WriteBuf::new(&mut startup_buf);
+    let _ = write!(
+        startup,
+        "[START] role=central profile={:?} cfg={}/{} re={} pipes=0x{:02x} req_to={} retry_hi={} sched={}/{}/{}\r\n",
+        PROFILE,
+        prx_cfg.slot_length_us,
+        prx_cfg.in_slot_match_us,
+        prx_cfg.report_every,
+        prx_cfg.enabled_pipes,
+        prx_cfg.request.timeout_us,
+        prx_cfg.request.retry_blocked_at_high_priority as u8,
+        prx_cfg.schedule.normal_distance_us,
+        prx_cfg.schedule.gap_after_windows,
+        prx_cfg.schedule.gap_distance_us,
+    );
+    let startup_len = startup.pos;
+    log(&startup_buf[..startup_len]);
+
     let mut prx_session = match open_prx_session(mpsl, &esb_cfg, &esb_addr, prx_cfg) {
         Ok(session) => session,
         Err(e) => {

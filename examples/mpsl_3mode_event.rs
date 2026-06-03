@@ -37,7 +37,9 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{CoexistenceProfile, PtxEventConfig, open_event_session};
+use embassy_nrf_esb::mpsl_timeslot::{
+    CoexistenceProfile, PtxEventConfig, SignalCounters, open_event_session,
+};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -386,6 +388,22 @@ async fn main(spawner: Spawner) {
     .unwrap();
 
     let event_cfg = PtxEventConfig::for_profile(PROFILE);
+    let mut startup_buf = [0u8; LOG_BUF_SIZE];
+    let mut startup = WriteBuf::new(&mut startup_buf);
+    let _ = write!(
+        startup,
+        "[START] role=event profile={:?} cfg={}/{} pipe={} ack_to={} retries={} req_to={} retry_hi={}\r\n",
+        PROFILE,
+        event_cfg.slot_length_us,
+        event_cfg.in_slot_match_us,
+        event_cfg.pipe,
+        event_cfg.ack_timeout_us,
+        event_cfg.max_retries,
+        event_cfg.request.timeout_us,
+        event_cfg.request.retry_blocked_at_high_priority as u8,
+    );
+    let startup_len = startup.pos;
+    log(&startup_buf[..startup_len]);
 
     let mut session = match open_event_session(&mpsl, &esb_cfg, &esb_addr, event_cfg) {
         Ok(s) => s,
@@ -420,6 +438,7 @@ async fn main(spawner: Spawner) {
         let report = pending.unwrap();
         let mut acked = false;
         let mut attempts: u8 = 0;
+        let mut event_counters = SignalCounters::ZERO;
 
         loop {
             attempts += 1;
@@ -433,6 +452,8 @@ async fn main(spawner: Spawner) {
                     break;
                 }
             };
+
+            event_counters = event_counters.saturating_add(result.counters);
 
             if result.ack_ok {
                 acked = true;
@@ -455,11 +476,21 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "e={} ok={} att={} pend={}\r\n",
+            "e={} ok={} att={} pend={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={}\r\n",
             event_count,
             acked,
             attempts,
             pending.is_some(),
+            event_counters.start,
+            event_counters.timer0,
+            event_counters.radio,
+            event_counters.blocked,
+            event_counters.cancelled,
+            event_counters.radio_disable_timeout,
+            event_counters.session_idle,
+            event_counters.session_closed,
+            event_counters.overstayed,
+            event_counters.invalid_return,
         );
         let log_len = w.pos;
         log(&buf[..log_len]);

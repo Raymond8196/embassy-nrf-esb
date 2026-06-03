@@ -775,6 +775,7 @@ Reference data:
 | 11ms reflash retest | 120s | 1.0000 | 1.12 | 0/0 | 0 | 3.56/5 | 1148/1278 = 0.898 | `{1: 2015, 2: 194, 3: 21, 4: 12}` |
 | 11ms diagnosis retest | 120s | 1.0000 | 1.12 | 0/0 | 0 | 3.56/5 | 1147/1278 = 0.898 | `{1: 2020, 2: 194, 3: 25, 4: 5}` |
 | 11ms diagnosis stability | 300s | 1.0000 | 1.12 | 0/0 | 0 | 3.55/5 | 2860/3190 = 0.897 | `{1: 5051, 2: 491, 3: 41, 4: 27}` |
+| 11ms startup-diagnostics retest | 120s | 1.0000 | 1.12 | 0/0 | 0 | 3.56/5 | 1145/1275 = 0.898 | `{1: 2015, 2: 192, 3: 19, 4: 13}` |
 
 Additional diagnostics from central reports:
 
@@ -784,6 +785,18 @@ Additional diagnostics from central reports:
 - `bk` is dominated by NORMAL chained timeslot requests: short central reads
   showed `nb` increasing with `bk`, while `eb`, `nc`, and `ec` stayed at zero.
   This points to normal-chain request conflicts, not EARLIEST recovery failure.
+- The startup-diagnostics build adds `[START]` lines on both devices. Central
+  reports PRX profile config, pipe mask, request timeout, high-priority retry
+  policy, and PRX schedule config. Event reports PTX slot config, pipe, ACK
+  timeout, retry count, request timeout, and high-priority retry policy.
+- Event report lines now append per-event aggregated counters:
+  `s/t0/rd/bk/cn/dt/si/sc/ov/iv`. The legacy `e=... ok=... att=... pend=...`
+  prefix is unchanged, so the existing statistics script still parses it.
+- After DFU into the startup-diagnostics build, Event initially repeated
+  `e=1 ok=false att=5 pend=true` while Central was still starting. The Event
+  counters for those retries were `s=5 t0=10 rd=5 bk=0 cn=0 dt=0 si=0 sc=0
+  ov=0 iv=0`. Once Central PRX reports were active, Event recovered to stable
+  `ok=true` without session lifecycle counters incrementing.
 
 Conclusion:
 
@@ -798,14 +811,17 @@ Conclusion:
   reappeared. A direct `python3 /tmp/esb_event_stats.py` run succeeded. This
   reinforces that future anomaly capture should log USB/boot/session state
   separately from radio counters.
+- The observed startup pending pattern is currently consistent with PRX/PTX
+  cold-start alignment rather than MPSL session corruption: Event had no
+  blocked/cancelled/disable-timeout/session-idle/session-closed/invalid/overstay
+  counters while pending, and recovered without intervention.
 
 Next direction B steps:
 
 1. Keep 11ms as a diagnostic candidate, but do not make it the final default
    until multiple cold-start or DFU-start cycles are captured.
-2. Add a startup/session diagnostic line before the first PRX request and before
-   the first Event send, including profile config, initial request kind, and
-   counters for session idle/closed/invalid/overstayed.
+2. Repeat several cold-start or DFU-start cycles with the startup-diagnostics
+   build and check whether Event pending always clears after Central PRX starts.
 3. During a failing run, distinguish these cases:
    - NORMAL chain blocked loop: `nb` grows, `eb/ec` stay zero, Event pending
      accumulates.
