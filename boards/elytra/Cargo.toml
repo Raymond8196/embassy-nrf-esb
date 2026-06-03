@@ -1,0 +1,65 @@
+[package]
+name = "elytra-fw"
+version = "0.1.0"
+edition = "2024"
+description = "ESB event-PTX firmware for the Elytra (nRF52833) split-keyboard peripheral half"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone workspace: isolates this nrf52833 crate from the root package so the
+# two never resolve in one cargo invocation (the root pins nrf52840). Build this
+# firmware only from within boards/elytra/.
+[workspace]
+
+[[bin]]
+name = "elytra-event"
+path = "src/main.rs"
+
+[dependencies]
+# The ESB library, built for nRF52833. `default-features = false` opts out of the
+# library's build.rs memory.x injection; this crate supplies its own (build.rs).
+embassy-nrf-esb = { path = "../..", default-features = false, features = [
+    "nrf52833",
+    "mpsl",
+    "defmt",
+] }
+
+embassy-nrf = { version = "0.10", features = [
+    "nrf52833",
+    "unstable-pac",
+    "time",
+    "time-driver-rtc1",
+    "defmt",
+] }
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
+embassy-usb = "0.6"
+
+# Same git rev as the library so cargo unifies a single MPSL/SDC copy.
+nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", default-features = false, features = [
+    "nrf52833",
+    "defmt",
+] }
+nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", default-features = false, features = [
+    "nrf52833",
+    "peripheral",
+    "defmt",
+] }
+
+bt-hci = { version = "0.8", default-features = false }
+cortex-m = { version = "0.7", default-features = false }
+cortex-m-rt = "0.7"
+defmt = "0.3"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+static_cell = "2"
+heapless = { version = "0.8", default-features = false }
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "s"

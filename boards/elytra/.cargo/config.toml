@@ -1,0 +1,12 @@
+# NOTE: linker-script rustflags (-Tlink.x / -Tdefmt.x) are inherited from the
+# repo-root .cargo/config.toml — cargo merges config files up the directory tree.
+# Re-declaring them here would double `-Tlink.x` and define the memory regions
+# twice. Only the board-specific runner (52833) is overridden below.
+[target.thumbv7em-none-eabihf]
+runner = "probe-rs run --chip nRF52833_xxAA"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[env]
+DEFMT_LOG = "debug"
