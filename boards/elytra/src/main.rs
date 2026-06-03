@@ -94,21 +94,45 @@ async fn matrix_scan_task(
     rows: [Input<'static>; MATRIX_ROWS],
 ) {
     let mut state = [[false; MATRIX_COLS]; MATRIX_ROWS];
+    let mut raw = [0u8; MATRIX_COLS];
+    let mut tick: u32 = 0;
     loop {
         for (c, col) in cols.iter_mut().enumerate() {
             col.set_high();
             embassy_time::Timer::after_micros(COL_SETTLE_US).await;
+            let mut mask = 0u8;
             for (r, row) in rows.iter().enumerate() {
                 let pressed = row.is_high();
+                if pressed {
+                    mask |= 1 << r;
+                }
                 if pressed != state[r][c] {
                     state[r][c] = pressed;
                     let key_id = (r * MATRIX_COLS + c) as u8;
+                    defmt::info!("edge r={} c={} pr={}", r, c, pressed as u8);
                     // Drop on overflow: a full channel means the link is far
                     // behind; losing an edge is better than blocking the scan.
                     let _ = KEY_CHANNEL.try_send(KeyEvent { key_id, pressed });
                 }
             }
+            raw[c] = mask;
             col.set_low();
+        }
+
+        // Raw matrix-snapshot diagnostic: every ~500ms emit each column's
+        // row-readback bitmask (bit r set => row input r read high while that
+        // column was driven). Lets us see which input pins respond at all.
+        tick = tick.wrapping_add(1);
+        if tick % 250 == 0 {
+            let mut dbg = [0u8; LOG_BUF_SIZE];
+            let mut w = WriteBuf::new(&mut dbg);
+            let _ = write!(
+                w,
+                "RAW c0={} c1={} c2={} c3={} c4={} c5={} c6={} c7={} (bit r0=1 r1=2 r2=4 r3=8 r4=16)\r\n",
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+            );
+            let n = w.pos;
+            log(&dbg[..n]);
         }
 
         embassy_time::Timer::after_millis(SCAN_INTERVAL_MS).await;
@@ -606,8 +630,12 @@ async fn main(spawner: Spawner) {
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "e={} ok={} att={} drop={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} lat={} sync={} wait={} fb={} lock={} miss={} age={}\r\n",
+            "e={} key={} r={} c={} pr={} ok={} att={} drop={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} lat={} sync={} wait={} fb={} lock={} miss={} age={}\r\n",
             event_count,
+            key_ev.key_id,
+            key_ev.key_id / MATRIX_COLS as u8,
+            key_ev.key_id % MATRIX_COLS as u8,
+            key_ev.pressed as u8,
             acked,
             attempts,
             !acked,
