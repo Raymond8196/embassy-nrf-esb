@@ -42,6 +42,29 @@ pub(crate) fn write_counter_packet(buf: &mut [u8; 256], pid: u8, counter: u32) {
     buf[p..p + 4].copy_from_slice(&counter.to_le_bytes());
 }
 
+pub(crate) fn write_counter_payload_packet(
+    buf: &mut [u8; 256],
+    pid: u8,
+    counter: u32,
+    payload: &[u8],
+) -> bool {
+    let total_len = 4 + payload.len();
+    if total_len > EsbHeader::MAX_PAYLOAD as usize
+        || EsbHeader::PAYLOAD_OFFSET + total_len > buf.len()
+    {
+        return false;
+    }
+
+    write_counter_packet(buf, pid, counter);
+
+    let p = EsbHeader::PAYLOAD_OFFSET;
+    buf[p + 4..p + total_len].copy_from_slice(payload);
+
+    let header = unsafe { &mut *(buf.as_mut_ptr().cast::<EsbHeader>()) };
+    header.length = total_len as u8;
+    true
+}
+
 pub(crate) fn write_counter_schedule_packet(
     buf: &mut [u8; 256],
     pid: u8,
@@ -103,7 +126,8 @@ pub(crate) fn spin_until(mut condition: impl FnMut() -> bool, limit: u32) -> boo
 mod tests {
     use super::{
         NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
-        spin_until, write_counter_packet, write_counter_schedule_packet,
+        spin_until, write_counter_packet, write_counter_payload_packet,
+        write_counter_schedule_packet,
     };
     use crate::header::EsbHeader;
     use crate::mpsl_schedule::{
@@ -139,6 +163,36 @@ mod tests {
         assert_eq!(header.pid(), 2);
         assert!(!header.no_ack());
         assert_eq!(read_counter_payload(&buf), Some(0x4433_2211));
+    }
+
+    #[test]
+    fn counter_payload_packet_keeps_counter_prefix_and_app_payload() {
+        let mut buf = [0u8; 256];
+
+        assert!(write_counter_payload_packet(
+            &mut buf,
+            3,
+            0x0403_0201,
+            &[0xAA, 0xBB, 0xCC],
+        ));
+
+        let header = unsafe { &*(buf.as_ptr().cast::<EsbHeader>()) };
+        assert_eq!(header.length, 7);
+        assert_eq!(header.pid(), 3);
+        assert!(!header.no_ack());
+        assert_eq!(read_counter_payload(&buf), Some(0x0403_0201));
+        assert_eq!(
+            &buf[EsbHeader::PAYLOAD_OFFSET + 4..EsbHeader::PAYLOAD_OFFSET + 7],
+            &[0xAA, 0xBB, 0xCC]
+        );
+    }
+
+    #[test]
+    fn counter_payload_packet_rejects_oversized_payload() {
+        let mut buf = [0u8; 256];
+        let payload = [0x55; EsbHeader::MAX_PAYLOAD as usize - 3];
+
+        assert!(!write_counter_payload_packet(&mut buf, 0, 1, &payload));
     }
 
     #[test]

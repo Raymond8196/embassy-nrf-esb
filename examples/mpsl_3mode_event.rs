@@ -37,9 +37,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{
-    CoexistenceProfile, PtxEventConfig, open_event_session,
-};
+use embassy_nrf_esb::mpsl_timeslot::{CoexistenceProfile, PtxEventConfig, open_event_session};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;

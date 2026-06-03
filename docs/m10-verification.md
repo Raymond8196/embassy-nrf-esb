@@ -754,6 +754,65 @@ Estimated performance for keyboard use case:
 - Typing current: ~0.8mA at 10 events/sec
 - CR2032 estimated life: ~6 months mixed use
 
+### 2026-06-03 11ms PRX Slot Diagnosis
+
+Context:
+
+- The PRX schedule implementation was moved to a chained timeslot model and the
+  event/PTX path now reports per-event attempts.
+- `DiagnosticPipe1Prx12ms` was temporarily edited for diagnosis to use an
+  11ms PRX slot with a 10.5ms in-slot match window.
+- Direction B for this pass was to determine whether the earlier bad 11ms run
+  was a real slot-length regression or a startup/session anomaly.
+
+Reference data:
+
+| Run | Duration | ack_rate | avg_att | fail/pending | crc | rd_avg/max | bk/batch | attempt_dist |
+| --- | ---: | ---: | ---: | --- | ---: | --- | --- | --- |
+| 12ms baseline | 300s | 1.0000 | 1.11 | 0/0 | 0 | 3.95/6 | 2860/2868 = 0.997 | `{1: 5087, 2: 442, 3: 61, 4: 21}` |
+| 10ms short run | 120s | 1.0000 | 1.16 | 0/0 | 9 | 3.24/7 | 1143/1403 = 0.815 | `{1: 1912, 2: 286, 3: 25, 4: 10}` |
+| 11ms abnormal first run | 120s | 1.0000 for completed events | 1.40 completed, 5.0 pending | 0/1617 | 0 | 3.61/7 | 30/33 = 0.91 | `{1: 42, 2: 10, 3: 1, 4: 1, 5: 1617}` |
+| 11ms reflash retest | 120s | 1.0000 | 1.12 | 0/0 | 0 | 3.56/5 | 1148/1278 = 0.898 | `{1: 2015, 2: 194, 3: 21, 4: 12}` |
+| 11ms diagnosis retest | 120s | 1.0000 | 1.12 | 0/0 | 0 | 3.56/5 | 1147/1278 = 0.898 | `{1: 2020, 2: 194, 3: 25, 4: 5}` |
+| 11ms diagnosis stability | 300s | 1.0000 | 1.12 | 0/0 | 0 | 3.55/5 | 2860/3190 = 0.897 | `{1: 5051, 2: 491, 3: 41, 4: 27}` |
+
+Additional diagnostics from central reports:
+
+- `cfg=11000/10500` confirmed the intended 11ms diagnostic profile was running.
+- `cn=0`, `dt=0`, `si=0`, `sc=0`, `ov=0`, and `iv=0` stayed at zero in the
+  healthy 11ms runs.
+- `bk` is dominated by NORMAL chained timeslot requests: short central reads
+  showed `nb` increasing with `bk`, while `eb`, `nc`, and `ec` stayed at zero.
+  This points to normal-chain request conflicts, not EARLIEST recovery failure.
+
+Conclusion:
+
+- 11ms is a valid candidate in the healthy state. It reduces blocked pressure
+  versus 12ms by roughly 10% (`bk/batch` about 0.90 vs 1.00) while keeping
+  `ack_rate=1.0`, `avg_att` around 1.12, and `rd_max` bounded at 5.
+- The earlier bad 11ms run did not reproduce after reflash/retest and 5 minutes
+  of continuous sampling. Treat it as an occasional startup/session anomaly
+  until a failing run is captured with the new diagnostics.
+- One 300s script launch using `DURATION_S=300 python3 ...` failed because
+  `/dev/ttyACM0` was not present at open time, but the port immediately
+  reappeared. A direct `python3 /tmp/esb_event_stats.py` run succeeded. This
+  reinforces that future anomaly capture should log USB/boot/session state
+  separately from radio counters.
+
+Next direction B steps:
+
+1. Keep 11ms as a diagnostic candidate, but do not make it the final default
+   until multiple cold-start or DFU-start cycles are captured.
+2. Add a startup/session diagnostic line before the first PRX request and before
+   the first Event send, including profile config, initial request kind, and
+   counters for session idle/closed/invalid/overstayed.
+3. During a failing run, distinguish these cases:
+   - NORMAL chain blocked loop: `nb` grows, `eb/ec` stay zero, Event pending
+     accumulates.
+   - EARLIEST recovery issue: `eb` or `ec` grows.
+   - session lifecycle issue: `si/sc/iv/ov` grows.
+   - USB/reboot issue: CDC port disappears or event counters restart.
+
 ## Pending Work
 
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.

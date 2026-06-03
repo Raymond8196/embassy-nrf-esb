@@ -147,7 +147,11 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
         let timeout = u16::from_le_bytes([data[10], data[11]]);
         defmt::info!(
             "Remote conn param req handle={} interval={}..{} lat={} to={}",
-            handle, interval_min, interval_max, latency, timeout
+            handle,
+            interval_min,
+            interval_max,
+            latency,
+            timeout
         );
         let _ = LeConnUpdate::new(
             ConnHandle::new(handle),
@@ -418,7 +422,7 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
     let mut w = WriteBuf::new(buf);
     let _ = write!(
         w,
-        "b={} rx={} dup={} crc={} p0:{}/{}/{}/{} p1:{}/{}/{}/{} s={} t0={} rd={} bk={} cn={} dt={}\r\n",
+        "b={} rx={} dup={} crc={} p0:{}/{}/{}/{} p1:{}/{}/{}/{} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} nb={} eb={} nc={} ec={} ph={} ac={} rq={} cfg={}/{} re={}\r\n",
         batch,
         r.rx_count,
         r.dup_count,
@@ -437,13 +441,27 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
         r.counters.blocked,
         r.counters.cancelled,
         r.counters.radio_disable_timeout,
+        r.counters.session_idle,
+        r.counters.session_closed,
+        r.counters.overstayed,
+        r.counters.invalid_return,
+        r.normal_blocked,
+        r.earliest_blocked,
+        r.normal_cancelled,
+        r.earliest_cancelled,
+        r.phase,
+        r.slot_active as u8,
+        r.last_request_kind,
+        r.slot_length_us,
+        r.in_slot_match_us,
+        r.report_every,
     );
     w.pos
 }
 
 // ---- Main ----
 
-const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe5ScheduledGate;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1Prx12ms;
 const ESB_IDLE_MS: u64 = 0;
 
 #[embassy_executor::main]

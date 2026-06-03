@@ -87,6 +87,65 @@ pub struct PrxSlotConfig {
     pub request: TimeslotRequestConfig,
     /// RADIO recovery policy before handing the peripheral back to MPSL/SDC.
     pub recovery: RadioRecoveryPolicy,
+    /// Optional pacing for chained PRX windows.
+    pub schedule: PrxScheduleConfig,
+}
+
+/// PRX pacing policy for long-lived chained sessions.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PrxScheduleConfig {
+    /// Default NORMAL request distance from the previous timeslot start.
+    ///
+    /// Use 0 to mean `slot_length_us`, i.e. continuous chaining.
+    pub normal_distance_us: u32,
+    /// Insert a longer request distance after this many granted windows.
+    ///
+    /// Use 0 to disable planned gaps.
+    pub gap_after_windows: u32,
+    /// NORMAL request distance used for the planned gap.
+    pub gap_distance_us: u32,
+}
+
+impl PrxScheduleConfig {
+    pub const fn continuous() -> Self {
+        Self {
+            normal_distance_us: 0,
+            gap_after_windows: 0,
+            gap_distance_us: 0,
+        }
+    }
+
+    pub const fn planned_gap(gap_after_windows: u32, gap_distance_us: u32) -> Self {
+        Self {
+            normal_distance_us: 0,
+            gap_after_windows,
+            gap_distance_us,
+        }
+    }
+
+    pub const fn paced(normal_distance_us: u32) -> Self {
+        Self {
+            normal_distance_us,
+            gap_after_windows: 0,
+            gap_distance_us: 0,
+        }
+    }
+
+    pub fn validate(self, slot_length_us: u32) -> Result<(), Error> {
+        if self.normal_distance_us != 0 && self.normal_distance_us < slot_length_us {
+            return Err(Error::InvalidParam);
+        }
+        if self.gap_after_windows == 0 {
+            if self.gap_distance_us != 0 {
+                return Err(Error::InvalidParam);
+            }
+        } else if self.gap_distance_us < slot_length_us {
+            return Err(Error::InvalidParam);
+        }
+
+        Ok(())
+    }
 }
 
 impl PrxSlotConfig {
@@ -105,6 +164,7 @@ impl PrxSlotConfig {
         }
 
         self.request.validate()?;
+        self.schedule.validate(self.slot_length_us)?;
         Ok(())
     }
 }
@@ -309,6 +369,7 @@ impl CoexistenceProfileConfig {
     pub const fn for_profile(profile: CoexistenceProfile) -> Self {
         let request = TimeslotRequestConfig::diagnostic_default();
         let recovery = RadioRecoveryPolicy::ForceResetAfterBoundedDisable;
+        let prx_schedule = PrxScheduleConfig::continuous();
 
         let ptx_event = PtxEventConfig {
             slot_length_us: 1500,
@@ -328,6 +389,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -350,6 +412,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -375,6 +438,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -400,6 +464,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,
@@ -428,6 +493,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -450,6 +516,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x06,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -472,6 +539,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x3E,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 2500,
@@ -500,6 +568,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -516,12 +585,13 @@ impl CoexistenceProfileConfig {
             },
             CoexistenceProfile::DiagnosticPipe1Prx12ms => Self {
                 prx: PrxSlotConfig {
-                    slot_length_us: 12_000,
-                    in_slot_match_us: 11_500,
+                    slot_length_us: 11_000,
+                    in_slot_match_us: 10_500,
                     report_every: 8,
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -544,6 +614,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -566,6 +637,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x06,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,
@@ -592,6 +664,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -614,6 +687,7 @@ impl CoexistenceProfileConfig {
                     enabled_pipes: 0x02,
                     request,
                     recovery,
+                    schedule: prx_schedule,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,
