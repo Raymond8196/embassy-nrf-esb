@@ -26,8 +26,8 @@
 use core::fmt::Write as FmtWrite;
 
 use bt_hci::cmd::controller_baseband::SetEventMask;
-use bt_hci::cmd::le::{LeConnUpdate, LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::cmd::{AsyncCmd, SyncCmd};
+use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
+use bt_hci::cmd::SyncCmd;
 use bt_hci::param::{
     AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
 };
@@ -122,6 +122,25 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
     }
     let event_code = buf[0];
     let event_len = buf[1] as usize;
+
+    if event_code == 0x05 && buf.len() >= 4 {
+        let status = buf[2];
+        let handle = u16::from_le_bytes([buf[3], buf[4.min(buf.len() - 1)]]) & 0x0fff;
+        let reason = buf.get(5).copied().unwrap_or(0);
+        let mut b = [0u8; LOG_BUF_SIZE];
+        let len = {
+            let mut w = WriteBuf::new(&mut b);
+            let _ = write!(
+                w,
+                "[BLE] Disconnected handle={} status={} reason=0x{:02x}\r\n",
+                handle, status, reason
+            );
+            w.pos
+        };
+        log(&b[..len]);
+        return;
+    }
+
     if event_code != 0x3e || buf.len() < 2 + event_len || event_len < 2 {
         return;
     }
@@ -130,56 +149,83 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
     let status = data[1];
     if status == 0 && (subevent == 1 || subevent == 10) && data.len() >= 4 {
         let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
-        defmt::info!(
-            "BLE connected; requesting relaxed conn params handle={}",
-            handle
-        );
+        let mut buf = [0u8; LOG_BUF_SIZE];
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "[BLE] Connected handle={} sub={}\r\n", handle, subevent);
+            w.pos
+        };
+        log(&buf[..len]);
+        embassy_time::Timer::after_millis(500).await;
         request_relaxed_conn_params(sdc, handle).await;
-    } else if status == 0 && subevent == 0x00 {
-        defmt::info!("LE Connection Update Complete: {:?}", data);
-    } else if status == 0 && subevent == 0x00 {
-        defmt::info!("LE Connection Update Complete: {:?}", data);
+    } else if status == 0 && subevent == 0x03 && data.len() >= 14 {
+        let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
+        let interval = u16::from_le_bytes([data[4], data[5]]);
+        let latency = u16::from_le_bytes([data[6], data[7]]);
+        let timeout = u16::from_le_bytes([data[8], data[9]]);
+        let mut buf = [0u8; LOG_BUF_SIZE];
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(
+                w,
+                "[BLE] Conn Update Complete handle={} interval={} ({:.1}ms) lat={} to={}\r\n",
+                handle,
+                interval,
+                interval as f32 * 1.25,
+                latency,
+                timeout
+            );
+            w.pos
+        };
+        log(&buf[..len]);
     } else if subevent == 0x06 && data.len() >= 14 {
         let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
         let interval_min = u16::from_le_bytes([data[4], data[5]]);
         let interval_max = u16::from_le_bytes([data[6], data[7]]);
         let latency = u16::from_le_bytes([data[8], data[9]]);
         let timeout = u16::from_le_bytes([data[10], data[11]]);
-        defmt::info!(
-            "Remote conn param req handle={} interval={}..{} lat={} to={}",
-            handle,
-            interval_min,
-            interval_max,
-            latency,
-            timeout
-        );
-        let _ = LeConnUpdate::new(
-            ConnHandle::new(handle),
-            bt_hci::param::Duration::from_millis(interval_max as u32 * 125 / 100),
-            bt_hci::param::Duration::from_millis(interval_max as u32 * 125 / 100),
-            latency,
-            bt_hci::param::Duration::from_millis(timeout as u32 * 10),
-            bt_hci::param::Duration::from_millis(0),
-            bt_hci::param::Duration::from_millis(0),
-        )
-        .exec(sdc)
-        .await;
+        let mut buf = [0u8; LOG_BUF_SIZE];
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(
+                w,
+                "[BLE] Remote conn param req handle={} int={:.1}..{:.1}ms lat={} to={}\r\n",
+                handle,
+                interval_min as f32 * 1.25,
+                interval_max as f32 * 1.25,
+                latency,
+                timeout
+            );
+            w.pos
+        };
+        log(&buf[..len]);
     }
 }
 
 async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16) {
-    let result = LeConnUpdate::new(
-        ConnHandle::new(handle),
-        bt_hci::param::Duration::from_millis(100),
-        bt_hci::param::Duration::from_millis(200),
-        50,
-        bt_hci::param::Duration::from_millis(6000),
-        bt_hci::param::Duration::from_millis(0),
-        bt_hci::param::Duration::from_millis(0),
-    )
-    .exec(sdc)
-    .await;
-    defmt::info!("LeConnUpdate result: {:?}", result);
+    embassy_time::Timer::after_millis(1000).await;
+    {
+        let mut buf = [0u8; LOG_BUF_SIZE];
+        let len = {
+            let mut w = WriteBuf::new(&mut buf);
+            let _ = write!(w, "[BLE] L2CAP conn param update: int=100ms lat=4 to=6000ms\r\n");
+            w.pos
+        };
+        log(&buf[..len]);
+    }
+
+    let interval_min: u16 = 80;
+    let interval_max: u16 = 80;
+    let latency: u16 = 4;
+    let timeout: u16 = 600;
+    let payload: [u8; 12] = [
+        0x12, 0x01, 0x08, 0x00,
+        (interval_min & 0xff) as u8, (interval_min >> 8) as u8,
+        (interval_max & 0xff) as u8, (interval_max >> 8) as u8,
+        (latency & 0xff) as u8, (latency >> 8) as u8,
+        (timeout & 0xff) as u8, (timeout >> 8) as u8,
+    ];
+    send_l2cap(sdc, handle, 0x0005, &payload);
 }
 
 fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
@@ -279,6 +325,16 @@ fn handle_l2cap_control(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8])
     }
     match code {
         0x12 => send_l2cap(sdc, handle, 0x0005, &[0x13, ident, 2, 0, 0, 0]),
+        0x13 if pdu.len() >= 6 => {
+            let result = u16::from_le_bytes([pdu[4], pdu[5]]);
+            let mut buf = [0u8; 64];
+            let len = {
+                let mut w = WriteBuf::new(&mut buf);
+                let _ = write!(w, "[BLE] L2CAP conn param response: result={}\r\n", result);
+                w.pos
+            };
+            log(&buf[..len]);
+        }
         _ => send_l2cap(sdc, handle, 0x0005, &[0x01, ident, 2, 0, code, 0]),
     }
 }

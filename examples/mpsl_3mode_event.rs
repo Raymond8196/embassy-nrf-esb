@@ -63,6 +63,8 @@ const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY_MS: u64 = 2;
 const ENABLE_FIRST_ATTEMPT_ALIGNMENT: bool = false;
 const ENABLE_HINT_RETRY_WAIT: bool = false;
+const ENABLE_SYNTHETIC_EVENTS: bool = false;
+const SYNTHETIC_EVENT_INTERVAL_MS: u64 = 50;
 const MIN_HINT_RETRY_GAP_US: u32 = 500;
 const LINK_TIMING_CONFIG: LinkTimingConfig = LinkTimingConfig {
     hint_valid_us: 200_000,
@@ -532,7 +534,15 @@ async fn main(spawner: Spawner) {
     loop {
         // Block until a real key transition arrives. An untouched matrix
         // produces no wakeup here, so the PTX issues no timeslot requests.
-        let key_ev = KEY_CHANNEL.receive().await;
+        let key_ev = if ENABLE_SYNTHETIC_EVENTS {
+            embassy_time::Timer::after_millis(SYNTHETIC_EVENT_INTERVAL_MS).await;
+            KeyEvent {
+                key_id: 0xFE,
+                pressed: (event_count & 1) == 0,
+            }
+        } else {
+            KEY_CHANNEL.receive().await
+        };
         event_count += 1;
         let event_since_us = Instant::now().as_micros();
         let report = [
