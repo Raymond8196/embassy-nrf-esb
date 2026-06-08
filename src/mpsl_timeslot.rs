@@ -1009,11 +1009,6 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 }
             }
 
-            // Ensure RADIO NVIC is unmasked so MPSL delivers SIGNAL_RADIO.
-            unsafe {
-                cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
-            }
-
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
             &mut state.return_param as *mut _
         }),
@@ -1788,10 +1783,6 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.intenset().write(|w| w.set_compare(0, true));
 
             state.phase = PrxPhase::Receiving;
-
-            unsafe {
-                cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
-            }
 
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
             &mut state.return_param as *mut _

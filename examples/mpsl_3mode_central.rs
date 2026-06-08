@@ -78,6 +78,12 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 }
 
 #[embassy_executor::task]
+async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
+    let _hfclk = mpsl.request_hfclk().await.unwrap();
+    core::future::pending().await
+}
+
+#[embassy_executor::task]
 async fn sdc_task(sdc: &'static SoftdeviceController<'static>) -> ! {
     let mut evt_buf = [0u8; sdc::raw::HCI_MSG_BUFFER_MAX_SIZE as usize];
     loop {
@@ -549,6 +555,7 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
     spawner.spawn(mpsl_task(mpsl).unwrap());
+    spawner.spawn(hfclk_task(mpsl).unwrap());
 
     // BLE
     let sdc_p = sdc::Peripherals::new(
