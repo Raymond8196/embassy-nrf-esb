@@ -152,7 +152,7 @@ def main():
             p_drop_count = 0
             p_miss_total = 0
 
-            recent_p = [d for d in peripheral_data if d['t'] > elapsed - dt]
+            recent_p = [d for d in peripheral_data if d['t'] > elapsed - dt and 'ok' in d]
             if recent_p:
                 p_events = len(recent_p)
                 p_ok_pct = sum(1 for d in recent_p if d.get('ok')) / len(recent_p) * 100
@@ -160,7 +160,7 @@ def main():
                 p_lat_avg = sum(lats) / len(lats) if lats else 0
                 atts = [d.get('att', 0) for d in recent_p if d.get('att') is not None]
                 p_att_avg = sum(atts) / len(atts) if atts else 0
-                p_drop_count = sum(1 for d in recent_p if not d.get('ok', True))
+                p_drop_count = sum(1 for d in recent_p if not d.get('ok'))
                 p_miss_total = sum(d.get('miss', 0) for d in recent_p)
 
                 p_latency.extend(lats)
@@ -218,9 +218,11 @@ def main():
         print(f"    events total:   {last_p_entry.get('e', '?')}")
         print(f"    evt rate:       {last_p_entry.get('e', 0) / elapsed:.1f}/s" if last_p_entry.get('e') else "    evt rate: N/A")
 
-        ok_count = sum(1 for d in peripheral_data if d.get('ok'))
-        drop_count = total_p - ok_count
-        print(f"    ok:             {ok_count}/{total_p} ({ok_count/total_p*100:.2f}%)" if total_p else "    ok: N/A")
+        event_lines = [d for d in peripheral_data if 'ok' in d]
+        total_events = len(event_lines)
+        ok_count = sum(1 for d in event_lines if d.get('ok'))
+        drop_count = total_events - ok_count
+        print(f"    ok:             {ok_count}/{total_events} ({ok_count/total_events*100:.2f}%)" if total_events else "    ok: N/A")
         print(f"    drops:          {drop_count}")
 
         if p_latency:
