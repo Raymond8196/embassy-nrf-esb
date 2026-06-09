@@ -104,8 +104,8 @@ def main():
     p_attempts = []
     p_miss = []
 
-    print(f"{'Time':>6}s | {'C:rx/s':>7} {'C:bk/s':>6} {'C:nb/s':>6} | {'P:evt/s':>7} {'P:ok%':>6} {'P:lat_avg':>8} {'P:att_avg':>7} {'P:drop':>5} {'P:miss':>5}")
-    print("-" * 95)
+    print(f"{'Time':>6}s | {'C:rx/s':>7} {'C:es/s':>7} {'C:ef/s':>6} {'C:bk/s':>6} | {'P:evt/s':>7} {'P:ok%':>6} {'P:lat_avg':>8} {'P:att_avg':>7} {'P:drop':>5} {'P:miss':>5}")
+    print("-" * 103)
 
     while True:
         now = time.time()
@@ -132,12 +132,18 @@ def main():
             dt = now - last_report
 
             c_rx_s = 0
+            c_es_s = 0
+            c_ef_s = 0
             c_bk_s = 0
-            c_nb_s = 0
             if last_c and prev_c:
                 c_rx_s = max(0, last_c.get('rx', 0) - prev_c.get('rx', 0)) / dt
                 c_bk_s = max(0, last_c.get('bk', 0) - prev_c.get('bk', 0)) / dt
-                c_nb_s = max(0, last_c.get('nb', 0) - prev_c.get('nb', 0)) / dt
+
+            # es/ef are per-report deltas, so sum them across the window.
+            recent_c = [d for d in central_data if d['t'] > elapsed - dt]
+            if recent_c:
+                c_es_s = sum(d.get('es', 0) for d in recent_c) / dt
+                c_ef_s = sum(d.get('ef', 0) for d in recent_c) / dt
 
             p_events = 0
             p_ok_pct = 100.0
@@ -163,7 +169,7 @@ def main():
             c_ok_rate.append(c_rx_s)
             c_rx_rate.append(c_rx_s)
 
-            print(f"{elapsed:6.0f}s | {c_rx_s:7.1f} {c_bk_s:6.1f} {c_nb_s:6.1f} | {p_events:7d} {p_ok_pct:5.1f}% {p_lat_avg:8.0f} {p_att_avg:7.1f} {p_drop_count:5d} {p_miss_total:5d}")
+            print(f"{elapsed:6.0f}s | {c_rx_s:7.1f} {c_es_s:7.1f} {c_ef_s:6.1f} {c_bk_s:6.1f} | {p_events:7d} {p_ok_pct:5.1f}% {p_lat_avg:8.0f} {p_att_avg:7.1f} {p_drop_count:5d} {p_miss_total:5d}")
 
             last_report = now
 
@@ -194,6 +200,11 @@ def main():
         print(f"    blocks:         {last_c_entry.get('bk', '?')}")
         print(f"    nobuf:          {last_c_entry.get('nb', '?')}")
         print(f"    event blocks:   {last_c_entry.get('eb', '?')}")
+        es_total = sum(d.get('es', 0) for d in central_data)
+        ef_total = sum(d.get('ef', 0) for d in central_data)
+        ext_total = es_total + ef_total
+        print(f"    extend ok:      {es_total}")
+        print(f"    extend failed:  {ef_total}" + (f" ({ef_total/ext_total*100:.2f}% yield)" if ext_total else ""))
         print(f"    rx rate:        {last_c_entry.get('rx', 0) / elapsed:.1f}/s" if last_c_entry.get('rx') else "    rx rate: N/A")
         if last_c_entry.get('p1_total') is not None:
             print(f"    pipe1 total:    {last_c_entry.get('p1_total', '?')}")

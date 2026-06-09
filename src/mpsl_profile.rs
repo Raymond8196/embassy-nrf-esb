@@ -24,6 +24,8 @@ pub enum CoexistenceProfile {
     DiagnosticPipe1Prx8ms,
     /// Same narrow pipe-1 diagnostic with a 12 ms PRX receive window.
     DiagnosticPipe1Prx12ms,
+    /// Nordic official EXTEND mode: short initial slot + dynamic extension.
+    NordicExtend,
     /// 11 ms PRX receive window requested every 12 ms, paired with PTX alignment.
     DiagnosticPipe1Prx11msPaced12ms,
     /// Same narrow pipe-1 diagnostic with a 20 ms PRX receive window.
@@ -91,6 +93,12 @@ pub struct PrxSlotConfig {
     pub recovery: RadioRecoveryPolicy,
     /// Optional pacing for chained PRX windows.
     pub schedule: PrxScheduleConfig,
+    /// Enable Nordic-style dynamic timeslot extension (EXTEND mode).
+    pub extend_mode: bool,
+    /// Extension window length in microseconds (added per extend).
+    pub extend_length_us: u32,
+    /// Maximum number of extensions per timeslot before requesting a new one.
+    pub max_extends: u32,
 }
 
 /// PRX pacing policy for long-lived chained sessions.
@@ -392,6 +400,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -415,6 +426,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -441,6 +455,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -467,6 +484,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,
@@ -496,6 +516,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -519,6 +542,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -542,6 +568,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 2500,
@@ -571,6 +600,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -594,6 +626,35 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
+                },
+                ptx: PtxPollConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 1300,
+                    pipe_mask: 0x02,
+                    report_every: 1,
+                    ack_timeout_us: 400,
+                    max_retries: 0,
+                    request,
+                    schedule_gate: PtxScheduleGateConfig::disabled(),
+                },
+                ptx_event,
+                ble_hint: BleCoexistenceHint::DiagnosticOnly,
+            },
+            CoexistenceProfile::NordicExtend => Self {
+                prx: PrxSlotConfig {
+                    slot_length_us: 1500,
+                    in_slot_match_us: 530,
+                    report_every: 8,
+                    enabled_pipes: 0x02,
+                    request,
+                    recovery,
+                    schedule: prx_schedule,
+                    extend_mode: true,
+                    extend_length_us: 530,
+                    max_extends: 200,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -617,6 +678,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: PrxScheduleConfig::paced(12_000),
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -640,6 +704,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -663,6 +730,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,
@@ -690,6 +760,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 1500,
@@ -713,6 +786,9 @@ impl CoexistenceProfileConfig {
                     request,
                     recovery,
                     schedule: prx_schedule,
+                    extend_mode: false,
+                    extend_length_us: 0,
+                    max_extends: 0,
                 },
                 ptx: PtxPollConfig {
                     slot_length_us: 3000,

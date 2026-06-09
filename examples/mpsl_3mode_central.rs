@@ -484,7 +484,7 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
     let mut w = WriteBuf::new(buf);
     let _ = write!(
         w,
-        "b={} rx={} dup={} crc={} p0:{}/{}/{}/{} p1:{}/{}/{}/{} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} nb={} eb={} nc={} ec={} ph={} ac={} rq={} cfg={}/{} re={}\r\n",
+        "b={} rx={} dup={} crc={} p0:{}/{}/{}/{} p1:{}/{}/{}/{} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} es={} ef={} nb={} eb={} nc={} ec={} ph={} ac={} rq={} cfg={}/{} re={}\r\n",
         batch,
         r.rx_count,
         r.dup_count,
@@ -507,6 +507,8 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
         r.counters.session_closed,
         r.counters.overstayed,
         r.counters.invalid_return,
+        r.counters.extend_succeeded,
+        r.counters.extend_failed,
         r.normal_blocked,
         r.earliest_blocked,
         r.normal_cancelled,
@@ -523,7 +525,7 @@ fn format_prx(buf: &mut [u8], batch: u32, r: &PrxSlotResult) -> usize {
 
 // ---- Main ----
 
-const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1Prx12ms;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::NordicExtend;
 const ESB_IDLE_MS: u64 = 0;
 
 #[embassy_executor::main]

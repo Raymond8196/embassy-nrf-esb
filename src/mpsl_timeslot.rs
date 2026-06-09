@@ -55,7 +55,7 @@ use crate::mpsl_schedule::{
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
 
-const TIMESLOT_HFCLK: u8 = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+const TIMESLOT_HFCLK: u8 = raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8;
 const TIMESLOT_PRIORITY_NORMAL: u8 = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
 const TIMESLOT_PRIORITY_HIGH: u8 = raw::MPSL_TIMESLOT_PRIORITY_HIGH as u8;
 
@@ -236,7 +236,7 @@ impl State {
                     request_type: raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8,
                     params: raw::mpsl_timeslot_request_t__bindgen_ty_1 {
                         earliest: raw::mpsl_timeslot_request_earliest_t {
-                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8,
+                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8,
                             priority: raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8,
                             length_us: 0,
                             timeout_us: 1_000_000,
@@ -457,7 +457,7 @@ pub async fn run_single_slot(
         state.target_count = 0; // single-shot
         state.in_slot_match_us = in_slot_match_us;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
         state.request.params.earliest.length_us = slot_length_us;
         state.request.params.earliest.timeout_us = 1_000_000;
@@ -519,7 +519,7 @@ pub async fn run_chained_slots(
         state.target_count = count;
         state.in_slot_match_us = in_slot_match_us;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
         state.request.params.earliest.length_us = slot_length_us;
         state.request.params.earliest.timeout_us = 1_000_000;
@@ -826,7 +826,7 @@ impl PtxState {
                     request_type: raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8,
                     params: raw::mpsl_timeslot_request_t__bindgen_ty_1 {
                         earliest: raw::mpsl_timeslot_request_earliest_t {
-                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8,
+                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8,
                             priority: raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8,
                             length_us: 0,
                             timeout_us: 1_000_000,
@@ -1007,6 +1007,14 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 if pipe < NUM_PIPES {
                     state.tx_per_pipe[pipe] += 1;
                 }
+            }
+
+            // MPSL hands the app the RADIO during a timeslot but leaves the
+            // NVIC line masked; the app must unmask it so RADIO events are
+            // delivered back as SIGNAL_RADIO. Without this, rd stays 0 and no
+            // RX/ACK is ever processed.
+            unsafe {
+                cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
             }
 
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
@@ -1514,6 +1522,10 @@ struct PrxInnerState {
     enabled_pipes: u8,
     recovery_policy: RadioRecoveryPolicy,
     slot_active: bool,
+    extend_count: u32,
+    max_extends: u32,
+    extend_length_us: u32,
+    prx_extend_mode: bool,
     ack_counter: [u32; NUM_PIPES],
     rx_per_pipe: [u32; NUM_PIPES],
     dup_per_pipe: [u32; NUM_PIPES],
@@ -1556,6 +1568,8 @@ impl PrxInnerState {
         self.last_crc = [0; NUM_PIPES];
         self.last_valid = [false; NUM_PIPES];
         self.slot_active = false;
+        self.extend_count = 0;
+        self.prx_extend_mode = false;
         self.ack_counter = [0; NUM_PIPES];
         self.rx_per_pipe = [0; NUM_PIPES];
         self.dup_per_pipe = [0; NUM_PIPES];
@@ -1634,6 +1648,33 @@ fn prx_next_normal_distance_us(state: &mut PrxInnerState) -> u32 {
     }
 }
 
+/// Finalize a completed PRX slot: surface a batch report when `report_every`
+/// slots have elapsed, then either reschedule the next slot or end the session.
+/// Shared by the normal TIMER0 slot-end and the EXTEND end paths so the report
+/// waker is driven identically regardless of how the slot terminated.
+fn prx_finalize_and_reschedule(state: &mut PrxInnerState) {
+    let long_session = state.report_every > 0;
+
+    if long_session
+        && state.counters.start.saturating_sub(state.last_report_start) >= state.report_every
+    {
+        state.last_report_start = state.counters.start;
+        state.report_ready = true;
+        state.waker.wake();
+    }
+
+    if long_session || state.counters.start < state.target_count {
+        let distance_us = prx_next_normal_distance_us(state);
+        prx_set_normal_request(state, distance_us);
+        state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+        state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+    } else {
+        state.done = true;
+        state.waker.wake();
+        state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+    }
+}
+
 fn prx_next_window_delay_us(state: &PrxInnerState) -> u32 {
     let t = pac::TIMER0;
     t.tasks_capture(2).write_value(1);
@@ -1673,7 +1714,7 @@ impl PrxState {
                     request_type: raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8,
                     params: raw::mpsl_timeslot_request_t__bindgen_ty_1 {
                         earliest: raw::mpsl_timeslot_request_earliest_t {
-                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8,
+                            hfclk: raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8,
                             priority: raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8,
                             length_us: 0,
                             timeout_us: 1_000_000,
@@ -1705,6 +1746,10 @@ impl PrxState {
                 enabled_pipes: 0x01,
                 recovery_policy: RadioRecoveryPolicy::ForceResetAfterBoundedDisable,
                 slot_active: false,
+                extend_count: 0,
+                max_extends: 0,
+                extend_length_us: 0,
+                prx_extend_mode: false,
                 ack_counter: [0; NUM_PIPES],
                 rx_per_pipe: [0; NUM_PIPES],
                 dup_per_pipe: [0; NUM_PIPES],
@@ -1751,6 +1796,7 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_START => PRX_STATE.with_inner(|state| {
             state.counters.start += 1;
             state.slot_active = true;
+            state.extend_count = 0;
 
             let (Some(config), Some(addresses)) = (state.config.as_ref(), state.addresses.as_ref())
             else {
@@ -1771,16 +1817,25 @@ unsafe extern "C" fn prx_timeslot_callback(
             radio.restore_crc_state(state.last_crc);
             radio.restore_detection_valid_state(state.last_valid);
 
-            // Manual ACK lets us program TXADDRESS from RXMATCH before ACK TX.
+            // MPSL hands the app the RADIO during a timeslot but leaves the
+            // NVIC line masked; the app must unmask it so RADIO events are
+            // delivered back as SIGNAL_RADIO. Without this, rd stays 0 and no
+            // RX/ACK is ever processed.
+            unsafe {
+                cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
+            }
+
             let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
             let dma_ptr = unsafe { rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
             radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
 
-            // Arm TIMER0 for slot end.
             let t = pac::TIMER0;
             t.events_compare(0).write_value(0);
             t.cc(0).write_value(state.in_slot_match_us);
             t.intenset().write(|w| w.set_compare(0, true));
+            if state.prx_extend_mode {
+                t.shorts().write(|w| w.set_compare_clear(0, true));
+            }
 
             state.phase = PrxPhase::Receiving;
 
@@ -1949,40 +2004,78 @@ unsafe extern "C" fn prx_timeslot_callback(
 
         raw::MPSL_TIMESLOT_SIGNAL_TIMER0 => PRX_STATE.with_inner(|state| {
             state.counters.timer0 += 1;
-            state.slot_active = false;
 
             let t = pac::TIMER0;
             t.events_compare(0).write_value(0);
+
+            if state.prx_extend_mode && state.extend_count < state.max_extends {
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_EXTEND as u8;
+                state.return_param.params.extend.length_us = state.extend_length_us;
+                return &mut state.return_param as *mut _;
+            }
+
+            state.slot_active = false;
             t.intenclr().write(|w| w.set_compare(0, true));
+            t.shorts().write(|w| w.set_compare_clear(0, false));
+
+            {
+                let r = pac::RADIO;
+                if r.events_disabled().read() != 0 {
+                    state.counters.session_closed += 1;
+                }
+                if r.events_address().read() != 0 {
+                    state.counters.overstayed += 1;
+                }
+                if r.events_payload().read() != 0 {
+                    state.counters.invalid_return += 1;
+                }
+            }
 
             if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
                 state.counters.radio_disable_timeout += 1;
             }
             state.phase = PrxPhase::Idle;
 
-            let long_session = state.report_every > 0;
-            let batch_complete = long_session
-                && state.counters.start.saturating_sub(state.last_report_start)
-                    >= state.report_every;
+            prx_finalize_and_reschedule(state);
+            &mut state.return_param as *mut _
+        }),
 
-            if batch_complete {
-                state.last_report_start = state.counters.start;
-                state.report_ready = true;
-                state.waker.wake();
-                let distance_us = prx_next_normal_distance_us(state);
-                prx_set_normal_request(state, distance_us);
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
-            } else if long_session || state.counters.start < state.target_count {
-                let distance_us = prx_next_normal_distance_us(state);
-                prx_set_normal_request(state, distance_us);
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+        raw::MPSL_TIMESLOT_SIGNAL_EXTEND_SUCCEEDED => PRX_STATE.with_inner(|state| {
+            state.counters.extend_succeeded += 1;
+            state.extend_count += 1;
+
+            if state.extend_count >= state.max_extends {
+                state.slot_active = false;
+                let t = pac::TIMER0;
+                t.intenclr().write(|w| w.set_compare(0, true));
+                t.shorts().write(|w| w.set_compare_clear(0, false));
+
+                if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
+                    state.counters.radio_disable_timeout += 1;
+                }
+                state.phase = PrxPhase::Idle;
+
+                prx_finalize_and_reschedule(state);
             } else {
-                state.done = true;
-                state.waker.wake();
-                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
             }
+            &mut state.return_param as *mut _
+        }),
+
+        raw::MPSL_TIMESLOT_SIGNAL_EXTEND_FAILED => PRX_STATE.with_inner(|state| {
+            state.counters.extend_failed += 1;
+            state.slot_active = false;
+
+            let t = pac::TIMER0;
+            t.intenclr().write(|w| w.set_compare(0, true));
+            t.shorts().write(|w| w.set_compare_clear(0, false));
+
+            if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
+                state.counters.radio_disable_timeout += 1;
+            }
+            state.phase = PrxPhase::Idle;
+
+            prx_finalize_and_reschedule(state);
             &mut state.return_param as *mut _
         }),
 
@@ -2290,6 +2383,9 @@ pub fn open_prx_session(
         state.recovery_policy = slot_config.recovery;
         state.report_every = slot_config.report_every;
         state.prx_schedule = slot_config.schedule;
+        state.prx_extend_mode = slot_config.extend_mode;
+        state.max_extends = slot_config.max_extends;
+        state.extend_length_us = slot_config.extend_length_us;
         state.retry_blocked_at_high_priority = slot_config.request.retry_blocked_at_high_priority;
         prx_set_earliest_request(
             state,
@@ -2650,7 +2746,7 @@ pub fn open_event_session(
         state.ack_timeout_us = event_config.ack_timeout_us;
         state.event_mode = true;
         state.request.request_type = raw::MPSL_TIMESLOT_REQ_TYPE_EARLIEST as u8;
-        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_NO_GUARANTEE as u8;
+        state.request.params.earliest.hfclk = raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8;
         state.request.params.earliest.priority = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
         state.request.params.earliest.length_us = event_config.slot_length_us;
         state.request.params.earliest.timeout_us = event_config.request.timeout_us;
