@@ -2,6 +2,8 @@
 *.hex
 *.uf2
 *_dfu.zip
+*.jsonl
 opencode.json
 /.agents/
 session-*.md
+plans/
