@@ -4,15 +4,25 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 
 ## Status
 
-**Active development — ESB core and MPSL bring-up.**
+**Alpha — core ESB and MPSL BLE+ESB coexistence working, API not yet stable.**
 
-- Exclusive PTX/PRX ESB examples build and have been hardware-smoke tested during M9/M10 work.
-- ACK payloads, multi-pipe routing, NoAck sends, retransmission, and suspend/resume are implemented.
-- MPSL timeslot diagnostics for PTX/PRX build and have shown two-dongle multi-pipe ACK payload success.
-- BLE + ESB coexistence is functional in diagnostics, but active BLE connection scheduling still needs tuning before it is treated as product-ready.
-- RMK integration is planned next; no RMK transport adapter is included yet.
+- PTX/PRX ESB with ACK payloads, multi-pipe, NoAck, retransmission, suspend/resume — all hardware verified
+- MPSL timeslot integration with Nordic EXTEND mode — hardware verified, 120s stress tested
+- BLE + ESB concurrent operation — verified: 100% OK rate with active BLE connection, 274 acked/s throughput, 2.8ms p50 latency
+- 15 coexistence profiles for different BLE/ESB duty-cycle tradeoffs
+- Real hardware validated on Elytra nRF52833 split keyboard (matrix scan + event-driven ESB PTX + BLE)
+- RMK split transport adapter — planned; no RMK integration yet
 
-The current roadmap is tracked in [Roadmap to 9/10](docs/roadmap-to-9.md).
+### Performance (NordicExtend profile, 200 evt/s, BLE connected, 120s)
+
+| Metric | Value |
+|--------|-------|
+| OK rate | 100% (0 drops) |
+| Throughput | 274 acked/s |
+| Latency p50 / p99 | 2.8ms / 7.6ms |
+| TX first-attempt success | 96.6% |
+| Extend yield | 99.5% |
+| BLE impact on ESB | Zero (OK rate unchanged before/during/after BLE connect) |
 
 ## Goals
 
@@ -33,22 +43,36 @@ The current roadmap is tracked in [Roadmap to 9/10](docs/roadmap-to-9.md).
 - Configurable timer (TIMER1/2/3/4; TIMER0 reserved for MPSL)
 - `defmt` support
 
-## MPSL Status
+## MPSL Coexistence
 
-The `mpsl` feature is experimental. It currently provides diagnostic helpers
-and examples for MPSL timeslot bring-up, PTX/PRX in slots, and nRF SDC BLE
-coexistence. These examples are useful for hardware validation, but the public
-timeslot API is not yet the final owned wrapper described in
-`docs/roadmap-to-9.md`.
+The `mpsl` feature enables concurrent BLE and ESB operation via Nordic's
+Multi-Protocol Service Layer timeslot API. This is the only Rust implementation
+of BLE + proprietary radio coexistence for nRF52.
 
-Do not treat the current MPSL free-function diagnostics as a stable API.
+**Architecture**: PRX requests short initial timeslots (1500us) and dynamically
+extends them in 530us increments via MPSL `ACTION_EXTEND`. BLE preemption only
+costs one 530us window instead of the entire slot, keeping ESB link alive under
+BLE load. This is the Nordic-recommended extend pattern.
+
+The public timeslot API (`open_prx_session`, `open_ptx_session`,
+`open_event_session`, `SignalCounters`, profile enums) is functional but not
+yet stabilized. The `mpsl` feature is mutually exclusive with `_cs-cortex`.
+
+### 3-Mode Example
+
+`mpsl_3mode_central` + `mpsl_3mode_event` demonstrate simultaneous:
+1. ESB PRX/PTX (split keyboard data)
+2. BLE connectable peripheral (HID to host)
+3. USB CDC (debug statistics)
+
+All three run concurrently on a single nRF52840 with zero ESB degradation.
 
 ## Supported Chips
 
 | Chip | Feature | Status |
 |------|---------|--------|
 | nRF52840 | `nrf52840` | Primary target; current hardware validation target |
-| nRF52833 | `nrf52833` | Feature reserved; not hardware-validated yet |
+| nRF52833 | `nrf52833` | Validated on Elytra split keyboard |
 | nRF52832 | `nrf52832` | Feature reserved; not hardware-validated yet |
 
 ## Quick Start
@@ -103,7 +127,8 @@ payload ────────────────────────
 radio ──── state_machine ──── isr ──── async_driver
 timer ──── ┘               └── suspend ──┤
 buffer ───────────────────────────────────┘
-                                         └── mpsl_timeslot
+                                          └── mpsl_timeslot ── mpsl_profile
+                                                              mpsl_schedule
 ```
 
 ## References
@@ -120,6 +145,7 @@ buffer ────────────────────────�
 - [Alpha Testing Guide](docs/alpha-testing.md)
 - [RMK ESB Integration Notes](docs/rmk-integration.md)
 - [M10 MPSL Verification](docs/m10-verification.md)
+- [ESB+BLE Coexistence Analysis](docs/esb-ble-coexistence-analysis.md)
 
 ## License
 
