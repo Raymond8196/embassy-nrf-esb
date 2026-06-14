@@ -1,3 +1,10 @@
+[workspace]
+members = ["xtask"]
+# Keep the default (bare `cargo build`, which cross-compiles to thumbv7em) limited
+# to the root library crate. xtask is a host-only helper, built explicitly with
+# `cargo run -p xtask`.
+default-members = ["."]
+
 [package]
 name = "embassy-nrf-esb"
 version = "0.1.0"
@@ -21,6 +28,11 @@ defmt = { version = "0.3", optional = true }
 # must wait until nrf-mpsl cuts a crates.io release built against embassy-nrf
 # 0.10. Until then, only the default (non-mpsl) feature set is publishable.
 nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
+# nrf-sdc: used only by the BLE+ESB coexistence examples (mpsl_*_ble, mpsl_3mode_*).
+# Optional + gated behind the `mpsl` feature so it stays out of non-mpsl builds —
+# in particular the nrf52833 `hw` test, which must not pull nrf-sdc's nrf52840
+# pin (that would enable two chip features at once). Same git pin as nrf-mpsl.
+nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
 
 [features]
 default = ["provide-memory-x"]
@@ -30,18 +42,19 @@ default = ["provide-memory-x"]
 # avoid a link-search collision.
 provide-memory-x = []
 # Chip selection (only nrf52840 implemented initially, others reserved)
-nrf52840 = ["embassy-nrf/nrf52840", "nrf-mpsl?/nrf52840"]
-nrf52833 = ["embassy-nrf/nrf52833", "nrf-mpsl?/nrf52833"]
-nrf52832 = ["embassy-nrf/nrf52832", "nrf-mpsl?/nrf52832"]
+nrf52840 = ["embassy-nrf/nrf52840", "nrf-mpsl?/nrf52840", "nrf-sdc?/nrf52840"]
+nrf52833 = ["embassy-nrf/nrf52833", "nrf-mpsl?/nrf52833", "nrf-sdc?/nrf52833"]
+nrf52832 = ["embassy-nrf/nrf52832", "nrf-mpsl?/nrf52832", "nrf-sdc?/nrf52832"]
 # Board selection (memory layout for bootloader)
 board-dongle = []
 board-nicenano = []
 # Functional options
 fast-ru = []
-defmt = ["dep:defmt", "embassy-nrf/defmt", "nrf-mpsl?/defmt"]
+defmt = ["dep:defmt", "embassy-nrf/defmt", "nrf-mpsl?/defmt", "nrf-sdc?/defmt"]
 # MPSL timeslot integration (M10) — gated; off by default.
 # Brings nrf-mpsl's critical-section impl; mutually exclusive with `_cs-cortex`.
-mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section-impl"]
+# Also pulls nrf-sdc (BLE host) used by the coexistence examples.
+mpsl = ["dep:nrf-mpsl", "nrf-mpsl/critical-section-impl", "dep:nrf-sdc", "nrf-sdc/peripheral"]
 # Internal: enables cortex-m's critical-section-single-core impl for examples
 # that do NOT use mpsl. Library code does not depend on this; required by the
 # M9 example binaries (ptx_basic, prx_basic, etc.) so they link a cs provider.
@@ -54,13 +67,19 @@ critical-section = { version = "1", features = ["std"] }
 [target.'cfg(target_arch = "arm")'.dev-dependencies]
 bt-hci = { version = "0.8", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
-embassy-nrf = { version = "0.10", features = ["nrf52840", "unstable-pac", "time", "time-driver-rtc1"] }
+# Chip is intentionally not pinned here: the lib's chip feature (nrf52840 /
+# nrf52833) selects `embassy-nrf/<chip>`, so examples and the `hw` test each
+# resolve embassy-nrf to a single chip. Pinning a chip here would clash with a
+# different chip feature (e.g. building the `hw` test for nrf52833).
+embassy-nrf = { version = "0.10", features = ["unstable-pac", "time", "time-driver-rtc1"] }
 embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
 embassy-usb = "0.6"
 cortex-m = { version = "0.7", default-features = false }
 cortex-m-rt = "0.7"
 defmt-rtt = "1"
-nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", features = ["nrf52840", "peripheral", "defmt"], default-features = false }
+# On-target HIL test harness. Provides its own test runner and panic handler
+# (so `hw.rs` must NOT also pull panic-probe). See `[[test]] name = "hw"`.
+embedded-test = { version = "0.7", features = ["defmt"] }
 panic-probe = { version = "1", features = ["print-defmt"] }
 panic-halt = "1"
 static_cell = "2"
@@ -68,6 +87,13 @@ postcard = { version = "1", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
 heapless = { version = "0.8", default-features = false }
 usbd-hid = "0.8"
+
+# On-target register HIL test (embedded-test). Runs on the Elytra nRF52833 over
+# SWD via `cargo xtask test-hw`. harness=false: embedded-test brings its own.
+[[test]]
+name = "hw"
+harness = false
+required-features = ["nrf52833", "defmt", "_cs-cortex"]
 
 [[example]]
 name = "ptx_basic"

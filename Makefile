@@ -55,6 +55,13 @@ check-fmt:
 
 check-no-hw: check-host check-exclusive check-mpsl check-feature-conflict check-fmt
 
+# Test runners (delegate to the xtask crate). HIL tests need a probe on the
+# nRF52833; host tests use the ELF triple baked into xtask (override with
+# `cargo xtask test-host <triple>`).
+test: ; cargo xtask test
+test-host: ; cargo xtask test-host
+test-hw: ; cargo xtask test-hw
+
 # Build single example: make build-ptx_silent
 build-%:
 	@command -v cargo >/dev/null || { echo "error: cargo not found in PATH"; exit 1; }
@@ -110,4 +117,4 @@ help:
 	@echo "  make ports              List connected serial ports"
 	@echo "  make clean              Remove all build artifacts"
 
-.PHONY: all check-host check-exclusive check-mpsl check-feature-conflict check-fmt check-no-hw clean help ports build-% flash-%
+.PHONY: all check-host check-exclusive check-mpsl check-feature-conflict check-fmt check-no-hw test test-host test-hw clean help ports build-% flash-%
