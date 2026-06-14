@@ -11,7 +11,9 @@ Pure Rust ESB (Enhanced ShockBurst) implementation for nRF52 series, built on Em
 - BLE + ESB concurrent operation — verified: 100% OK rate with active BLE connection, 274 acked/s throughput, 2.8ms p50 latency
 - 15 coexistence profiles for different BLE/ESB duty-cycle tradeoffs
 - Real hardware validated on Elytra nRF52833 split keyboard (matrix scan + event-driven ESB PTX + BLE)
-- RMK split transport adapter — planned; no RMK integration yet
+- Split transport layer (framing, static binding, sequence dedup) with host tests and a runnable split example pair
+- On-target register HIL tests via `cargo xtask test-hw` (embedded-test, runs on nRF52833 over SWD)
+- RMK split transport adapter — planned next; the RMK-side `SplitReader`/`SplitWriter` adapter is not written yet
 
 ### Performance (NordicExtend profile, 200 evt/s, BLE connected, 120s)
 
@@ -84,6 +86,20 @@ cargo fmt --check
 cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
 cargo check --features nrf52840,_cs-cortex
 ```
+
+### Tests
+
+The `xtask` runner drives both host and on-target tests:
+
+```bash
+cargo xtask test-host   # host unit tests (ELF target; matches CI)
+cargo xtask test-hw     # on-target register HIL tests (needs a probe on nRF52833)
+cargo xtask test        # both
+```
+
+`test-hw` flashes the `tests/hw.rs` register-assert suite to an nRF52833 over
+SWD via probe-rs and checks that the public driver programs RADIO/TIMER exactly
+as configured. The two nRF52840 dongles are DFU-only and cannot run these.
 
 Build the exclusive ESB USB smoke-test firmware for two nRF52840 boards:
 

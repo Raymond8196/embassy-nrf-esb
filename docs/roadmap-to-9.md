@@ -13,6 +13,36 @@ The target is to raise four project dimensions to 9/10:
 The first product target remains RMK integration for a tri-mode, multi-split
 keyboard. The second target is an upstream-friendly Embassy-style crate.
 
+## Progress Log
+
+### 2026-06-15
+
+- **Phase 1 (baseline/CI):** done. Host checks + example/MPSL/feature-conflict
+  checks run in CI. Added an `xtask` runner and on-target register HIL tests
+  (`cargo xtask test-hw`, embedded-test on nRF52833 over SWD) — see `tests/hw.rs`.
+- **Phase 2 (exclusive ESB core):** hardware-verified (PTX/PRX, ACK payloads,
+  multi-pipe, NoAck, suspend/resume).
+- **Phase 3 (RMK transport MVP):** the in-repo portion is essentially complete.
+  `src/transport.rs` provides `TransportHeader`, `encode_frame`/`decode_frame`,
+  `SequenceTracker` (dedup), `StaticBindingTable`, and `accept_bound_frame`,
+  with host unit tests. `examples/ptx_split_peripheral` + `prx_split_central`
+  demonstrate a split pair carrying an RMK-shaped `SplitMessage` (postcard).
+- **Review-fix backlog:** the MPSL PRX PID/CRC cross-slot clearing bug is fixed
+  (timeslot state now carries and restores `last_pid`/`last_crc`). Remaining
+  backlog items (single global `PTX_BUFS`/`PRX_BUFS`, duplicated timeslot state
+  machines) are Phase 5 work.
+
+**Chosen next milestone: Phase 3 → the real RMK adapter (Track A).** The in-repo
+transport layer and a working split demo are ready; the missing piece is the
+RMK-side `SplitReader`/`SplitWriter` adapter, which lives in the RMK repo
+(`/Users/ray/wkspaces/rmk`) because `SplitMessage` is crate-private there.
+Immediate validation step: two-nRF52840-dongle bring-up of the split path
+before moving into the RMK codebase.
+
+Deferred: Phase 5 (MPSL owned wrapper / pool-based buffers) and Phase 6
+(publish split: pure ESB core to crates.io; `mpsl` blocked by the `nrf-mpsl`
+git dependency). nRF54L support remains out of scope for now.
+
 ## Score Targets
 
 | Area | Current estimate | 9/10 definition |
