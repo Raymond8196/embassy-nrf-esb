@@ -502,16 +502,16 @@ impl EsbRadio {
         });
     }
 
-    /// Set up ACK TX with fallback empty ACK `[0, 0]`.
-    /// Used when no ACK payload is queued (esb-ng lines 377).
+    /// Pointer to the shared 2-byte fallback empty-ACK buffer `[0, 0]`.
+    ///
     /// Minimum ACK is 2 bytes: DMA needs valid length + pid_no_ack fields.
-    pub(crate) fn setup_ack_tx_fallback(&mut self, pipe: u8) {
+    fn fallback_ack_ptr(&self) -> *mut u8 {
         // SAFETY: UnsafeCell provides interior mutability for DMA access.
         // The RADIO only reads from this buffer (never writes) — it transmits
         // the 2-byte content as an empty ACK packet.
         //
-        // SAFETY (Sync wrapper): Access is single-threaded — this method is only
-        // called from the RADIO ISR. No concurrent access is possible.
+        // SAFETY (Sync wrapper): Access is single-threaded — only called from
+        // the RADIO ISR or the MPSL timeslot callback. No concurrent access.
         //
         // link_section(".data") guarantees RAM placement — EasyDMA cannot read
         // from Flash (errata [122], PS §6.17.6).
@@ -521,8 +521,21 @@ impl EsbRadio {
         #[unsafe(link_section = ".data")]
         static FALLBACK_ACK: FallbackAck = FallbackAck(UnsafeCell::new([0, 0]));
         // SAFETY: ISR-only access, RADIO reads while in TX mode.
-        let ptr = unsafe { (*FALLBACK_ACK.0.get()).as_mut_ptr() };
+        unsafe { (*FALLBACK_ACK.0.get()).as_mut_ptr() }
+    }
+
+    /// Set up ACK TX with fallback empty ACK `[0, 0]` (auto shortcut path).
+    /// Used when no ACK payload is queued (esb-ng lines 377).
+    pub(crate) fn setup_ack_tx_fallback(&mut self, pipe: u8) {
+        let ptr = self.fallback_ack_ptr();
         self.setup_ack_tx(pipe, ptr);
+    }
+
+    /// Start ACK TX with the fallback empty ACK, manual (MPSL) turnaround.
+    #[cfg(feature = "mpsl")]
+    pub(crate) fn transmit_ack_manual_fallback(&mut self, pipe: u8) {
+        let ptr = self.fallback_ack_ptr();
+        self.transmit_ack_manual(pipe, ptr);
     }
 
     /// Stop PRX TX (NoAck path) — stops radio before TX begins

@@ -597,7 +597,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         let idx = alloc_dma_buffer(pool).ok_or(Error::OutOfMemory)?;
         self.rx_idx = idx;
         let dma_ptr = unsafe { pool.dma_ptr(idx) };
-        self.radio.start_receiving(self.enabled_pipes, dma_ptr);
+        self.arm_rx(dma_ptr);
         self.state = StatePrx::Receiver;
         Ok(())
     }
@@ -646,16 +646,12 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                         pool.release_tx(rx_idx);
                                         self.rx_idx = new_idx;
                                         let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
-                                        // Stop TX ramp-up from disabled_txen shortcut
-                                        // before restarting RX (issue 4).
-                                        self.radio.stop_prx_no_ack();
-                                        self.radio.complete_rx_no_ack(dma_ptr);
+                                        self.restart_rx_no_ack(dma_ptr);
                                     }
                                     None => {
                                         // Re-use current buffer
                                         let dma_ptr = unsafe { pool.dma_ptr(rx_idx) };
-                                        self.radio.stop_prx_no_ack();
-                                        self.radio.complete_rx_no_ack(dma_ptr);
+                                        self.restart_rx_no_ack(dma_ptr);
                                     }
                                 }
                                 return (PrxEvent::Duplicate, None);
@@ -666,7 +662,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 // Release it before entering TxRepeatedAck.
                                 pool.release_tx(rx_idx);
                                 self.rx_idx = NO_IDX;
-                                self.radio.setup_ack_tx_fallback(pipe as u8);
+                                self.start_repeated_ack(pipe as u8);
                                 self.state = StatePrx::TxRepeatedAck;
                                 return (PrxEvent::Duplicate, None);
                             }
@@ -687,10 +683,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                                 Some(new_idx) => {
                                     self.rx_idx = new_idx;
                                     let dma_ptr = unsafe { pool.dma_ptr(new_idx) };
-                                    // Stop TX ramp-up from disabled_txen shortcut
-                                    // before restarting RX (issue 4).
-                                    self.radio.stop_prx_no_ack();
-                                    self.radio.complete_rx_no_ack(dma_ptr);
+                                    self.restart_rx_no_ack(dma_ptr);
                                 }
                                 None => {
                                     // No buffer available — stop radio and go idle
@@ -702,7 +695,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                         }
 
                         // Need ACK
-                        self.setup_ack_tx(pool, pipe as u8);
+                        self.start_ack_tx(pool, pipe as u8);
                         self.pending_rx_idx = rx_idx;
                         self.rx_idx = NO_IDX;
                         self.state = StatePrx::TxAck;
@@ -724,7 +717,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                     Some(idx) => {
                         self.rx_idx = idx;
                         let dma_ptr = unsafe { pool.dma_ptr(idx) };
-                        self.radio.complete_rx_ack(dma_ptr);
+                        self.restart_rx_after_ack(dma_ptr);
                         self.state = StatePrx::Receiver;
                     }
                     None => {
@@ -746,7 +739,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                     Some(idx) => {
                         self.rx_idx = idx;
                         let dma_ptr = unsafe { pool.dma_ptr(idx) };
-                        self.radio.complete_rx_ack(dma_ptr);
+                        self.restart_rx_after_ack(dma_ptr);
                         self.state = StatePrx::Receiver;
                     }
                     None => {
@@ -764,6 +757,91 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                 let _ = self.start_receiving(pool);
                 (PrxEvent::None, None)
             }
+        }
+    }
+
+    // ---- Mode-aware radio turnaround (S4) ----
+    //
+    // Each helper routes between the exclusive auto-shortcut path and the MPSL
+    // manual-ACK path based on `timeslot_managed`. Under `not(feature = "mpsl")`
+    // the cfg block is removed entirely, so exclusive builds compile to the exact
+    // same radio calls as before (no behavioral change, no regression).
+
+    /// Arm RX to start listening.
+    fn arm_rx(&mut self, dma_ptr: *mut u8) {
+        #[cfg(feature = "mpsl")]
+        if self.timeslot_managed {
+            self.radio
+                .start_receiving_manual_ack(self.enabled_pipes, dma_ptr);
+            return;
+        }
+        self.radio.start_receiving(self.enabled_pipes, dma_ptr);
+    }
+
+    /// Restart RX after a NoAck packet (stop any TX ramp, then re-arm RX).
+    fn restart_rx_no_ack(&mut self, dma_ptr: *mut u8) {
+        #[cfg(feature = "mpsl")]
+        if self.timeslot_managed {
+            self.radio.stop();
+            self.radio
+                .start_receiving_manual_ack(self.enabled_pipes, dma_ptr);
+            return;
+        }
+        self.radio.stop_prx_no_ack();
+        self.radio.complete_rx_no_ack(dma_ptr);
+    }
+
+    /// Restart RX after an ACK TX completes.
+    fn restart_rx_after_ack(&mut self, dma_ptr: *mut u8) {
+        #[cfg(feature = "mpsl")]
+        if self.timeslot_managed {
+            self.radio
+                .start_receiving_manual_ack(self.enabled_pipes, dma_ptr);
+            return;
+        }
+        self.radio.complete_rx_ack(dma_ptr);
+    }
+
+    /// Start an ACK TX for a new packet (dequeue ACK payload or empty fallback).
+    fn start_ack_tx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+        pipe: u8,
+    ) {
+        #[cfg(feature = "mpsl")]
+        if self.timeslot_managed {
+            self.setup_ack_tx_manual(pool, pipe);
+            return;
+        }
+        self.setup_ack_tx(pool, pipe);
+    }
+
+    /// Start a repeated (duplicate) ACK — empty fallback ACK.
+    fn start_repeated_ack(&mut self, pipe: u8) {
+        #[cfg(feature = "mpsl")]
+        if self.timeslot_managed {
+            self.radio.transmit_ack_manual_fallback(pipe);
+            return;
+        }
+        self.radio.setup_ack_tx_fallback(pipe);
+    }
+
+    /// Manual-turnaround variant of `setup_ack_tx` for MPSL timeslot mode.
+    /// Dequeues a pipe-matched ACK payload from the pool (empty fallback if
+    /// none) and starts the ACK TX explicitly (no `disabled_txen` shortcut).
+    #[cfg(feature = "mpsl")]
+    fn setup_ack_tx_manual<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+        pipe: u8,
+    ) {
+        if let Some(idx) = pool.try_dequeue_tx_for_pipe(pipe) {
+            let dma_ptr = unsafe { pool.dma_ptr(idx) };
+            self.ack_tx_idx = idx;
+            self.radio.transmit_ack_manual(pipe, dma_ptr);
+        } else {
+            self.ack_tx_idx = NO_IDX;
+            self.radio.transmit_ack_manual_fallback(pipe);
         }
     }
 
