@@ -142,6 +142,12 @@ pub struct PtxStateMachine<T: TimerInstance> {
     tx_idx: usize,
     /// Current ACK RX buffer pool index (IN_DMA while waiting for ACK).
     ack_rx_idx: usize,
+    /// MPSL timeslot-managed mode. When `true`, this state machine is driven
+    /// from the MPSL timeslot callback (`SIGNAL_RADIO`) rather than the RADIO
+    /// ISR, and timing comes from the timeslot layer (TIMER0 / in-slot poll)
+    /// instead of the `EsbTimer` PPI path. Defaults to `false` (exclusive mode).
+    /// See `docs/single-engine-convergence-plan.md` (S2/S6).
+    timeslot_managed: bool,
 }
 
 #[allow(dead_code)]
@@ -170,12 +176,28 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             pid: 0,
             tx_idx: NO_IDX,
             ack_rx_idx: NO_IDX,
+            timeslot_managed: false,
         }
     }
 
     /// Get current PTX state.
     pub fn state(&self) -> StatePtx {
         self.state
+    }
+
+    /// Enable or disable MPSL timeslot-managed operation.
+    ///
+    /// When `true`, the state machine expects to be driven from the MPSL
+    /// timeslot callback (manual radio turnaround, timeslot-layer timing) rather
+    /// than the RADIO/TIMER ISR path. The manual turnaround branches are wired in
+    /// S4/S6; today this only records the mode for the timeslot wrapper (S3).
+    pub(crate) fn set_timeslot_managed(&mut self, enabled: bool) {
+        self.timeslot_managed = enabled;
+    }
+
+    /// Returns whether MPSL timeslot-managed operation is enabled.
+    pub(crate) fn is_timeslot_managed(&self) -> bool {
+        self.timeslot_managed
     }
 
     /// Check and clear ISR event flags.
@@ -500,6 +522,12 @@ pub struct PrxStateMachine<T: TimerInstance> {
     pending_rx_idx: usize,
     /// Current ACK TX buffer pool index (IN_DMA while sending ACK payload).
     ack_tx_idx: usize,
+    /// MPSL timeslot-managed mode. When `true`, this state machine is driven
+    /// from the MPSL timeslot callback (`SIGNAL_RADIO`) and uses manual ACK
+    /// turnaround (`start_receiving_manual_ack` / `transmit_ack_manual`) instead
+    /// of the auto `disabled_txen`/`disabled_rxen` shortcuts. Defaults to `false`
+    /// (exclusive mode). See `docs/single-engine-convergence-plan.md` (S2/S4).
+    timeslot_managed: bool,
 }
 
 #[allow(dead_code)]
@@ -520,12 +548,28 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             rx_idx: NO_IDX,
             pending_rx_idx: NO_IDX,
             ack_tx_idx: NO_IDX,
+            timeslot_managed: false,
         }
     }
 
     /// Get current PRX state.
     pub fn state(&self) -> StatePrx {
         self.state
+    }
+
+    /// Enable or disable MPSL timeslot-managed operation.
+    ///
+    /// When `true`, the state machine expects to be driven from the MPSL
+    /// timeslot callback and to use manual ACK turnaround instead of the auto
+    /// `disabled_txen`/`disabled_rxen` shortcuts. The manual turnaround branches
+    /// are wired in S4; today this only records the mode for the wrapper (S3).
+    pub(crate) fn set_timeslot_managed(&mut self, enabled: bool) {
+        self.timeslot_managed = enabled;
+    }
+
+    /// Returns whether MPSL timeslot-managed operation is enabled.
+    pub(crate) fn is_timeslot_managed(&self) -> bool {
+        self.timeslot_managed
     }
 
     /// Check and clear ISR event flags.
