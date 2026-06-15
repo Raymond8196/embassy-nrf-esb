@@ -297,3 +297,16 @@ Host/HIL: build all feature sets + register HIL still green. Hardware (S5): the
 converged `mpsl_3mode_central`/`mpsl_prx_ble` against `ble_conn_capture.py` must
 reproduce the baseline (≈100% OK, 99.5% extend yield) vs the `baseline-inline-engine-mpsl`
 tag before PTX (S6) starts.
+
+## 10. Progress
+
+- **2026-06-15** — S0/S2/S4-a landed on `feat/single-engine-convergence`
+  (baseline tag `baseline-inline-engine-mpsl`):
+  - S2: `timeslot_managed` mode + accessors on both state machines (commit 3e766ba).
+  - S4-a: PRX manual-ACK turnaround via mode-aware helpers; exclusive codegen
+    unchanged under `not(feature="mpsl")`; ACK payloads from `PacketPool` (commit 6bc9e8d).
+  - Verified without hardware: exclusive + mpsl `cargo check` clean, host tests 52/0.
+  - **Remaining is hardware-coupled** (deferred to a bench session): S3 wrapper +
+    S4-b callback rewire are coupled (the wrapper is inert until the callback
+    drives it) and only S5 can confirm the converged PRX reproduces the baseline;
+    S6/S7 (PTX) need the D1 micro-spike on hardware.
