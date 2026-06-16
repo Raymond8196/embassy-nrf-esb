@@ -307,6 +307,16 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
         compiler_fence(Ordering::Acquire);
         self.state[index].store(state::FREE, Ordering::Release);
     }
+
+    /// Discard all queued RX packets and return their buffers to the free pool.
+    pub(crate) fn discard_received(&self) -> usize {
+        let mut count = 0;
+        while let Some(index) = self.try_receive_rx() {
+            self.release_rx(index);
+            count += 1;
+        }
+        count
+    }
 }
 
 #[allow(dead_code)]
@@ -567,5 +577,20 @@ mod tests {
             state::FREE
         );
         assert!(pool.rx_to_dma(0));
+    }
+
+    #[test]
+    fn discard_received_drains_rx_queue_and_releases_buffers() {
+        let pool = PacketPool::<3, 16>::new();
+
+        assert!(pool.rx_to_dma(0));
+        assert!(pool.rx_to_dma(1));
+        pool.rx_complete(0);
+        pool.rx_complete(1);
+
+        assert_eq!(pool.discard_received(), 2);
+        assert_eq!(pool.discard_received(), 0);
+        assert!(pool.rx_to_dma(0));
+        assert!(pool.rx_to_dma(1));
     }
 }

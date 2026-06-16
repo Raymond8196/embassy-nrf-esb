@@ -779,6 +779,19 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         sm.ts_on_radio(self.pool)
     }
 
+    /// Provide diagnostic ACK context for the next in-slot PRX event.
+    #[cfg(feature = "mpsl")]
+    pub fn ts_set_diag_ack_context(&self, context: crate::state_machine::TimeslotDiagAckContext) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.set_timeslot_diag_ack_context(context);
+    }
+
+    /// Discard RX packets queued by the timeslot diagnostic driver.
+    pub fn ts_discard_received(&self) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.ts_discard_received(self.pool);
+    }
+
     /// Slot end — stop radio, release buffers, clear timeslot_managed.
     pub fn ts_force_stop(&self) {
         let sm = unsafe { &mut *self.sm.get() };
@@ -828,6 +841,12 @@ pub trait TimeslotPrxDriver: Sync {
     /// event so the timeslot layer can update diagnostic counters.
     fn ts_on_radio(&self) -> (crate::state_machine::PrxEvent, Option<usize>);
 
+    /// Provide per-slot diagnostic ACK metadata before handling a RADIO event.
+    fn ts_set_diag_ack_context(&self, context: crate::state_machine::TimeslotDiagAckContext);
+
+    /// Discard packets queued for app delivery by diagnostic timeslot sessions.
+    fn ts_discard_received(&self);
+
     /// Slot end / EXTEND_FAILED / OVERSTAYED: stop radio, release buffers,
     /// clear timeslot_managed. After return, the driver is quiescent.
     fn ts_force_stop(&self);
@@ -853,6 +872,14 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> TimeslotPrxDriver for 
 
     fn ts_on_radio(&self) -> (crate::state_machine::PrxEvent, Option<usize>) {
         EsbPrx::ts_on_radio(self)
+    }
+
+    fn ts_set_diag_ack_context(&self, context: crate::state_machine::TimeslotDiagAckContext) {
+        EsbPrx::ts_set_diag_ack_context(self, context)
+    }
+
+    fn ts_discard_received(&self) {
+        EsbPrx::ts_discard_received(self)
     }
 
     fn ts_force_stop(&self) {

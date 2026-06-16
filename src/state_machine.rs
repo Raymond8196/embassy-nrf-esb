@@ -107,6 +107,15 @@ pub enum PrxEvent {
     BadCrc,
 }
 
+#[cfg(any(test, feature = "mpsl"))]
+#[derive(Clone, Copy)]
+pub struct TimeslotDiagAckContext {
+    pub window_id: u32,
+    pub next_delay_us: u32,
+    pub period_us: u32,
+    pub window_us: u32,
+}
+
 /// Sentinel value meaning "no active DMA buffer".
 const NO_IDX: usize = usize::MAX;
 
@@ -529,6 +538,10 @@ pub struct PrxStateMachine<T: TimerInstance> {
     /// Last pipe processed in `handle_radio_event` (0xFF = none yet). Exposed
     /// for timeslot-mode diagnostic counters.
     last_pipe: u8,
+    #[cfg(feature = "mpsl")]
+    diag_ack_context: Option<TimeslotDiagAckContext>,
+    #[cfg(feature = "mpsl")]
+    diag_ack_counter: [u32; 8],
     /// MPSL timeslot-managed mode. When `true`, this state machine is driven
     /// from the MPSL timeslot callback (`SIGNAL_RADIO`) and uses manual ACK
     /// turnaround (`start_receiving_manual_ack` / `transmit_ack_manual`) instead
@@ -557,6 +570,10 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             pending_rx_idx: NO_IDX,
             ack_tx_idx: NO_IDX,
             last_pipe: 0xFF,
+            #[cfg(feature = "mpsl")]
+            diag_ack_context: None,
+            #[cfg(feature = "mpsl")]
+            diag_ack_counter: [0; 8],
             timeslot_managed: false,
         }
     }
@@ -647,6 +664,11 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         self.last_pipe
     }
 
+    #[cfg(feature = "mpsl")]
+    pub(crate) fn set_timeslot_diag_ack_context(&mut self, context: TimeslotDiagAckContext) {
+        self.diag_ack_context = Some(context);
+    }
+
     /// Timeslot entrypoint: slot start.
     ///
     /// Power-cycles RADIO, re-inits ESB registers, restores duplicate-detection
@@ -705,6 +727,15 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     ) {
         self.stop_receiving(pool);
         self.timeslot_managed = false;
+    }
+
+    /// Timeslot diagnostic entrypoint: discard packets queued by the shared
+    /// state machine so a headless PRX session cannot exhaust its RX pool.
+    pub(crate) fn ts_discard_received<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        pool.discard_received();
     }
 
     /// Handle a RADIO ISR event.
@@ -928,7 +959,7 @@ impl<T: TimerInstance> PrxStateMachine<T> {
     fn start_repeated_ack(&mut self, pipe: u8) {
         #[cfg(feature = "mpsl")]
         if self.timeslot_managed {
-            self.radio.transmit_ack_manual_fallback(pipe);
+            self.transmit_timeslot_fallback_ack(pipe, false);
             return;
         }
         self.radio.setup_ack_tx_fallback(pipe);
@@ -949,8 +980,31 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             self.radio.transmit_ack_manual(pipe, dma_ptr);
         } else {
             self.ack_tx_idx = NO_IDX;
-            self.radio.transmit_ack_manual_fallback(pipe);
+            self.transmit_timeslot_fallback_ack(pipe, true);
         }
+    }
+
+    #[cfg(feature = "mpsl")]
+    fn transmit_timeslot_fallback_ack(&mut self, pipe: u8, advance_counter: bool) {
+        let Some(context) = self.diag_ack_context else {
+            self.radio.transmit_ack_manual_fallback(pipe);
+            return;
+        };
+
+        let pipe_idx = pipe as usize;
+        let counter = if pipe_idx < self.diag_ack_counter.len() {
+            if advance_counter {
+                self.diag_ack_counter[pipe_idx] = self.diag_ack_counter[pipe_idx].saturating_add(1);
+            }
+            self.diag_ack_counter[pipe_idx]
+        } else {
+            0
+        };
+
+        let ack = timeslot_diag_ack_buf();
+        write_timeslot_diag_ack(ack, context, counter);
+        let dma_ptr = unsafe { ack.as_mut_ptr().add(crate::header::EsbHeader::DMA_OFFSET) };
+        self.radio.transmit_ack_manual(pipe, dma_ptr);
     }
 
     /// Set up ACK TX for a new (non-duplicate) packet.
@@ -1061,8 +1115,74 @@ fn alloc_dma_buffer<const N: usize, const SIZE: usize>(
     (0..N).find(|&i| pool.rx_to_dma(i))
 }
 
+#[cfg(any(test, feature = "mpsl"))]
+fn write_timeslot_diag_ack(buf: &mut [u8; 256], context: TimeslotDiagAckContext, counter: u32) {
+    crate::mpsl_common::write_counter_schedule_packet(
+        buf,
+        0,
+        counter,
+        crate::mpsl_schedule::ScheduleHint::new(
+            0,
+            context.window_id,
+            context.next_delay_us,
+            context.period_us,
+            context.window_us,
+        ),
+    );
+}
+
+#[cfg(feature = "mpsl")]
+fn timeslot_diag_ack_buf() -> &'static mut [u8; 256] {
+    use core::cell::UnsafeCell;
+
+    #[repr(C, align(4))]
+    struct TimeslotDiagAckBuf(UnsafeCell<[u8; 256]>);
+    unsafe impl Sync for TimeslotDiagAckBuf {}
+
+    #[unsafe(link_section = ".data")]
+    static ACK: TimeslotDiagAckBuf = TimeslotDiagAckBuf(UnsafeCell::new([0u8; 256]));
+
+    unsafe { &mut *ACK.0.get() }
+}
+
 /// Pend the RADIO ISR.
 #[cfg(any(feature = "nrf52840", feature = "nrf52833", feature = "nrf52832"))]
 fn pend_radio_isr() {
     cortex_m::peripheral::NVIC::pend(crate::pac::Interrupt::RADIO);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TimeslotDiagAckContext, write_timeslot_diag_ack};
+    use crate::header::EsbHeader;
+    use crate::mpsl_common::read_counter_payload;
+    use crate::mpsl_schedule::{
+        SCHEDULE_COUNTER_HINT_PAYLOAD_LEN, ScheduleHint, decode_counter_payload_schedule_hint,
+    };
+
+    #[test]
+    fn timeslot_diag_ack_preserves_legacy_counter_and_schedule_hint() {
+        let mut buf = [0u8; 256];
+        let context = TimeslotDiagAckContext {
+            window_id: 42,
+            next_delay_us: 1500,
+            period_us: 5000,
+            window_us: 4500,
+        };
+
+        write_timeslot_diag_ack(&mut buf, context, 0x4433_2211);
+
+        let header = unsafe { &*(buf.as_ptr().cast::<EsbHeader>()) };
+        assert_eq!(header.length, SCHEDULE_COUNTER_HINT_PAYLOAD_LEN as u8);
+        assert_eq!(header.pid(), 0);
+        assert!(!header.no_ack());
+        assert_eq!(read_counter_payload(&buf), Some(0x4433_2211));
+
+        let payload = &buf[EsbHeader::PAYLOAD_OFFSET
+            ..EsbHeader::PAYLOAD_OFFSET + SCHEDULE_COUNTER_HINT_PAYLOAD_LEN];
+        assert_eq!(
+            decode_counter_payload_schedule_hint(payload),
+            Ok(ScheduleHint::new(0, 42, 1500, 5000, 4500))
+        );
+    }
 }

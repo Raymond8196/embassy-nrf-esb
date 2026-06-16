@@ -1573,6 +1573,7 @@ impl PrxInnerState {
         self.counters = SignalCounters::ZERO;
         self.done = false;
         self.target_count = 0;
+        self.driver = None;
         self.saved_pid = [0; NUM_PIPES];
         self.saved_crc = [0; NUM_PIPES];
         self.saved_valid = [false; NUM_PIPES];
@@ -1875,7 +1876,14 @@ unsafe extern "C" fn prx_timeslot_callback(
 
             // ---- Converged path: drive the shared state machine ----
             if let Some(driver) = state.driver {
+                driver.ts_set_diag_ack_context(crate::state_machine::TimeslotDiagAckContext {
+                    window_id: state.counters.start,
+                    next_delay_us: prx_next_window_delay_us(state),
+                    period_us: prx_schedule_period_us(state),
+                    window_us: state.in_slot_match_us,
+                });
                 let (event, _rx_idx) = driver.ts_on_radio();
+                driver.ts_discard_received();
                 let pipe = driver.ts_last_pipe() as usize;
                 use crate::state_machine::PrxEvent;
                 match event {
@@ -2440,6 +2448,9 @@ impl PrxSlotSession {
 
 impl Drop for PrxSlotSession {
     fn drop(&mut self) {
+        PRX_STATE.with_inner(|state| {
+            state.driver = None;
+        });
         let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
     }
 }
