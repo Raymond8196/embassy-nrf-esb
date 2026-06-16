@@ -310,3 +310,28 @@ tag before PTX (S6) starts.
     S4-b callback rewire are coupled (the wrapper is inert until the callback
     drives it) and only S5 can confirm the converged PRX reproduces the baseline;
     S6/S7 (PTX) need the D1 micro-spike on hardware.
+
+- **2026-06-16** — S3 + S4-b landed (uncommitted, on branch):
+  - **S3 (D6 trait-object bridge):** `TimeslotPrxDriver` trait in `isr.rs` with
+    `ts_start_rx` / `ts_on_radio` / `ts_force_stop` / `ts_snapshot_dup_state` /
+    `ts_last_pipe`. `EsbPrx::new_timeslot()` constructor (no NVIC RADIO unmask —
+    MPSL owns the vector). `PrxStateMachine` gained `addresses` field +
+    `ts_start_rx/ts_on_radio/ts_force_stop` methods (power-cycle + init + restore
+    dup-state + arm RX each slot).
+  - **S4-b (callback rewire):** `prx_timeslot_callback` SIGNAL_START / SIGNAL_RADIO
+    / slot-end now dispatch through `driver.ts_*()` when `state.driver.is_some()`.
+    Legacy inline path preserved as fallback (`driver == None`). Per-pipe counters
+    updated from `PrxEvent` + `ts_last_pipe()`. `set_prx_driver()` / `clear_prx_driver()`
+    public API for session-time registration.
+  - **mpsl_3mode_central.rs** updated: creates `EsbPrx<TIMER1>` via
+    `new_timeslot`, calls `set_prx_driver`. USB CDC setup moved before BLE init
+    so logs are visible even if BLE panics.
+  - **Verified:** `make check-no-hw` green (host 52/0, exclusive, MPSL, fmt,
+    feature-conflict). On-target (1× nRF52840 dongle): converged PRX firmware
+    boots, USB CDC active, `[3MODE] PRX converged engine active` logged,
+    timeslot scheduling active (start/timer0 counters incrementing, blocked
+    recovery working). `ts_start_rx` returns Ok (no buffer alloc failures).
+  - **Pending S5:** full PTX↔PRX coexistence verification blocked on second
+    dongle recovery (DC08665938A2 stuck after repeated BLE-init flashes).
+    `rd=0` in solo-run is expected (no PTX transmitting → no RADIO events
+    within slot; slot-end stop doesn't generate SIGNAL_RADIO).

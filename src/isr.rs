@@ -522,6 +522,46 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         })
     }
 
+    /// Create a new PRX driver for MPSL timeslot-managed mode (S3).
+    ///
+    /// Like [`new`](Self::new) but does **not** unmask the RADIO or TIMER ISRs —
+    /// in timeslot mode the RADIO ISR vector belongs to MPSL (the app receives
+    /// events via `SIGNAL_RADIO`), and the protocol timing comes from TIMER0
+    /// owned by MPSL, not from `EsbTimer<T>`. RADIO is also left un-initialised
+    /// here because each timeslot power-cycles it; `ts_start_rx` does the init.
+    ///
+    /// **NVIC note:** unlike `new()`, this does NOT mask/unmask RADIO. MPSL
+    /// owns the RADIO vector; masking it here would break MPSL signal delivery.
+    pub fn new_timeslot(
+        timer: embassy_nrf::Peri<'static, T>,
+        _radio: embassy_nrf::Peri<'static, embassy_nrf::peripherals::RADIO>,
+        pool: &'static PacketPool<N, SIZE>,
+        config: &EsbConfig,
+        addresses: &EsbAddresses,
+    ) -> Result<Self, Error> {
+        config.validate()?;
+        // SM keeps the config + a fresh radio instance; RADIO registers are
+        // programmed on each slot by `ts_start_rx`.
+        let radio = EsbRadio::new(crate::pac::RADIO);
+        let esb_timer = EsbTimer::new(timer);
+        let enabled_pipes = addresses.enabled_mask();
+        let mut sm = PrxStateMachine::new(radio, esb_timer, config, enabled_pipes);
+        sm.set_addresses(addresses);
+        sm.set_timeslot_managed(true);
+
+        // Deliberately do NOT touch NVIC RADIO — MPSL owns it in timeslot mode.
+        // TIMER interrupt is also left alone; PRX has no ACK-timeout in either
+        // mode, and the timer token is only consumed to prevent aliasing.
+        Ok(Self {
+            sm: UnsafeCell::new(sm),
+            pool,
+            timer_flag: AtomicBool::new(false),
+            suspend_requested: AtomicBool::new(false),
+            suspend_signal: AtomicWaker::new(),
+            max_payload_len: config.payload_length as usize,
+        })
+    }
+
     /// Called from the RADIO interrupt handler.
     ///
     /// SAFETY: Must be called from RADIO ISR only. No concurrent ISR execution.
@@ -705,6 +745,126 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
         self.suspend_requested.store(false, Ordering::Release);
         unpend_radio_irq();
         enable_radio_irq();
+    }
+
+    // ---- Timeslot entrypoints (S3) ----
+    //
+    // Thin public wrappers over `PrxStateMachine`'s `ts_*` methods. Called by
+    // the MPSL timeslot callback via the `TimeslotPrxDriver` trait object. Each
+    // method takes the RADIO-TIMER IRQ mask guard pattern as read by the caller
+    // (MPSL callback runs with TIMER0 already owned, and the RADIO NVIC line is
+    // *not* used in timeslot mode — MPSL delivers events via SIGNAL_RADIO).
+
+    /// Record addresses + enabled pipes so each slot can re-init RADIO.
+    pub fn ts_configure(&self, addresses: &EsbAddresses, enabled_pipes: u8) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.set_addresses(addresses);
+        sm.set_enabled_pipes(enabled_pipes);
+    }
+
+    /// Slot start — power-cycle + re-init RADIO, restore dup-detection, arm RX.
+    pub fn ts_start_rx(
+        &self,
+        saved_pid: [u8; 8],
+        saved_crc: [u16; 8],
+        saved_valid: [bool; 8],
+    ) -> Result<(), crate::error::Error> {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.ts_start_rx(self.pool, saved_pid, saved_crc, saved_valid)
+    }
+
+    /// SIGNAL_RADIO — drive one PrxStateMachine event.
+    pub fn ts_on_radio(&self) -> (crate::state_machine::PrxEvent, Option<usize>) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.ts_on_radio(self.pool)
+    }
+
+    /// Slot end — stop radio, release buffers, clear timeslot_managed.
+    pub fn ts_force_stop(&self) {
+        let sm = unsafe { &mut *self.sm.get() };
+        sm.ts_force_stop(self.pool);
+    }
+
+    /// Snapshot the current duplicate-detection state (for cross-slot
+    /// preservation at slot boundaries).
+    pub fn ts_snapshot_dup_state(&self) -> ([u8; 8], [u16; 8], [bool; 8]) {
+        let sm = unsafe { &*self.sm.get() };
+        (sm.saved_pid(), sm.saved_crc(), sm.saved_valid())
+    }
+
+    /// Returns the last pipe processed by the state machine (0xFF if none).
+    /// Diagnostic only — used by the timeslot callback to attribute per-pipe
+    /// counters in converged mode.
+    pub fn ts_last_pipe(&self) -> u8 {
+        let sm = unsafe { &*self.sm.get() };
+        sm.last_pipe()
+    }
+}
+
+// ---- Timeslot driver trait (S3 / D6) ----
+
+/// Object-safe bridge between the generic `EsbPrx<T,N,SIZE>` and the non-generic
+/// MPSL timeslot callback.
+///
+/// The PRX timeslot callback is a single global `extern "C" fn` that must work
+/// for any `T/N/SIZE`. It stores `Option<&'static dyn TimeslotPrxDriver>` and
+/// dispatches SIGNAL_START / SIGNAL_RADIO / slot-end through this trait.
+///
+/// SAFETY contract: all methods are called from the high-priority MPSL signal
+/// context, serialised by the MPSL session (one slot at a time). No locking is
+/// needed inside the methods.
+#[cfg(feature = "mpsl")]
+pub trait TimeslotPrxDriver: Sync {
+    /// Slot start: configure addresses (first slot only) + arm RX. The driver
+    /// internally handles RADIO power-cycle / re-init and dup-state restore.
+    fn ts_start_rx(
+        &self,
+        saved_pid: [u8; 8],
+        saved_crc: [u16; 8],
+        saved_valid: [bool; 8],
+    ) -> Result<(), crate::error::Error>;
+
+    /// SIGNAL_RADIO: drive one PrxStateMachine event. Returns the protocol
+    /// event so the timeslot layer can update diagnostic counters.
+    fn ts_on_radio(&self) -> (crate::state_machine::PrxEvent, Option<usize>);
+
+    /// Slot end / EXTEND_FAILED / OVERSTAYED: stop radio, release buffers,
+    /// clear timeslot_managed. After return, the driver is quiescent.
+    fn ts_force_stop(&self);
+
+    /// Snapshot the current duplicate-detection state (called at slot end to
+    /// carry into the next slot).
+    fn ts_snapshot_dup_state(&self) -> ([u8; 8], [u16; 8], [bool; 8]);
+
+    /// Last pipe processed (0xFF if none). Diagnostic only.
+    fn ts_last_pipe(&self) -> u8;
+}
+
+#[cfg(feature = "mpsl")]
+impl<T: TimerInstance, const N: usize, const SIZE: usize> TimeslotPrxDriver for EsbPrx<T, N, SIZE> {
+    fn ts_start_rx(
+        &self,
+        saved_pid: [u8; 8],
+        saved_crc: [u16; 8],
+        saved_valid: [bool; 8],
+    ) -> Result<(), crate::error::Error> {
+        EsbPrx::ts_start_rx(self, saved_pid, saved_crc, saved_valid)
+    }
+
+    fn ts_on_radio(&self) -> (crate::state_machine::PrxEvent, Option<usize>) {
+        EsbPrx::ts_on_radio(self)
+    }
+
+    fn ts_force_stop(&self) {
+        EsbPrx::ts_force_stop(self)
+    }
+
+    fn ts_snapshot_dup_state(&self) -> ([u8; 8], [u16; 8], [bool; 8]) {
+        EsbPrx::ts_snapshot_dup_state(self)
+    }
+
+    fn ts_last_pipe(&self) -> u8 {
+        EsbPrx::ts_last_pipe(self)
     }
 }
 

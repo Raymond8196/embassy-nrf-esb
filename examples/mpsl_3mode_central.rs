@@ -25,9 +25,9 @@
 
 use core::fmt::Write as FmtWrite;
 
+use bt_hci::cmd::SyncCmd;
 use bt_hci::cmd::controller_baseband::SetEventMask;
 use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::cmd::SyncCmd;
 use bt_hci::param::{
     AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
 };
@@ -48,9 +48,11 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
+use embassy_nrf_esb::isr::{EsbPrx, TimeslotPrxDriver};
 use embassy_nrf_esb::mpsl_timeslot::{
-    CoexistenceProfile, PrxSlotConfig, PrxSlotResult, open_prx_session,
+    CoexistenceProfile, PrxSlotConfig, PrxSlotResult, open_prx_session, set_prx_driver,
 };
+use embassy_nrf_esb::payload::PacketPool;
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
@@ -214,7 +216,10 @@ async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16
         let mut buf = [0u8; LOG_BUF_SIZE];
         let len = {
             let mut w = WriteBuf::new(&mut buf);
-            let _ = write!(w, "[BLE] L2CAP conn param update: int=100ms lat=4 to=6000ms\r\n");
+            let _ = write!(
+                w,
+                "[BLE] L2CAP conn param update: int=100ms lat=4 to=6000ms\r\n"
+            );
             w.pos
         };
         log(&buf[..len]);
@@ -225,11 +230,18 @@ async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16
     let latency: u16 = 4;
     let timeout: u16 = 600;
     let payload: [u8; 12] = [
-        0x12, 0x01, 0x08, 0x00,
-        (interval_min & 0xff) as u8, (interval_min >> 8) as u8,
-        (interval_max & 0xff) as u8, (interval_max >> 8) as u8,
-        (latency & 0xff) as u8, (latency >> 8) as u8,
-        (timeout & 0xff) as u8, (timeout >> 8) as u8,
+        0x12,
+        0x01,
+        0x08,
+        0x00,
+        (interval_min & 0xff) as u8,
+        (interval_min >> 8) as u8,
+        (interval_max & 0xff) as u8,
+        (interval_max >> 8) as u8,
+        (latency & 0xff) as u8,
+        (latency >> 8) as u8,
+        (timeout & 0xff) as u8,
+        (timeout >> 8) as u8,
     ];
     send_l2cap(sdc, handle, 0x0005, &payload);
 }
@@ -559,24 +571,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mpsl_task(mpsl).unwrap());
     spawner.spawn(hfclk_task(mpsl).unwrap());
 
-    // BLE
-    let sdc_p = sdc::Peripherals::new(
-        p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
-        p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
-    );
-
-    static RNG: StaticCell<Rng> = StaticCell::new();
-    let rng = RNG.init(rng::Rng::new_blocking(p.RNG));
-
-    static SDC_MEM: StaticCell<sdc::Mem<8192>> = StaticCell::new();
-    static SDC: StaticCell<SoftdeviceController> = StaticCell::new();
-    let sdc = SDC.init(build_sdc(sdc_p, rng, mpsl, SDC_MEM.init(sdc::Mem::new())).unwrap());
-
-    start_advertising(sdc).await;
-    spawner.spawn(sdc_task(sdc).unwrap());
-    defmt::info!("BLE advertising as 'ESB 3MODE'");
-
-    // USB CDC (fire-and-forget via channel, does not block ESB)
+    // USB CDC setup FIRST so we get logs even if BLE init panics later.
     static VBUS: StaticCell<SoftwareVbusDetect> = StaticCell::new();
     let vbus: &'static SoftwareVbusDetect = VBUS.init(SoftwareVbusDetect::new(true, true));
     let driver = UsbDriver::new(p.USBD, Irqs, vbus);
@@ -606,6 +601,24 @@ async fn main(spawner: Spawner) {
     let usb_dev = builder.build();
     spawner.spawn(usb_task(usb_dev).unwrap());
     spawner.spawn(cdc_logger_task(cdc_class).unwrap());
+    log(b"[BOOT] USB CDC up, starting BLE...\r\n");
+
+    // BLE
+    let sdc_p = sdc::Peripherals::new(
+        p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
+        p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
+    );
+
+    static RNG: StaticCell<Rng> = StaticCell::new();
+    let rng = RNG.init(rng::Rng::new_blocking(p.RNG));
+
+    static SDC_MEM: StaticCell<sdc::Mem<8192>> = StaticCell::new();
+    static SDC: StaticCell<SoftdeviceController> = StaticCell::new();
+    let sdc = SDC.init(build_sdc(sdc_p, rng, mpsl, SDC_MEM.init(sdc::Mem::new())).unwrap());
+
+    start_advertising(sdc).await;
+    spawner.spawn(sdc_task(sdc).unwrap());
+    defmt::info!("BLE advertising as 'ESB 3MODE'");
 
     // ESB starts immediately — no waiting for USB CDC
     let esb_cfg = EsbConfig::default();
@@ -660,6 +673,24 @@ async fn main(spawner: Spawner) {
             core::future::pending().await
         }
     };
+
+    // ---- Converged-engine wiring (S3/S4-b) ----
+    // Create the shared PRX state machine and register it as the timeslot
+    // driver. From here on, SIGNAL_START / SIGNAL_RADIO drive the same
+    // PrxStateMachine as the exclusive path.
+    static ESB_POOL: StaticCell<PacketPool<4, 256>> = StaticCell::new();
+    let pool = ESB_POOL.init(PacketPool::new());
+
+    static ESB_PRX: StaticCell<EsbPrx<peripherals::TIMER1>> = StaticCell::new();
+    let prx =
+        ESB_PRX.init(EsbPrx::new_timeslot(p.TIMER1, p.RADIO, pool, &esb_cfg, &esb_addr).unwrap());
+    set_prx_driver(
+        prx as &dyn TimeslotPrxDriver,
+        &esb_addr,
+        esb_addr.enabled_mask(),
+    );
+    defmt::info!("PRX converged driver registered (timeslot_managed)");
+    log(b"[3MODE] PRX converged engine active\r\n");
 
     loop {
         batch += 1;

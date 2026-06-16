@@ -1512,7 +1512,20 @@ struct PrxInnerState {
     target_count: u32,
     config: Option<EsbConfig>,
     addresses: Option<EsbAddresses>,
+    /// Converged-engine driver (S3/D6). When set, the PRX callback drives the
+    /// shared `EsbPrx` state machine through `TimeslotPrxDriver`; when `None`,
+    /// the legacy inline-engine path runs.
+    driver: Option<&'static dyn crate::isr::TimeslotPrxDriver>,
+    /// Duplicate-detection state preserved across slots. In converged mode the
+    /// SM owns dup detection during a slot; we snapshot at slot end and restore
+    /// at the next slot start.
+    saved_pid: [u8; NUM_PIPES],
+    saved_crc: [u16; NUM_PIPES],
+    saved_valid: [bool; NUM_PIPES],
+    /// Legacy inline-engine phase. Only used when `driver` is `None`.
     phase: PrxPhase,
+    /// Legacy inline-engine counters / dup-detection. Removed in S9 once the
+    /// converged path is the only one.
     rx_count: u32,
     dup_count: u32,
     bad_crc_count: u32,
@@ -1560,6 +1573,9 @@ impl PrxInnerState {
         self.counters = SignalCounters::ZERO;
         self.done = false;
         self.target_count = 0;
+        self.saved_pid = [0; NUM_PIPES];
+        self.saved_crc = [0; NUM_PIPES];
+        self.saved_valid = [false; NUM_PIPES];
         self.phase = PrxPhase::Idle;
         self.rx_count = 0;
         self.dup_count = 0;
@@ -1736,6 +1752,10 @@ impl PrxState {
                 target_count: 0,
                 config: None,
                 addresses: None,
+                driver: None,
+                saved_pid: [0; NUM_PIPES],
+                saved_crc: [0; NUM_PIPES],
+                saved_valid: [false; NUM_PIPES],
                 phase: PrxPhase::Idle,
                 rx_count: 0,
                 dup_count: 0,
@@ -1807,27 +1827,36 @@ unsafe extern "C" fn prx_timeslot_callback(
                 return &mut state.return_param as *mut _;
             };
 
-            let r = pac::RADIO;
-            r.power().write(|w| w.set_power(false));
-            r.power().write(|w| w.set_power(true));
+            if let Some(driver) = state.driver {
+                // ---- Converged path: drive the shared state machine ----
+                if let Err(_e) =
+                    driver.ts_start_rx(state.saved_pid, state.saved_crc, state.saved_valid)
+                {
+                    state.counters.invalid_return += 1;
+                }
+            } else {
+                // ---- Legacy inline-engine path ----
+                let r = pac::RADIO;
+                r.power().write(|w| w.set_power(false));
+                r.power().write(|w| w.set_power(true));
 
-            let mut radio = EsbRadio::new(pac::RADIO);
-            radio.init(config, addresses);
-            radio.restore_pid_state(state.last_pid);
-            radio.restore_crc_state(state.last_crc);
-            radio.restore_detection_valid_state(state.last_valid);
+                let mut radio = EsbRadio::new(pac::RADIO);
+                radio.init(config, addresses);
+                radio.restore_pid_state(state.last_pid);
+                radio.restore_crc_state(state.last_crc);
+                radio.restore_detection_valid_state(state.last_valid);
 
-            // MPSL hands the app the RADIO during a timeslot but leaves the
-            // NVIC line masked; the app must unmask it so RADIO events are
-            // delivered back as SIGNAL_RADIO. Without this, rd stays 0 and no
-            // RX/ACK is ever processed.
+                let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
+                let dma_ptr = unsafe { rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
+                radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
+                state.phase = PrxPhase::Receiving;
+            }
+
+            // Common: unmask NVIC RADIO so events reach SIGNAL_RADIO, and arm
+            // the in-slot TIMER0 CC0 for slot end / extend gating.
             unsafe {
                 cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
             }
-
-            let rx_buf = unsafe { &mut *PRX_BUFS.rx.get() };
-            let dma_ptr = unsafe { rx_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
-            radio.start_receiving_manual_ack(state.enabled_pipes, dma_ptr);
 
             let t = pac::TIMER0;
             t.events_compare(0).write_value(0);
@@ -1837,8 +1866,6 @@ unsafe extern "C" fn prx_timeslot_callback(
                 t.shorts().write(|w| w.set_compare_clear(0, true));
             }
 
-            state.phase = PrxPhase::Receiving;
-
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
             &mut state.return_param as *mut _
         }),
@@ -1846,6 +1873,45 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_RADIO => PRX_STATE.with_inner(|state| {
             state.counters.radio += 1;
 
+            // ---- Converged path: drive the shared state machine ----
+            if let Some(driver) = state.driver {
+                let (event, _rx_idx) = driver.ts_on_radio();
+                let pipe = driver.ts_last_pipe() as usize;
+                use crate::state_machine::PrxEvent;
+                match event {
+                    PrxEvent::Received => {
+                        state.rx_count += 1;
+                        if pipe < NUM_PIPES {
+                            state.rx_per_pipe[pipe] += 1;
+                            state.ack_tx_per_pipe[pipe] += 1;
+                        }
+                    }
+                    PrxEvent::Duplicate => {
+                        state.dup_count += 1;
+                        if pipe < NUM_PIPES {
+                            state.dup_per_pipe[pipe] += 1;
+                            state.ack_tx_per_pipe[pipe] += 1;
+                        }
+                    }
+                    PrxEvent::BadCrc => {
+                        state.bad_crc_count += 1;
+                        if pipe < NUM_PIPES {
+                            state.bad_crc_per_pipe[pipe] += 1;
+                        }
+                    }
+                    PrxEvent::ReceivedNoAck => {
+                        state.rx_count += 1;
+                        if pipe < NUM_PIPES {
+                            state.rx_per_pipe[pipe] += 1;
+                        }
+                    }
+                    PrxEvent::None => {}
+                }
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                return &mut state.return_param as *mut _;
+            }
+
+            // ---- Legacy inline-engine path below ----
             let r = pac::RADIO;
             let disabled = r.events_disabled().read() == 1;
 
@@ -2031,10 +2097,20 @@ unsafe extern "C" fn prx_timeslot_callback(
                 }
             }
 
+            // Converged path: stop driver + snapshot dup state for next slot.
+            if let Some(driver) = state.driver {
+                driver.ts_force_stop();
+                let (p, c, v) = driver.ts_snapshot_dup_state();
+                state.saved_pid = p;
+                state.saved_crc = c;
+                state.saved_valid = v;
+            } else {
+                state.phase = PrxPhase::Idle;
+            }
+
             if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
                 state.counters.radio_disable_timeout += 1;
             }
-            state.phase = PrxPhase::Idle;
 
             prx_finalize_and_reschedule(state);
             &mut state.return_param as *mut _
@@ -2050,10 +2126,19 @@ unsafe extern "C" fn prx_timeslot_callback(
                 t.intenclr().write(|w| w.set_compare(0, true));
                 t.shorts().write(|w| w.set_compare_clear(0, false));
 
+                if let Some(driver) = state.driver {
+                    driver.ts_force_stop();
+                    let (p, c, v) = driver.ts_snapshot_dup_state();
+                    state.saved_pid = p;
+                    state.saved_crc = c;
+                    state.saved_valid = v;
+                } else {
+                    state.phase = PrxPhase::Idle;
+                }
+
                 if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
                     state.counters.radio_disable_timeout += 1;
                 }
-                state.phase = PrxPhase::Idle;
 
                 prx_finalize_and_reschedule(state);
             } else {
@@ -2070,10 +2155,19 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.intenclr().write(|w| w.set_compare(0, true));
             t.shorts().write(|w| w.set_compare_clear(0, false));
 
+            if let Some(driver) = state.driver {
+                driver.ts_force_stop();
+                let (p, c, v) = driver.ts_snapshot_dup_state();
+                state.saved_pid = p;
+                state.saved_crc = c;
+                state.saved_valid = v;
+            } else {
+                state.phase = PrxPhase::Idle;
+            }
+
             if quiesce_radio_before_timeslot_end(state.recovery_policy).timed_out() {
                 state.counters.radio_disable_timeout += 1;
             }
-            state.phase = PrxPhase::Idle;
 
             prx_finalize_and_reschedule(state);
             &mut state.return_param as *mut _
@@ -2135,7 +2229,11 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PRX_STATE.with_inner(|state| {
             state.counters.overstayed += 1;
             state.slot_active = false;
-            state.phase = PrxPhase::Idle;
+            if let Some(driver) = state.driver {
+                driver.ts_force_stop();
+            } else {
+                state.phase = PrxPhase::Idle;
+            }
             state.done = true;
             state.waker.wake();
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
@@ -2418,6 +2516,54 @@ pub fn open_prx_session(
         last_normal_cancelled: 0,
         last_earliest_cancelled: 0,
     })
+}
+
+/// Register the converged-engine driver on the current PRX session (S3/D6).
+///
+/// After this call, the PRX timeslot callback drives the shared
+/// `EsbPrx`/`PrxStateMachine` through `TimeslotPrxDriver` instead of the legacy
+/// inline engine. Must be called between `open_prx_session` and the first
+/// `next_report`. The driver must live in a `&'static` (StaticCell) and already
+/// be configured with the same `config`/`addresses`/`enabled_pipes` as the
+/// session. Pass `addresses` and `enabled_pipes` so the driver can re-init
+/// RADIO each slot.
+///
+/// To revert to the inline engine (e.g. for A/B regression), call
+/// [`clear_prx_driver`] before the next slot starts.
+pub fn set_prx_driver(
+    driver: &'static dyn crate::isr::TimeslotPrxDriver,
+    addresses: &EsbAddresses,
+    enabled_pipes: u8,
+) {
+    // Configure the driver with addresses + enabled_pipes. `ts_configure` is a
+    // method on `EsbPrx`; trait doesn't expose it, but the concrete type's
+    // constructor already programs these in. To keep the trait minimal, we
+    // pass these in so the session stores them for the SIGNAL_START path;
+    // the driver's own `ts_start_rx` does the radio re-init using the SM's
+    // stored config/addresses.
+    PRX_STATE.with_inner(|state| {
+        state.driver = Some(driver);
+        // Ensure the legacy dup-detection fields are seeded from the driver's
+        // initial snapshot so the first slot doesn't falsely mark the first
+        // packet as a dup of stale state.
+        let (p, c, v) = driver.ts_snapshot_dup_state();
+        state.saved_pid = p;
+        state.saved_crc = c;
+        state.saved_valid = v;
+        // Mirror into legacy fields in case fallback is used later.
+        state.last_pid = p;
+        state.last_crc = c;
+        state.last_valid = v;
+        state.addresses = Some(addresses.clone());
+        state.enabled_pipes = enabled_pipes;
+    });
+}
+
+/// Unregister the converged-engine driver, reverting to the legacy inline path.
+pub fn clear_prx_driver() {
+    PRX_STATE.with_inner(|state| {
+        state.driver = None;
+    });
 }
 
 /// Per-round result for the PTX poll session.

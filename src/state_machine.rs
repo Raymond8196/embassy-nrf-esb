@@ -513,6 +513,10 @@ pub struct PrxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
     config: EsbConfig,
+    /// ESB addresses. Kept in the SM so the timeslot entrypoints can re-init
+    /// the RADIO at the start of every slot (the MPSL path power-cycles RADIO
+    /// between slots). Filled in by `set_addresses` at wrap time.
+    addresses: Option<EsbAddresses>,
     state: StatePrx,
     /// Enabled pipe bitmask.
     enabled_pipes: u8,
@@ -522,6 +526,9 @@ pub struct PrxStateMachine<T: TimerInstance> {
     pending_rx_idx: usize,
     /// Current ACK TX buffer pool index (IN_DMA while sending ACK payload).
     ack_tx_idx: usize,
+    /// Last pipe processed in `handle_radio_event` (0xFF = none yet). Exposed
+    /// for timeslot-mode diagnostic counters.
+    last_pipe: u8,
     /// MPSL timeslot-managed mode. When `true`, this state machine is driven
     /// from the MPSL timeslot callback (`SIGNAL_RADIO`) and uses manual ACK
     /// turnaround (`start_receiving_manual_ack` / `transmit_ack_manual`) instead
@@ -543,11 +550,13 @@ impl<T: TimerInstance> PrxStateMachine<T> {
             radio,
             timer,
             config: config.clone(),
+            addresses: None,
             state: StatePrx::Idle,
             enabled_pipes,
             rx_idx: NO_IDX,
             pending_rx_idx: NO_IDX,
             ack_tx_idx: NO_IDX,
+            last_pipe: 0xFF,
             timeslot_managed: false,
         }
     }
@@ -602,6 +611,102 @@ impl<T: TimerInstance> PrxStateMachine<T> {
         Ok(())
     }
 
+    /// Store ESB addresses for timeslot-mode RADIO re-init.
+    ///
+    /// In exclusive mode the RADIO is initialized once at construction; in
+    /// timeslot mode each slot power-cycles RADIO, so the entrypoints need the
+    /// addresses to re-run `init`. Set once at wrap time.
+    pub(crate) fn set_addresses(&mut self, addresses: &EsbAddresses) {
+        self.addresses = Some(addresses.clone());
+    }
+
+    /// Update the enabled-pipe mask (used by the timeslot wrapper when opening
+    /// a session; exclusive mode sets this once at construction).
+    pub(crate) fn set_enabled_pipes(&mut self, mask: u8) {
+        self.enabled_pipes = mask;
+    }
+
+    /// Returns the saved duplicate-detection PID array (for cross-slot
+    /// preservation by the timeslot wrapper).
+    pub(crate) fn saved_pid(&self) -> [u8; 8] {
+        self.radio.save_pid_state()
+    }
+
+    /// Returns the saved duplicate-detection CRC array.
+    pub(crate) fn saved_crc(&self) -> [u16; 8] {
+        self.radio.save_crc_state()
+    }
+
+    /// Returns the saved duplicate-detection valid-flags array.
+    pub(crate) fn saved_valid(&self) -> [bool; 8] {
+        self.radio.save_detection_valid_state()
+    }
+
+    /// Returns the last pipe processed (0xFF if none yet). Diagnostic only.
+    pub(crate) fn last_pipe(&self) -> u8 {
+        self.last_pipe
+    }
+
+    /// Timeslot entrypoint: slot start.
+    ///
+    /// Power-cycles RADIO, re-inits ESB registers, restores duplicate-detection
+    /// state, sets `timeslot_managed = true`, and arms the first RX buffer.
+    /// Must be called from the MPSL signal context (not the RADIO ISR). The
+    /// caller passes the saved PID/CRC/valid arrays (last slot's final state).
+    pub(crate) fn ts_start_rx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+        saved_pid: [u8; 8],
+        saved_crc: [u16; 8],
+        saved_valid: [bool; 8],
+    ) -> Result<(), Error> {
+        let addresses = self
+            .addresses
+            .clone()
+            .expect("ts_start_rx: addresses must be set via set_addresses first");
+
+        self.radio.power_cycle();
+        self.radio.init(&self.config, &addresses);
+        self.radio.restore_pid_state(saved_pid);
+        self.radio.restore_crc_state(saved_crc);
+        self.radio.restore_detection_valid_state(saved_valid);
+
+        self.timeslot_managed = true;
+        self.state = StatePrx::Idle;
+
+        // Arm first RX. If buffer alloc fails the slot is wasted but not fatal.
+        self.start_receiving(pool)
+    }
+
+    /// Timeslot entrypoint: SIGNAL_RADIO.
+    ///
+    /// Drives one state-machine event. Must be called from the MPSL signal
+    /// context (which has taken the RADIO interrupt). Returns the PRX event
+    /// for diagnostic counter updates in the timeslot layer.
+    pub(crate) fn ts_on_radio<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) -> (PrxEvent, Option<usize>) {
+        if self.state == StatePrx::Idle {
+            return (PrxEvent::None, None);
+        }
+        // timer_flag is irrelevant for PRX (PRX has no ACK-timeout timer).
+        self.handle_radio_event(pool, false)
+    }
+
+    /// Timeslot entrypoint: slot end / EXTEND_FAILED / OVERSTAYED / handoff.
+    ///
+    /// Stops the radio, releases any in-flight DMA buffer, and saves
+    /// duplicate-detection state into the arrays returned by the caller.
+    /// After this, the SM is in `Idle` and ready for the next slot.
+    pub(crate) fn ts_force_stop<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        self.stop_receiving(pool);
+        self.timeslot_managed = false;
+    }
+
     /// Handle a RADIO ISR event.
     /// Ref: esb-ng `src/irq.rs` lines 316–383.
     pub fn handle_radio_event<const N: usize, const SIZE: usize>(
@@ -622,13 +727,16 @@ impl<T: TimerInstance> PrxStateMachine<T> {
                 match self.radio.check_packet() {
                     RxResult::BadCrc => {
                         // Bad CRC — radio already restarted with same PACKETPTR.
-                        // Keep using the same DMA buffer.
+                        // Keep using the same DMA buffer. Record pipe for
+                        // timeslot-mode per-pipe diagnostics.
+                        self.last_pipe = self.radio.rx_match();
                         (PrxEvent::BadCrc, None)
                     }
                     RxResult::NewPacket => {
                         let pipe = self.radio.rx_match() as usize;
                         let crc = self.radio.rx_crc();
                         let rssi = self.radio.rssi_sample();
+                        self.last_pipe = pipe as u8;
 
                         let rx_idx = self.rx_idx;
                         let header = unsafe { pool.header_mut(rx_idx) };
