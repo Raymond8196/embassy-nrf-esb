@@ -7,3 +7,4 @@ opencode.json
 /.agents/
 session-*.md
 plans/
+__pycache__/

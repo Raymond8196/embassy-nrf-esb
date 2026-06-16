@@ -335,3 +335,70 @@ tag before PTX (S6) starts.
     dongle recovery (DC08665938A2 stuck after repeated BLE-init flashes).
     `rd=0` in solo-run is expected (no PTX transmitting → no RADIO events
     within slot; slot-end stop doesn't generate SIGNAL_RADIO).
+
+- **2026-06-16 follow-up** — review fixes + single-dongle smoke landed:
+  - **Headless diagnostic RX drain:** converged timeslot PRX now discards packets
+    queued by `PrxStateMachine` after the callback has updated diagnostic counters.
+    This prevents `PacketPool<4, 256>` exhaustion in examples that do not have an
+    app task draining `prx.receive()`.
+  - **Diagnostic ACK fallback parity:** when no app ACK payload is queued, the
+    converged manual-ACK path now emits the same counter + schedule-hint ACK payload
+    that the legacy inline PRX engine generated. This preserves S5 PTX-side
+    observability (`ack_payload_count`, `last_ack_counter`, schedule hints) while
+    still letting real app ACK payloads come from `PacketPool`.
+  - **Driver lifecycle cleanup:** `PrxInnerState::reset_runtime()` and
+    `PrxSlotSession::drop()` clear `state.driver`, so a registered
+    `TimeslotPrxDriver` cannot leak across PRX sessions.
+  - **Verified:** `make check-no-hw` green (host 52/0, exclusive, MPSL, fmt,
+    feature-conflict). Rebuilt `mpsl_3mode_central` release firmware, generated a
+    fresh DFU package in `/tmp/mpsl_3mode_central_codex.zip`, and flashed one
+    nRF52840 dongle via `nrfutil dfu usb-serial`.
+  - **Single-dongle smoke result:** device re-enumerated as USB CDC `Central`;
+    logs showed `[3MODE] PRX converged engine active`; `s`/`t0` continued to
+    advance; solo run had expected `rx=0 rd=0`; error counters stayed quiet
+    (`iv=0`, `ov=0`, `dt=0`, `sc=0` in sampled reports).
+  - **Still blocked on 2× dongles:** full S5 replay still needs an active PTX peer
+    to prove RX throughput, duplicate detection under retransmit, ACK payload
+    counters, and schedule-hint behavior against the baseline.
+
+### Single-dongle work still available before S5
+
+- Add host-side/unit coverage for the new diagnostic ACK fallback and RX-drain
+  behavior by factoring the pure payload/counter pieces into testable helpers.
+- Tighten `TimeslotPrxDriver` API shape before it becomes public surface: decide
+  whether diagnostic-only methods should remain in the trait or move behind a
+  session wrapper/internal adapter.
+- Implement the S4-d `EsbTimeslotPrx` wrapper skeleton around
+  `open_prx_session`/`set_prx_driver`/`clear_prx_driver`, with compile-only tests
+  and docs. Single-dongle smoke can verify open/start/drop lifecycle and driver
+  cleanup, but not RX/ACK correctness.
+- Add a single-dongle regression example or script that flashes
+  `mpsl_3mode_central`, captures CDC logs for a fixed window, and asserts the
+  smoke invariants: CDC up, converged active, `s/t0 > 0`, `iv/ov/dt/sc == 0`,
+  and `rx=rd=0` accepted in no-peer mode.
+- Do PTX S6 design-only preparation: factor the reusable timer-mode interface and
+  keep it compile-checked. Hardware acceptance for PTX still waits for S7 with a
+  peer dongle.
+
+- **2026-06-16 single-dongle prep follow-up:**
+  - Added host tests for the review-fix invariants: `PacketPool::discard_received`
+    drains queued RX buffers back to free, and `write_timeslot_diag_ack` preserves
+    the legacy counter + schedule-hint ACK payload layout.
+  - Tightened driver/session configuration: `TimeslotPrxDriver::ts_configure`
+    is now part of the trait, `set_prx_driver()` calls it, and
+    `mpsl_3mode_central` passes `prx_cfg.enabled_pipes` so the shared state
+    machine listens on the same pipe mask as the PRX session.
+  - Added the S4-d lifecycle skeleton `EsbTimeslotPrx<T,N,SIZE>` around
+    `open_prx_session` + `set_prx_driver`, with `receive`, `send_ack_payload`,
+    `next_report`, and `stop` forwarding methods. This is compile-checked only
+    for now; examples still use the explicit diagnostic calls.
+  - Added `scripts/smoke_single_dongle_3mode.py` as the first automation pass for
+    build/package/DFU/log assertion. The script can build/package and contains
+    the log invariant checks, but the local dongle's USB CDC/DFU node currently
+    disappears during scripted open/capture; manual `nrfutil dfu usb-serial -snr`
+    plus `timeout cat /dev/ttyACM0` remains the reliable verification path.
+  - **Verified:** `make check-no-hw` green with host tests now 54/0. Manually
+    flashed the latest build by serial number (`C2A1EFA145C4`), device
+    re-enumerated as `Central`, and sampled reports again showed converged PRX
+    active with `s/t0 > 0`, expected no-peer `rx=0 rd=0`, and quiet error
+    counters (`iv=0`, `ov=0`, `dt=0`, `sc=0`).
