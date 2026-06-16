@@ -2455,6 +2455,60 @@ impl Drop for PrxSlotSession {
     }
 }
 
+/// Convenience wrapper for driving an [`EsbPrx`](crate::isr::EsbPrx) from MPSL
+/// timeslots.
+///
+/// This is the S4-d lifecycle surface: it opens a PRX timeslot session,
+/// registers the shared PRX state machine as the callback driver, and clears the
+/// registration when dropped. The wrapper is intentionally thin while the
+/// diagnostic `PrxSlotSession` API remains available for bring-up.
+pub struct EsbTimeslotPrx<T, const N: usize, const SIZE: usize>
+where
+    T: crate::timer::TimerInstance,
+{
+    prx: &'static crate::isr::EsbPrx<T, N, SIZE>,
+    session: PrxSlotSession,
+}
+
+impl<T, const N: usize, const SIZE: usize> EsbTimeslotPrx<T, N, SIZE>
+where
+    T: crate::timer::TimerInstance,
+{
+    pub fn start(
+        mpsl: &MultiprotocolServiceLayer<'_>,
+        prx: &'static crate::isr::EsbPrx<T, N, SIZE>,
+        config: &EsbConfig,
+        addresses: &EsbAddresses,
+        slot_config: PrxSlotConfig,
+    ) -> Result<Self, Error> {
+        let session = open_prx_session(mpsl, config, addresses, slot_config)?;
+        set_prx_driver(prx, addresses, slot_config.enabled_pipes);
+        Ok(Self { prx, session })
+    }
+
+    pub async fn receive(&self) -> crate::isr::ReceivedPacket<'_, N, SIZE> {
+        self.prx.receive().await
+    }
+
+    pub async fn send_ack_payload(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
+        self.prx.send_ack_payload(pipe, payload).await
+    }
+
+    pub async fn next_report(&mut self) -> Result<PrxSlotResult, Error> {
+        self.session.next_report().await
+    }
+
+    pub fn prx(&self) -> &'static crate::isr::EsbPrx<T, N, SIZE> {
+        self.prx
+    }
+
+    pub fn stop(self) -> &'static crate::isr::EsbPrx<T, N, SIZE> {
+        let prx = self.prx;
+        drop(self);
+        prx
+    }
+}
+
 pub fn open_prx_session(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &EsbConfig,
@@ -2546,12 +2600,7 @@ pub fn set_prx_driver(
     addresses: &EsbAddresses,
     enabled_pipes: u8,
 ) {
-    // Configure the driver with addresses + enabled_pipes. `ts_configure` is a
-    // method on `EsbPrx`; trait doesn't expose it, but the concrete type's
-    // constructor already programs these in. To keep the trait minimal, we
-    // pass these in so the session stores them for the SIGNAL_START path;
-    // the driver's own `ts_start_rx` does the radio re-init using the SM's
-    // stored config/addresses.
+    driver.ts_configure(addresses, enabled_pipes);
     PRX_STATE.with_inner(|state| {
         state.driver = Some(driver);
         // Ensure the legacy dup-detection fields are seeded from the driver's

@@ -828,6 +828,10 @@ impl<T: TimerInstance, const N: usize, const SIZE: usize> EsbPrx<T, N, SIZE> {
 /// needed inside the methods.
 #[cfg(feature = "mpsl")]
 pub trait TimeslotPrxDriver: Sync {
+    /// Record addresses + enabled pipes before a timeslot session drives this
+    /// PRX. This keeps the shared state machine aligned with the session config.
+    fn ts_configure(&self, addresses: &crate::addresses::EsbAddresses, enabled_pipes: u8);
+
     /// Slot start: configure addresses (first slot only) + arm RX. The driver
     /// internally handles RADIO power-cycle / re-init and dup-state restore.
     fn ts_start_rx(
@@ -861,6 +865,10 @@ pub trait TimeslotPrxDriver: Sync {
 
 #[cfg(feature = "mpsl")]
 impl<T: TimerInstance, const N: usize, const SIZE: usize> TimeslotPrxDriver for EsbPrx<T, N, SIZE> {
+    fn ts_configure(&self, addresses: &crate::addresses::EsbAddresses, enabled_pipes: u8) {
+        EsbPrx::ts_configure(self, addresses, enabled_pipes)
+    }
+
     fn ts_start_rx(
         &self,
         saved_pid: [u8; 8],

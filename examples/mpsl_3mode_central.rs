@@ -28,9 +28,7 @@ use core::fmt::Write as FmtWrite;
 use bt_hci::cmd::SyncCmd;
 use bt_hci::cmd::controller_baseband::SetEventMask;
 use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::param::{
-    AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
-};
+use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, EventMask, LeEventMask};
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::usb::Driver as UsbDriver;
@@ -687,7 +685,7 @@ async fn main(spawner: Spawner) {
     set_prx_driver(
         prx as &dyn TimeslotPrxDriver,
         &esb_addr,
-        esb_addr.enabled_mask(),
+        prx_cfg.enabled_pipes,
     );
     defmt::info!("PRX converged driver registered (timeslot_managed)");
     log(b"[3MODE] PRX converged engine active\r\n");
