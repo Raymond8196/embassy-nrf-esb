@@ -39,8 +39,7 @@ mod tests {
 
         // Side effect of construction: RADIO + TIMER1 are fully programmed.
         // Keep the driver alive until all asserts run.
-        let _prx =
-            EsbPrx::<TIMER1>::new(p.TIMER1, p.RADIO, &POOL, &config, &addresses).unwrap();
+        let _prx = EsbPrx::<TIMER1>::new(p.TIMER1, p.RADIO, &POOL, &config, &addresses).unwrap();
 
         let r = pac::RADIO;
 
@@ -77,11 +76,17 @@ mod tests {
         assert_eq!(r.frequency().read().frequency(), 2);
 
         // TX power: default 0 dBm.
-        assert_eq!(r.txpower().read().txpower(), pac::radio::vals::Txpower::_0_DBM);
+        assert_eq!(
+            r.txpower().read().txpower(),
+            pac::radio::vals::Txpower::_0_DBM
+        );
 
         // TIMER1: 32-bit mode, prescaler 4 (1 MHz / 1 µs tick).
         let t = pac::TIMER1;
-        assert_eq!(t.bitmode().read().bitmode(), pac::timer::vals::Bitmode::_32BIT);
+        assert_eq!(
+            t.bitmode().read().bitmode(),
+            pac::timer::vals::Bitmode::_32BIT
+        );
         assert_eq!(t.prescaler().read().prescaler(), 4);
     }
 }

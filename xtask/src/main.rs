@@ -42,7 +42,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn workspace_root() -> PathBuf {
@@ -56,7 +60,14 @@ fn workspace_root() -> PathBuf {
 fn run_test_host(target: &str) -> bool {
     println!("==> host unit tests ({target})");
     cargo(
-        &["test", "--lib", "--target", target, "--features", "nrf52840"],
+        &[
+            "test",
+            "--lib",
+            "--target",
+            target,
+            "--features",
+            "nrf52840",
+        ],
         &[],
     )
 }
