@@ -996,10 +996,10 @@ unsafe extern "C" fn ptx_timeslot_callback(
             };
 
             // In poll mode, advance to next pipe in mask.
-            if state.poll_pipes > 0 {
-                if let Some(next) = next_pipe_in_mask(state.tx_pipe, state.poll_pipe_mask) {
-                    state.tx_pipe = next;
-                }
+            if state.poll_pipes > 0
+                && let Some(next) = next_pipe_in_mask(state.tx_pipe, state.poll_pipe_mask)
+            {
+                state.tx_pipe = next;
             }
 
             if state.schedule_gate.mode == PtxScheduleMode::FixedSkipAfterHint
@@ -1408,8 +1408,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
             core::ptr::null_mut()
         }),
 
-        raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => {
-            let ptr = PTX_STATE.with_inner(|state| {
+        raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PTX_STATE.with_inner(|state| {
                 state.counters.overstayed += 1;
                 state.phase = PtxPhase::Idle;
                 if state.poll_pipes > 0 {
@@ -1442,9 +1441,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     }
                 }
                 &mut state.return_param as *mut _
-            });
-            ptr
-        }
+            }),
 
         _ => PTX_STATE.with_inner(|state| {
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
@@ -1458,6 +1455,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
 /// Each timeslot sends exactly 1 ACK packet with an incrementing payload.
 /// After `count` slots, returns cumulative results including ACK stats.
 /// PID is saved/restored across slot boundaries.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ptx_slots(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &crate::config::EsbConfig,

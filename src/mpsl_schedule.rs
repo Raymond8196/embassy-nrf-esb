@@ -163,6 +163,12 @@ pub struct ScheduleTracker {
     snapshot: ScheduleTrackerSnapshot,
 }
 
+impl Default for ScheduleTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScheduleTracker {
     pub const fn new() -> Self {
         Self {
@@ -284,6 +290,12 @@ pub struct LinkTiming {
     lock_count: u32,
     fallback_count: u32,
     miss_streak: u8,
+}
+
+impl Default for LinkTiming {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LinkTiming {
