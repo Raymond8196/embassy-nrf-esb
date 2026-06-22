@@ -1,8 +1,8 @@
-//! Small transport framing helpers for higher-level split protocols.
+//! Optional framing helpers for higher-level split protocols.
 //!
-//! The ESB core transmits arbitrary payload bytes. RMK integration should keep
-//! carrying RMK's existing serialized `SplitMessage` bytes and add only a thin
-//! transport header for routing and duplicate suppression.
+//! The ESB core transmits arbitrary payload bytes and does not interpret this
+//! format. Applications may use these helpers in a board-level transport
+//! adapter for routing, duplicate suppression, and application acknowledgements.
 
 use crate::error::Error;
 use crate::header::EsbHeader;
@@ -73,7 +73,8 @@ pub const fn validate_payload_length(esb_payload_len: u8, payload_len: usize) ->
 pub struct TransportHeader {
     /// Framing version. Must match [`TRANSPORT_VERSION`].
     pub version: u8,
-    /// Application-level device id. For RMK MVP this maps to the static binding table.
+    /// Application-level device id, which an application may map through a
+    /// static binding table.
     pub device_id: u8,
     /// Application-level sequence number for duplicate suppression.
     pub sequence: u8,
@@ -220,8 +221,7 @@ pub fn decode_transport_ack(buf: &[u8]) -> Result<TransportAck, Error> {
 
 /// Decode and validate a frame received on `pipe`.
 ///
-/// This helper matches the central-side flow needed by split keyboard
-/// transports:
+/// This helper implements a common split-device receive flow:
 ///
 /// 1. Decode the transport header.
 /// 2. Check the static `pipe -> device_id` binding.
@@ -250,8 +250,8 @@ pub fn accept_bound_frame<'a, const PIPES: usize, const DEVICES: usize>(
 
 /// Per-device sequence tracker for duplicate suppression above ESB PID/CRC.
 ///
-/// ESB PID detects radio-level repeats on a pipe. Keyboard firmware still
-/// needs application-level deduplication keyed by `device_id + sequence`.
+/// ESB PID detects radio-level repeats on a pipe. Applications that can retry
+/// above ESB still need deduplication keyed by `device_id + sequence`.
 #[derive(Debug, Clone, Copy)]
 pub struct SequenceTracker<const N: usize> {
     valid: [bool; N],

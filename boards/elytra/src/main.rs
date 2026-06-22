@@ -444,12 +444,14 @@ async fn main(spawner: Spawner) {
                 if let Some(hint) = result.schedule_hint {
                     link_timing.observe_hint(Instant::now().as_micros(), hint);
                 }
-                if let Some(ack) = result.transport_ack {
-                    transport_ack_count = transport_ack_count.saturating_add(1);
-                    last_ack_dev = ack.device_id;
-                    last_ack_seq = ack.sequence;
-                    if ack.matches(RIGHT_DEVICE_ID, snapshot_seq) {
-                        break;
+                if let Some(extension) = result.ack_extension {
+                    if let Ok(ack) = transport::decode_transport_ack(extension.as_slice()) {
+                        transport_ack_count = transport_ack_count.saturating_add(1);
+                        last_ack_dev = ack.device_id;
+                        last_ack_seq = ack.sequence;
+                        if ack.matches(RIGHT_DEVICE_ID, snapshot_seq) {
+                            break;
+                        }
                     }
                 }
             }

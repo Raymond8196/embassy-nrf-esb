@@ -31,8 +31,13 @@ use {defmt_rtt as _, panic_probe as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
-use embassy_nrf_esb::mpsl_timeslot::{CoexistenceProfile, PrxSlotConfig, open_prx_session};
-use embassy_nrf_esb::transport::{SequenceTracker, StaticBindingTable, accept_bound_frame};
+use embassy_nrf_esb::mpsl_timeslot::{
+    CoexistenceProfile, PrxAckExtension, PrxSlotConfig, open_prx_session_with_ack_extension,
+};
+use embassy_nrf_esb::transport::{
+    SequenceTracker, StaticBindingTable, TransportAck, accept_bound_frame, decode_frame,
+    encode_transport_ack, TRANSPORT_ACK_LEN,
+};
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 
@@ -205,6 +210,34 @@ async fn matrix_scan_task(mut cols: [Output<'static>; COLS], rows: [Input<'stati
     }
 }
 
+/// Board-level split transport policy: ACK a validated right-hand frame only
+/// after the generic PRX event queue accepted it. This runs in the MPSL RADIO
+/// callback, so it only performs bounded parsing and fixed-size copies.
+fn right_transport_ack_extension(pipe: u8, payload: &[u8], queued: bool) -> PrxAckExtension {
+    if !queued || pipe != 1 {
+        return PrxAckExtension::EMPTY;
+    }
+
+    let Ok((header, _)) = decode_frame(payload) else {
+        return PrxAckExtension::EMPTY;
+    };
+    if header.device_id != RIGHT_DEVICE_ID {
+        return PrxAckExtension::EMPTY;
+    }
+
+    let mut bytes = [0u8; TRANSPORT_ACK_LEN];
+    if encode_transport_ack(
+        TransportAck::new(header.device_id, header.sequence),
+        &mut bytes,
+    )
+    .is_err()
+    {
+        return PrxAckExtension::EMPTY;
+    }
+
+    PrxAckExtension::from_slice(&bytes).unwrap_or(PrxAckExtension::EMPTY)
+}
+
 #[embassy_executor::task]
 async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     let esb_cfg = EsbConfig::default();
@@ -216,7 +249,14 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     )
     .unwrap();
     let cfg = PrxSlotConfig::for_profile(CoexistenceProfile::NordicExtend);
-    let mut session = open_prx_session(mpsl, &esb_cfg, &esb_addr, cfg).unwrap();
+    let mut session = open_prx_session_with_ack_extension(
+        mpsl,
+        &esb_cfg,
+        &esb_addr,
+        cfg,
+        Some(right_transport_ack_extension),
+    )
+    .unwrap();
     let bindings = StaticBindingTable::<8>::from_pipe_entries([
         None,
         Some(RIGHT_DEVICE_ID),

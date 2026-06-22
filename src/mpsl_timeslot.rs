@@ -7,8 +7,8 @@
 //! # Stability
 //!
 //! This module is experimental and diagnostic. The current public functions are
-//! useful for bring-up and hardware regression runs, but they are not the
-//! stable RMK split-transport API.
+//! useful for bring-up and hardware regression runs, but they are not a
+//! stable application-transport API.
 //!
 //! Current limitations:
 //!
@@ -20,8 +20,8 @@
 //!   retry behavior used by the exclusive ESB core;
 //! - active BLE connection coexistence still needs scheduler tuning.
 //!
-//! Use the exclusive `EsbPtx`/`EsbPrx` path as the stable baseline for the
-//! first RMK dongle prototype.
+//! Use the exclusive `EsbPtx`/`EsbPrx` path as the stable baseline for
+//! production ESB applications.
 
 use core::cell::RefCell;
 use core::future::poll_fn;
@@ -40,8 +40,7 @@ use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 use crate::error::Error;
 use crate::mpsl_common::{
     NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
-    write_counter_packet, write_counter_payload_packet,
-    write_counter_schedule_transport_ack_packet,
+    write_counter_packet, write_counter_payload_packet, write_counter_schedule_extension_packet,
 };
 pub use crate::mpsl_profile::{
     BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxScheduleConfig,
@@ -53,9 +52,62 @@ use crate::mpsl_radio::{disable_radio_bounded, quiesce_radio_before_timeslot_end
 use crate::mpsl_schedule::{
     ScheduleHint, ScheduleTracker, ScheduleTrackerSnapshot, decode_counter_payload_schedule_hint,
 };
-use crate::transport::{TRANSPORT_ACK_LEN, TransportAck, decode_frame, decode_transport_ack};
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
+
+/// Maximum caller-defined ACK extension length after the scheduler's counter
+/// and timing hint.
+pub const PRX_ACK_EXTENSION_MAX_LEN: usize = crate::header::EsbHeader::MAX_PAYLOAD as usize
+    - crate::mpsl_schedule::SCHEDULE_COUNTER_HINT_PAYLOAD_LEN;
+
+/// Opaque caller-defined bytes appended to a PRX ACK payload.
+///
+/// The MPSL adapter neither interprets nor validates these bytes. A higher
+/// transport may use them for an application acknowledgement, while a simple
+/// ESB user can leave them empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PrxAckExtension {
+    len: u8,
+    bytes: [u8; PRX_ACK_EXTENSION_MAX_LEN],
+}
+
+impl PrxAckExtension {
+    pub const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; PRX_ACK_EXTENSION_MAX_LEN],
+    };
+
+    /// Create an extension if `bytes` fits in the available ACK payload space.
+    pub fn from_slice(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > PRX_ACK_EXTENSION_MAX_LEN {
+            return None;
+        }
+
+        let mut extension = Self::EMPTY;
+        extension.bytes[..bytes.len()].copy_from_slice(bytes);
+        extension.len = bytes.len() as u8;
+        Some(extension)
+    }
+
+    /// Return the caller-defined bytes carried after the scheduler hint.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
+impl Default for PrxAckExtension {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Called from the PRX timeslot callback for a newly received application
+/// payload. The callback must be bounded and non-blocking.
+///
+/// `queued` reports whether the adapter's raw event queue accepted `payload`.
+/// A transport can withhold its acknowledgement when `queued` is false.
+pub type PrxAckExtensionProvider = fn(u8, &[u8], bool) -> PrxAckExtension;
 
 const TIMESLOT_HFCLK: u8 = raw::MPSL_TIMESLOT_HFCLK_CFG_XTAL_GUARANTEED as u8;
 const TIMESLOT_PRIORITY_NORMAL: u8 = raw::MPSL_TIMESLOT_PRIORITY_NORMAL as u8;
@@ -638,7 +690,7 @@ struct PtxInnerState {
     event_pending: bool,
     event_result_ready: bool,
     event_ack_ok: bool,
-    last_transport_ack: Option<TransportAck>,
+    last_ack_extension: Option<PrxAckExtension>,
 }
 
 // SAFETY: same invariant as InnerState — PtxInnerState is only reached through
@@ -697,7 +749,7 @@ impl PtxInnerState {
         self.event_pending = false;
         self.event_result_ready = false;
         self.event_ack_ok = false;
-        self.last_transport_ack = None;
+        self.last_ack_extension = None;
     }
 }
 
@@ -896,7 +948,7 @@ impl PtxState {
                 event_pending: false,
                 event_result_ready: false,
                 event_ack_ok: false,
-                last_transport_ack: None,
+                last_ack_extension: None,
             })),
         }
     }
@@ -1104,17 +1156,12 @@ unsafe extern "C" fn ptx_timeslot_callback(
                                         state.schedule_tracker.observe_bad_hint();
                                     }
                                 }
-                                let transport_ack_start =
+                                let extension_start =
                                     crate::mpsl_schedule::SCHEDULE_COUNTER_HINT_PAYLOAD_LEN;
-                                if ack_payload.len()
-                                    >= transport_ack_start.saturating_add(TRANSPORT_ACK_LEN)
-                                {
-                                    if let Ok(ack) = decode_transport_ack(
-                                        &ack_payload[transport_ack_start
-                                            ..transport_ack_start + TRANSPORT_ACK_LEN],
-                                    ) {
-                                        state.last_transport_ack = Some(ack);
-                                    }
+                                if ack_payload.len() > extension_start {
+                                    state.last_ack_extension = PrxAckExtension::from_slice(
+                                        &ack_payload[extension_start..],
+                                    );
                                 }
                             } else {
                                 state.schedule_hint_bad_count += 1;
@@ -1509,7 +1556,7 @@ pub struct PrxSlotResult {
     pub earliest_cancelled: u32,
 }
 
-/// One application payload received by a long-lived PRX timeslot session.
+/// One raw application payload received by a long-lived PRX timeslot session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PrxReceivedEvent {
@@ -1589,9 +1636,8 @@ struct PrxInnerState {
     event_tail: usize,
     event_len: usize,
     event_dropped: u32,
-    transport_ack_valid: [bool; NUM_PIPES],
-    transport_ack_device: [u8; NUM_PIPES],
-    transport_ack_sequence: [u8; NUM_PIPES],
+    ack_extension_provider: Option<PrxAckExtensionProvider>,
+    ack_extensions: [PrxAckExtension; NUM_PIPES],
 }
 
 // SAFETY: same invariant as InnerState/PtxInnerState — PrxInnerState is reached
@@ -1637,9 +1683,7 @@ impl PrxInnerState {
         self.event_tail = 0;
         self.event_len = 0;
         self.event_dropped = 0;
-        self.transport_ack_valid = [false; NUM_PIPES];
-        self.transport_ack_device = [0; NUM_PIPES];
-        self.transport_ack_sequence = [0; NUM_PIPES];
+        self.ack_extensions = [PrxAckExtension::EMPTY; NUM_PIPES];
     }
 
     fn push_event(&mut self, pipe: u8, payload: &[u8]) -> bool {
@@ -1674,40 +1718,22 @@ impl PrxInnerState {
         Some(event)
     }
 
-    fn transport_ack_for_pipe(&self, pipe: usize) -> Option<TransportAck> {
-        if pipe < NUM_PIPES && self.transport_ack_valid[pipe] {
-            Some(TransportAck::new(
-                self.transport_ack_device[pipe],
-                self.transport_ack_sequence[pipe],
-            ))
-        } else {
-            None
-        }
-    }
-
-    fn is_duplicate_transport_frame(&self, pipe: usize, payload: &[u8]) -> bool {
-        if pipe >= NUM_PIPES || !self.transport_ack_valid[pipe] {
-            return false;
-        }
-
-        if let Ok((header, _)) = decode_frame(payload) {
-            self.transport_ack_device[pipe] == header.device_id
-                && self.transport_ack_sequence[pipe] == header.sequence
-        } else {
-            false
-        }
-    }
-
-    fn observe_accepted_transport_frame(&mut self, pipe: usize, payload: &[u8]) {
+    fn observe_payload(&mut self, pipe: usize, payload: &[u8], queued: bool) {
         if pipe >= NUM_PIPES {
             return;
         }
 
-        if let Ok((header, _)) = decode_frame(payload) {
-            self.transport_ack_valid[pipe] = true;
-            self.transport_ack_device[pipe] = header.device_id;
-            self.transport_ack_sequence[pipe] = header.sequence;
-        }
+        self.ack_extensions[pipe] = self
+            .ack_extension_provider
+            .map(|provider| provider(pipe as u8, payload, queued))
+            .unwrap_or(PrxAckExtension::EMPTY);
+    }
+
+    fn ack_extension_for_pipe(&self, pipe: usize) -> &[u8] {
+        self.ack_extensions
+            .get(pipe)
+            .map(PrxAckExtension::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -1822,10 +1848,10 @@ fn write_ack_counter_packet(
     next_delay_us: u32,
     period_us: u32,
     window_us: u32,
-    transport_ack: Option<TransportAck>,
+    extension: &[u8],
 ) {
     let hint = ScheduleHint::new(0, window_id, next_delay_us, period_us, window_us);
-    write_counter_schedule_transport_ack_packet(buf, 0, counter, hint, transport_ack);
+    write_counter_schedule_extension_packet(buf, 0, counter, hint, extension);
 }
 
 impl PrxState {
@@ -1901,9 +1927,8 @@ impl PrxState {
                 event_tail: 0,
                 event_len: 0,
                 event_dropped: 0,
-                transport_ack_valid: [false; NUM_PIPES],
-                transport_ack_device: [0; NUM_PIPES],
-                transport_ack_sequence: [0; NUM_PIPES],
+                ack_extension_provider: None,
+                ack_extensions: [PrxAckExtension::EMPTY; NUM_PIPES],
             })),
         }
     }
@@ -2049,7 +2074,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     next_delay_us,
                                     period_us,
                                     state.in_slot_match_us,
-                                    state.transport_ack_for_pipe(pipe),
+                                    state.ack_extension_for_pipe(pipe),
                                 );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
@@ -2077,12 +2102,8 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     (EsbHeader::PAYLOAD_OFFSET + app_len).min(rx_buf.len());
                                 if payload_start < payload_end {
                                     let payload = &rx_buf[payload_start..payload_end];
-                                    if state.is_duplicate_transport_frame(pipe, payload) {
-                                        state.dup_count += 1;
-                                        state.dup_per_pipe[pipe] += 1;
-                                    } else if state.push_event(pipe as u8, payload) {
-                                        state.observe_accepted_transport_frame(pipe, payload);
-                                    }
+                                    let queued = state.push_event(pipe as u8, payload);
+                                    state.observe_payload(pipe, payload, queued);
                                 }
                             }
 
@@ -2112,7 +2133,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     next_delay_us,
                                     period_us,
                                     state.in_slot_match_us,
-                                    state.transport_ack_for_pipe(pipe),
+                                    state.ack_extension_for_pipe(pipe),
                                 );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
@@ -2420,8 +2441,8 @@ pub struct PrxSlotSession {
 impl PrxSlotSession {
     /// Remove and return one received application payload without waiting.
     ///
-    /// Report-only PRX consumers should call this often enough to keep the
-    /// bounded event queue from applying backpressure to transport acceptance.
+    /// Report-only consumers should call this often enough to avoid dropping
+    /// payloads when the bounded event queue fills.
     pub fn try_next_event(&mut self) -> Option<PrxReceivedEvent> {
         PRX_STATE.with_inner(|state| state.pop_event())
     }
@@ -2527,11 +2548,31 @@ impl Drop for PrxSlotSession {
     }
 }
 
+/// Open a long-lived PRX session with scheduler counter ACK payloads only.
+///
+/// For a higher-level protocol that needs to append caller-defined bytes to
+/// each ACK, use [`open_prx_session_with_ack_extension`].
 pub fn open_prx_session(
+    mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_config: PrxSlotConfig,
+) -> Result<PrxSlotSession, Error> {
+    open_prx_session_with_ack_extension(mpsl, config, addresses, slot_config, None)
+}
+
+/// Open a long-lived PRX session with an optional caller-defined ACK extension.
+///
+/// `ack_extension_provider` runs in the MPSL RADIO callback after the raw
+/// application payload has been queued. It must be bounded and non-blocking.
+/// The ESB/MPSL adapter only appends the returned bytes; it does not interpret
+/// their format or impose a transport protocol.
+pub fn open_prx_session_with_ack_extension(
     _mpsl: &MultiprotocolServiceLayer<'_>,
     config: &EsbConfig,
     addresses: &EsbAddresses,
     slot_config: PrxSlotConfig,
+    ack_extension_provider: Option<PrxAckExtensionProvider>,
 ) -> Result<PrxSlotSession, Error> {
     let busy = PRX_STATE.try_enter()?;
     if config.payload_length < 4 {
@@ -2568,6 +2609,7 @@ pub fn open_prx_session(
         state.max_extends = slot_config.max_extends;
         state.extend_length_us = slot_config.extend_length_us;
         state.retry_blocked_at_high_priority = slot_config.request.retry_blocked_at_high_priority;
+        state.ack_extension_provider = ack_extension_provider;
         prx_set_earliest_request(
             state,
             TIMESLOT_PRIORITY_NORMAL,
@@ -2864,8 +2906,9 @@ pub struct PtxSendResult {
     pub counters: SignalCounters,
     /// Valid PRX schedule hint carried in the ACK payload, if present.
     pub schedule_hint: Option<ScheduleHint>,
-    /// Last transport frame accepted by the PRX and echoed in its ACK payload.
-    pub transport_ack: Option<TransportAck>,
+    /// Caller-defined bytes carried after the PRX scheduler hint in its ACK
+    /// payload. The ESB/MPSL adapter does not interpret this extension.
+    pub ack_extension: Option<PrxAckExtension>,
 }
 
 /// A long-lived event-driven PTX session.
@@ -2975,7 +3018,7 @@ impl PtxEventSession {
             state.event_result_ready = false;
             state.event_ack_ok = false;
             state.last_schedule_hint = None;
-            state.last_transport_ack = None;
+            state.last_ack_extension = None;
             state.done = false;
             state.counters = SignalCounters::ZERO;
             true
@@ -2993,7 +3036,7 @@ impl PtxEventSession {
                 state.event_pending = false;
                 state.event_result_ready = false;
                 state.event_ack_ok = false;
-                state.last_transport_ack = None;
+                state.last_ack_extension = None;
             });
             return Err(e);
         }
@@ -3039,7 +3082,7 @@ impl PtxEventSession {
 
             let counters = state.counters;
             let schedule_hint = state.last_schedule_hint;
-            let transport_ack = state.last_transport_ack;
+            let ack_extension = state.last_ack_extension;
 
             state.event_result_ready = false;
             state.event_pending = false;
@@ -3048,7 +3091,7 @@ impl PtxEventSession {
                 ack_ok,
                 counters,
                 schedule_hint,
-                transport_ack,
+                ack_extension,
             })
         })?;
 
