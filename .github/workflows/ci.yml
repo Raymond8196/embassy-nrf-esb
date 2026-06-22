@@ -22,10 +22,8 @@ jobs:
         run: cargo fmt --check
       - name: Host unit tests
         run: cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
-      # Clippy runs in report-only mode for now. Promote to `-D warnings`
-      # (roadmap Phase 6 target) once the existing warning backlog is cleaned.
-      - name: Clippy (lib, report only)
-        run: cargo clippy --lib --target x86_64-unknown-linux-gnu --features nrf52840
+      - name: Clippy (lib)
+        run: cargo clippy --lib --target x86_64-unknown-linux-gnu --features nrf52840 -- -D warnings
       - name: Feature check without MPSL
         run: cargo check --features nrf52840,_cs-cortex
       - name: Feature check with MPSL
