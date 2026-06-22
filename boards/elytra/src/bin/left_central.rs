@@ -35,8 +35,8 @@ use embassy_nrf_esb::mpsl_timeslot::{
     CoexistenceProfile, PrxAckExtension, PrxSlotConfig, open_prx_session_with_ack_extension,
 };
 use embassy_nrf_esb::transport::{
-    SequenceTracker, StaticBindingTable, TransportAck, accept_bound_frame, decode_frame,
-    encode_transport_ack, TRANSPORT_ACK_LEN,
+    SequenceTracker, StaticBindingTable, TRANSPORT_ACK_LEN, TransportAck, accept_bound_frame,
+    decode_frame, encode_transport_ack,
 };
 
 type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
