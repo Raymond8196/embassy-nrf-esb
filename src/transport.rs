@@ -372,10 +372,11 @@ impl<const N: usize> Default for StaticBindingTable<N> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FLAG_ACK, FLAG_RETRANSMIT, MAX_TRANSPORT_PAYLOAD_LEN, SequenceTracker, StaticBindingTable,
-        TRANSPORT_ACK_LEN, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportAck, TransportHeader,
-        accept_bound_frame, decode_frame, decode_transport_ack, encode_frame, encode_transport_ack,
-        fits_esb_payload, required_esb_payload_len, validate_payload_length,
+        FLAG_ACK, FLAG_RETRANSMIT, FLAGS_V1_MASK, MAX_TRANSPORT_PAYLOAD_LEN, SequenceTracker,
+        StaticBindingTable, TRANSPORT_ACK_LEN, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION,
+        TransportAck, TransportHeader, accept_bound_frame, decode_frame, decode_transport_ack,
+        encode_frame, encode_transport_ack, fits_esb_payload, required_esb_payload_len,
+        validate_payload_length,
     };
     use crate::error::Error;
 
@@ -564,5 +565,223 @@ mod tests {
             accept_bound_frame(&bindings, &mut tracker, 0, &frame[..len]),
             Err(Error::InvalidParam)
         );
+    }
+
+    #[test]
+    fn transport_ack_matches_only_when_device_and_sequence_agree() {
+        let ack = TransportAck::new(7, 42);
+
+        assert!(ack.matches(7, 42));
+        assert!(!ack.matches(8, 42));
+        assert!(!ack.matches(7, 43));
+        assert!(!ack.matches(0, 42));
+        assert!(!ack.matches(7, 0));
+    }
+
+    #[test]
+    fn transport_ack_matches_at_u8_boundaries() {
+        let lo = TransportAck::new(0, 0);
+        assert!(lo.matches(0, 0));
+        assert!(!lo.matches(255, 0));
+        assert!(!lo.matches(0, 255));
+
+        let hi = TransportAck::new(255, 255);
+        assert!(hi.matches(255, 255));
+        assert!(!hi.matches(0, 255));
+        assert!(!hi.matches(255, 0));
+    }
+
+    #[test]
+    fn encode_decode_transport_ack_round_trips_typical_and_boundary_values() {
+        for (device_id, sequence) in [(0u8, 0u8), (1, 1), (3, 9), (254, 255), (255, 255), (255, 0)] {
+            let mut buf = [0u8; TRANSPORT_ACK_LEN];
+            let ack = TransportAck::new(device_id, sequence);
+
+            encode_transport_ack(ack, &mut buf).unwrap();
+
+            // Wire layout: magic (LE) + device_id + sequence.
+            assert_eq!(&buf[0..2], &[0x54, 0x41]);
+            assert_eq!(buf[2], device_id);
+            assert_eq!(buf[3], sequence);
+
+            assert_eq!(decode_transport_ack(&buf), Ok(ack));
+        }
+    }
+
+    #[test]
+    fn decode_transport_ack_rejects_undersized_buffer() {
+        // Every strict prefix shorter than TRANSPORT_ACK_LEN must be rejected.
+        let mut buf = [0u8; TRANSPORT_ACK_LEN];
+        encode_transport_ack(TransportAck::new(1, 2), &mut buf).unwrap();
+
+        for prefix in 0..TRANSPORT_ACK_LEN {
+            assert_eq!(
+                decode_transport_ack(&buf[..prefix]),
+                Err(Error::InvalidParam),
+                "prefix of {prefix} bytes should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_transport_ack_rejects_wrong_magic() {
+        let mut buf = [0u8; TRANSPORT_ACK_LEN];
+        encode_transport_ack(TransportAck::new(1, 2), &mut buf).unwrap();
+
+        // Flip each byte of the magic; decode must reject all of them.
+        buf[0] = !buf[0];
+        assert_eq!(decode_transport_ack(&buf), Err(Error::InvalidParam));
+
+        encode_transport_ack(TransportAck::new(1, 2), &mut buf).unwrap();
+        buf[1] = !buf[1];
+        assert_eq!(decode_transport_ack(&buf), Err(Error::InvalidParam));
+
+        // And a fully bogus magic.
+        buf[0] = 0xff;
+        buf[1] = 0xff;
+        assert_eq!(decode_transport_ack(&buf), Err(Error::InvalidParam));
+    }
+
+    #[test]
+    fn decode_transport_ack_ignores_trailing_bytes() {
+        // decode_transport_ack only consumes the first TRANSPORT_ACK_LEN bytes;
+        // trailing bytes (e.g. embedded inside a longer ESB ACK payload) are
+        // left for the caller to interpret.
+        let mut buf = [0u8; TRANSPORT_ACK_LEN + 3];
+        encode_transport_ack(TransportAck::new(4, 5), &mut buf).unwrap();
+        buf[TRANSPORT_ACK_LEN] = 0xde;
+        buf[TRANSPORT_ACK_LEN + 1] = 0xad;
+        buf[TRANSPORT_ACK_LEN + 2] = 0xbe;
+
+        assert_eq!(decode_transport_ack(&buf), Ok(TransportAck::new(4, 5)));
+    }
+
+    #[test]
+    fn encode_transport_ack_accepts_larger_buffer_without_touching_trailing_bytes() {
+        let mut buf = [0xffu8; TRANSPORT_ACK_LEN + 2];
+        encode_transport_ack(TransportAck::new(2, 8), &mut buf).unwrap();
+
+        assert_eq!(&buf[0..2], &[0x54, 0x41]);
+        assert_eq!(buf[2], 2);
+        assert_eq!(buf[3], 8);
+        // Trailing bytes outside the encoded range stay untouched.
+        assert_eq!(&buf[TRANSPORT_ACK_LEN..], &[0xff, 0xff]);
+    }
+
+    #[test]
+    fn encode_transport_ack_rejects_undersized_output() {
+        let mut buf = [0u8; TRANSPORT_ACK_LEN];
+        encode_transport_ack(TransportAck::new(1, 1), &mut buf).unwrap();
+
+        for cap in 0..TRANSPORT_ACK_LEN {
+            assert_eq!(
+                encode_transport_ack(TransportAck::new(1, 1), &mut buf[..cap]),
+                Err(Error::InvalidParam),
+                "capacity of {cap} bytes should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_flags_are_disjoint_and_combine_into_mask() {
+        assert_eq!(FLAG_ACK, 0x01);
+        assert_eq!(FLAG_RETRANSMIT, 0x02);
+        assert_eq!(FLAGS_V1_MASK, FLAG_ACK | FLAG_RETRANSMIT);
+        assert_eq!(FLAGS_V1_MASK, 0x03);
+
+        // No shared bits: the two flags can be set independently and together.
+        assert_eq!(FLAG_ACK & FLAG_RETRANSMIT, 0);
+        assert_eq!(FLAG_ACK | FLAG_RETRANSMIT, FLAGS_V1_MASK);
+    }
+
+    #[test]
+    fn transport_header_accepts_both_flags_set_together() {
+        let both = TransportHeader::new(1, 1, FLAG_ACK | FLAG_RETRANSMIT, 0).unwrap();
+        assert_eq!(both.flags, FLAG_ACK | FLAG_RETRANSMIT);
+
+        // Each flag on its own is also valid.
+        assert!(TransportHeader::new(1, 1, FLAG_ACK, 0).is_ok());
+        assert!(TransportHeader::new(1, 1, FLAG_RETRANSMIT, 0).is_ok());
+        assert!(TransportHeader::new(1, 1, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn transport_header_rejects_flags_outside_v1_mask() {
+        // Every bit not in FLAGS_V1_MASK must be rejected at construction.
+        for bit in 0u8..8 {
+            let flag = 1u8 << bit;
+            if flag & FLAGS_V1_MASK != 0 {
+                continue;
+            }
+            assert_eq!(
+                TransportHeader::new(0, 0, flag, 0),
+                Err(Error::InvalidParam),
+                "flag 0x{flag:02x} should be rejected"
+            );
+        }
+
+        // A combined flag with any reserved bit set is also rejected.
+        assert_eq!(
+            TransportHeader::new(0, 0, FLAG_ACK | 0x80, 0),
+            Err(Error::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn retransmit_flag_survives_full_frame_round_trip() {
+        let payload = [0x10, 0x20, 0x30];
+        let mut frame = [0u8; 16];
+        let len = encode_frame(5, 99, FLAG_RETRANSMIT, &payload, &mut frame).unwrap();
+
+        let (header, decoded_payload) = decode_frame(&frame[..len]).unwrap();
+        assert_eq!(header.flags, FLAG_RETRANSMIT);
+        assert_eq!(header.device_id, 5);
+        assert_eq!(header.sequence, 99);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn ack_and_retransmit_flags_round_trip_together_through_frame() {
+        let payload = [0xAB];
+        let mut frame = [0u8; 16];
+        let flags = FLAG_ACK | FLAG_RETRANSMIT;
+        let len = encode_frame(6, 200, flags, &payload, &mut frame).unwrap();
+
+        let (header, decoded_payload) = decode_frame(&frame[..len]).unwrap();
+        assert_eq!(header.flags, flags);
+        assert!(header.flags & FLAG_ACK != 0);
+        assert!(header.flags & FLAG_RETRANSMIT != 0);
+        assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn accept_bound_frame_accepts_retransmitted_frame_as_new_after_reset() {
+        // accept_bound_frame does not itself interpret FLAG_RETRANSMIT; it only
+        // does binding + sequence dedup. A retransmitted sequence number is
+        // dropped as a duplicate until the tracker entry is reset.
+        let bindings = StaticBindingTable::<2>::from_pipe_entries([Some(3), None]);
+        let mut tracker = SequenceTracker::<8>::new();
+        let mut frame = [0u8; 16];
+        let len = encode_frame(3, 17, FLAG_RETRANSMIT, &[0x01], &mut frame).unwrap();
+
+        // First arrival: accepted.
+        let accepted = accept_bound_frame(&bindings, &mut tracker, 0, &frame[..len])
+            .unwrap()
+            .expect("first copy of retransmitted frame should be accepted");
+        assert_eq!(accepted.0.flags, FLAG_RETRANSMIT);
+
+        // Immediate repeat (same device+sequence): dropped as duplicate.
+        assert_eq!(
+            accept_bound_frame(&bindings, &mut tracker, 0, &frame[..len]),
+            Ok(None)
+        );
+
+        // After resetting that device's slot, the same sequence is new again.
+        tracker.reset_device(3).unwrap();
+        let accepted_again = accept_bound_frame(&bindings, &mut tracker, 0, &frame[..len])
+            .unwrap()
+            .expect("frame should be accepted after device reset");
+        assert_eq!(accepted_again.0.flags, FLAG_RETRANSMIT);
+        assert_eq!(accepted_again.0.sequence, 17);
     }
 }
