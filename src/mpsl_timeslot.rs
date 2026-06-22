@@ -40,7 +40,8 @@ use nrf_mpsl::{MultiprotocolServiceLayer, RetVal, raw};
 use crate::error::Error;
 use crate::mpsl_common::{
     NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
-    write_counter_packet, write_counter_payload_packet, write_counter_schedule_packet,
+    write_counter_packet, write_counter_payload_packet,
+    write_counter_schedule_transport_ack_packet,
 };
 pub use crate::mpsl_profile::{
     BleCoexistenceHint, CoexistenceProfile, CoexistenceProfileConfig, PrxScheduleConfig,
@@ -52,6 +53,7 @@ use crate::mpsl_radio::{disable_radio_bounded, quiesce_radio_before_timeslot_end
 use crate::mpsl_schedule::{
     ScheduleHint, ScheduleTracker, ScheduleTrackerSnapshot, decode_counter_payload_schedule_hint,
 };
+use crate::transport::{TRANSPORT_ACK_LEN, TransportAck, decode_frame, decode_transport_ack};
 
 const TIMESLOT_TIMER_INTERRUPT: Interrupt = Interrupt::TIMER0;
 
@@ -636,6 +638,7 @@ struct PtxInnerState {
     event_pending: bool,
     event_result_ready: bool,
     event_ack_ok: bool,
+    last_transport_ack: Option<TransportAck>,
 }
 
 // SAFETY: same invariant as InnerState — PtxInnerState is only reached through
@@ -694,6 +697,7 @@ impl PtxInnerState {
         self.event_pending = false;
         self.event_result_ready = false;
         self.event_ack_ok = false;
+        self.last_transport_ack = None;
     }
 }
 
@@ -892,6 +896,7 @@ impl PtxState {
                 event_pending: false,
                 event_result_ready: false,
                 event_ack_ok: false,
+                last_transport_ack: None,
             })),
         }
     }
@@ -1089,6 +1094,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                                 let t = pac::TIMER0;
                                 t.tasks_capture(2).write_value(1);
                                 let ack_offset_us = t.cc(2).read();
+                                let ack_payload = &rx_buf[payload..end];
                                 match decode_counter_payload_schedule_hint(&rx_buf[payload..end]) {
                                     Ok(hint) => {
                                         ptx_observe_schedule_hint(state, hint, ack_offset_us)
@@ -1096,6 +1102,18 @@ unsafe extern "C" fn ptx_timeslot_callback(
                                     Err(_) => {
                                         state.schedule_hint_bad_count += 1;
                                         state.schedule_tracker.observe_bad_hint();
+                                    }
+                                }
+                                let transport_ack_start =
+                                    crate::mpsl_schedule::SCHEDULE_COUNTER_HINT_PAYLOAD_LEN;
+                                if ack_payload.len()
+                                    >= transport_ack_start.saturating_add(TRANSPORT_ACK_LEN)
+                                {
+                                    if let Ok(ack) = decode_transport_ack(
+                                        &ack_payload[transport_ack_start
+                                            ..transport_ack_start + TRANSPORT_ACK_LEN],
+                                    ) {
+                                        state.last_transport_ack = Some(ack);
                                     }
                                 }
                             } else {
@@ -1217,8 +1235,7 @@ unsafe extern "C" fn ptx_timeslot_callback(
                     state.event_pending = false;
                     state.event_ack_ok = state.acked_this_slot;
                     state.waker.wake();
-                    state.return_param.callback_action =
-                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                    state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
                 } else if poll_active {
                     state.poll_slots_since_report += 1;
                     if state.poll_slots_since_report >= state.poll_report_every {
@@ -1315,6 +1332,21 @@ unsafe extern "C" fn ptx_timeslot_callback(
             if ret < 0 {
                 PTX_STATE.with_inner(|state| {
                     state.counters.invalid_return += 1;
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!(
+                        "ptx blocked/cancelled rerequest failed ret={} sig={} cnt s={} t0={} rd={} bk={} cn={} idle={} closed={} over={} inv={}",
+                        ret,
+                        signal,
+                        state.counters.start,
+                        state.counters.timer0,
+                        state.counters.radio,
+                        state.counters.blocked,
+                        state.counters.cancelled,
+                        state.counters.session_idle,
+                        state.counters.session_closed,
+                        state.counters.overstayed,
+                        state.counters.invalid_return,
+                    );
                     state.done = true;
                     state.waker.wake();
                 });
@@ -1477,8 +1509,18 @@ pub struct PrxSlotResult {
     pub earliest_cancelled: u32,
 }
 
+/// One application payload received by a long-lived PRX timeslot session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct PrxReceivedEvent {
+    pub pipe: u8,
+    pub len: u8,
+    pub payload: [u8; 32],
+}
+
 const PRX_REQ_EARLIEST: u8 = 1;
 const PRX_REQ_NORMAL: u8 = 2;
+const PRX_EVENT_QUEUE_CAP: usize = 32;
 
 /// Phase within a single PRX timeslot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1542,6 +1584,14 @@ struct PrxInnerState {
     earliest_blocked: u32,
     normal_cancelled: u32,
     earliest_cancelled: u32,
+    event_queue: [PrxReceivedEvent; PRX_EVENT_QUEUE_CAP],
+    event_head: usize,
+    event_tail: usize,
+    event_len: usize,
+    event_dropped: u32,
+    transport_ack_valid: [bool; NUM_PIPES],
+    transport_ack_device: [u8; NUM_PIPES],
+    transport_ack_sequence: [u8; NUM_PIPES],
 }
 
 // SAFETY: same invariant as InnerState/PtxInnerState — PrxInnerState is reached
@@ -1583,6 +1633,81 @@ impl PrxInnerState {
         self.earliest_blocked = 0;
         self.normal_cancelled = 0;
         self.earliest_cancelled = 0;
+        self.event_head = 0;
+        self.event_tail = 0;
+        self.event_len = 0;
+        self.event_dropped = 0;
+        self.transport_ack_valid = [false; NUM_PIPES];
+        self.transport_ack_device = [0; NUM_PIPES];
+        self.transport_ack_sequence = [0; NUM_PIPES];
+    }
+
+    fn push_event(&mut self, pipe: u8, payload: &[u8]) -> bool {
+        if self.event_len == PRX_EVENT_QUEUE_CAP {
+            self.event_dropped = self.event_dropped.saturating_add(1);
+            return false;
+        }
+
+        let len = payload.len().min(32);
+        let mut event = PrxReceivedEvent {
+            pipe,
+            len: len as u8,
+            payload: [0; 32],
+        };
+        event.payload[..len].copy_from_slice(&payload[..len]);
+
+        self.event_queue[self.event_tail] = event;
+        self.event_tail = (self.event_tail + 1) % PRX_EVENT_QUEUE_CAP;
+        self.event_len += 1;
+        self.waker.wake();
+        true
+    }
+
+    fn pop_event(&mut self) -> Option<PrxReceivedEvent> {
+        if self.event_len == 0 {
+            return None;
+        }
+
+        let event = self.event_queue[self.event_head];
+        self.event_head = (self.event_head + 1) % PRX_EVENT_QUEUE_CAP;
+        self.event_len -= 1;
+        Some(event)
+    }
+
+    fn transport_ack_for_pipe(&self, pipe: usize) -> Option<TransportAck> {
+        if pipe < NUM_PIPES && self.transport_ack_valid[pipe] {
+            Some(TransportAck::new(
+                self.transport_ack_device[pipe],
+                self.transport_ack_sequence[pipe],
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn is_duplicate_transport_frame(&self, pipe: usize, payload: &[u8]) -> bool {
+        if pipe >= NUM_PIPES || !self.transport_ack_valid[pipe] {
+            return false;
+        }
+
+        if let Ok((header, _)) = decode_frame(payload) {
+            self.transport_ack_device[pipe] == header.device_id
+                && self.transport_ack_sequence[pipe] == header.sequence
+        } else {
+            false
+        }
+    }
+
+    fn observe_accepted_transport_frame(&mut self, pipe: usize, payload: &[u8]) {
+        if pipe >= NUM_PIPES {
+            return;
+        }
+
+        if let Ok((header, _)) = decode_frame(payload) {
+            self.transport_ack_valid[pipe] = true;
+            self.transport_ack_device[pipe] = header.device_id;
+            self.transport_ack_sequence[pipe] = header.sequence;
+        }
     }
 }
 
@@ -1697,9 +1822,10 @@ fn write_ack_counter_packet(
     next_delay_us: u32,
     period_us: u32,
     window_us: u32,
+    transport_ack: Option<TransportAck>,
 ) {
     let hint = ScheduleHint::new(0, window_id, next_delay_us, period_us, window_us);
-    write_counter_schedule_packet(buf, 0, counter, hint);
+    write_counter_schedule_transport_ack_packet(buf, 0, counter, hint, transport_ack);
 }
 
 impl PrxState {
@@ -1766,6 +1892,18 @@ impl PrxState {
                 earliest_blocked: 0,
                 normal_cancelled: 0,
                 earliest_cancelled: 0,
+                event_queue: [PrxReceivedEvent {
+                    pipe: 0,
+                    len: 0,
+                    payload: [0; 32],
+                }; PRX_EVENT_QUEUE_CAP],
+                event_head: 0,
+                event_tail: 0,
+                event_len: 0,
+                event_dropped: 0,
+                transport_ack_valid: [false; NUM_PIPES],
+                transport_ack_device: [0; NUM_PIPES],
+                transport_ack_sequence: [0; NUM_PIPES],
             })),
         }
     }
@@ -1911,6 +2049,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     next_delay_us,
                                     period_us,
                                     state.in_slot_match_us,
+                                    state.transport_ack_for_pipe(pipe),
                                 );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
@@ -1930,6 +2069,22 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 state.rx_per_pipe[pipe] += 1;
                             }
                             state.rx_count += 1;
+
+                            let app_len = rx_buf[EsbHeader::DMA_OFFSET] as usize;
+                            if app_len > 4 && pipe < NUM_PIPES {
+                                let payload_start = EsbHeader::PAYLOAD_OFFSET + 4;
+                                let payload_end =
+                                    (EsbHeader::PAYLOAD_OFFSET + app_len).min(rx_buf.len());
+                                if payload_start < payload_end {
+                                    let payload = &rx_buf[payload_start..payload_end];
+                                    if state.is_duplicate_transport_frame(pipe, payload) {
+                                        state.dup_count += 1;
+                                        state.dup_per_pipe[pipe] += 1;
+                                    } else if state.push_event(pipe as u8, payload) {
+                                        state.observe_accepted_transport_frame(pipe, payload);
+                                    }
+                                }
+                            }
 
                             if no_ack {
                                 // NoAck — stop TX ramp, restart RX.
@@ -1957,6 +2112,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     next_delay_us,
                                     period_us,
                                     state.in_slot_match_us,
+                                    state.transport_ack_for_pipe(pipe),
                                 );
                                 let dma_ptr =
                                     unsafe { ack_buf.as_mut_ptr().add(EsbHeader::DMA_OFFSET) };
@@ -2262,6 +2418,31 @@ pub struct PrxSlotSession {
 }
 
 impl PrxSlotSession {
+    /// Remove and return one received application payload without waiting.
+    ///
+    /// Report-only PRX consumers should call this often enough to keep the
+    /// bounded event queue from applying backpressure to transport acceptance.
+    pub fn try_next_event(&mut self) -> Option<PrxReceivedEvent> {
+        PRX_STATE.with_inner(|state| state.pop_event())
+    }
+
+    pub async fn next_event(&mut self) -> Result<PrxReceivedEvent, Error> {
+        poll_fn(|cx| {
+            PRX_STATE.with_inner(|state| {
+                state.waker.register(cx.waker());
+                if state.done {
+                    Poll::Ready(None)
+                } else if let Some(event) = state.pop_event() {
+                    Poll::Ready(Some(event))
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await
+        .ok_or(Error::Mpsl)
+    }
+
     pub async fn next_report(&mut self) -> Result<PrxSlotResult, Error> {
         poll_fn(|cx| {
             PRX_STATE.with_inner(|state| {
@@ -2683,6 +2864,8 @@ pub struct PtxSendResult {
     pub counters: SignalCounters,
     /// Valid PRX schedule hint carried in the ACK payload, if present.
     pub schedule_hint: Option<ScheduleHint>,
+    /// Last transport frame accepted by the PRX and echoed in its ACK payload.
+    pub transport_ack: Option<TransportAck>,
 }
 
 /// A long-lived event-driven PTX session.
@@ -2792,6 +2975,7 @@ impl PtxEventSession {
             state.event_result_ready = false;
             state.event_ack_ok = false;
             state.last_schedule_hint = None;
+            state.last_transport_ack = None;
             state.done = false;
             state.counters = SignalCounters::ZERO;
             true
@@ -2803,10 +2987,13 @@ impl PtxEventSession {
         let request = PTX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
         let ret = unsafe { raw::mpsl_timeslot_request(self.session_id, request) };
         if let Err(e) = mpsl_ok(ret) {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("ptx event request failed ret={} err={:?}", ret, e);
             PTX_STATE.with_inner(|state| {
                 state.event_pending = false;
                 state.event_result_ready = false;
                 state.event_ack_ok = false;
+                state.last_transport_ack = None;
             });
             return Err(e);
         }
@@ -2825,6 +3012,22 @@ impl PtxEventSession {
 
         let result = PTX_STATE.with_inner(|state| {
             if state.done && !state.event_result_ready {
+                #[cfg(feature = "defmt")]
+                defmt::warn!(
+                    "ptx event ended without result cnt s={} t0={} rd={} bk={} cn={} idle={} closed={} over={} inv={} extf={} exts={} rdt={}",
+                    state.counters.start,
+                    state.counters.timer0,
+                    state.counters.radio,
+                    state.counters.blocked,
+                    state.counters.cancelled,
+                    state.counters.session_idle,
+                    state.counters.session_closed,
+                    state.counters.overstayed,
+                    state.counters.invalid_return,
+                    state.counters.extend_failed,
+                    state.counters.extend_succeeded,
+                    state.counters.radio_disable_timeout,
+                );
                 return Err(Error::Mpsl);
             }
 
@@ -2836,6 +3039,7 @@ impl PtxEventSession {
 
             let counters = state.counters;
             let schedule_hint = state.last_schedule_hint;
+            let transport_ack = state.last_transport_ack;
 
             state.event_result_ready = false;
             state.event_pending = false;
@@ -2844,6 +3048,7 @@ impl PtxEventSession {
                 ack_ok,
                 counters,
                 schedule_hint,
+                transport_ack,
             })
         })?;
 

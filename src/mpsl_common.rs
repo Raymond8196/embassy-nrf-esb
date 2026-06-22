@@ -8,6 +8,7 @@ use crate::mpsl_schedule::{
     SCHEDULE_COUNTER_HINT_PAYLOAD_LEN, SCHEDULE_HINT_PAYLOAD_OFFSET, ScheduleHint,
     encode_schedule_hint,
 };
+use crate::transport::{TRANSPORT_ACK_LEN, TransportAck, encode_transport_ack};
 
 pub(crate) const NUM_PIPES: usize = 8;
 
@@ -86,6 +87,26 @@ pub(crate) fn write_counter_schedule_packet(
     );
 }
 
+pub(crate) fn write_counter_schedule_transport_ack_packet(
+    buf: &mut [u8; 256],
+    pid: u8,
+    counter: u32,
+    hint: ScheduleHint,
+    transport_ack: Option<TransportAck>,
+) {
+    write_counter_schedule_packet(buf, pid, counter, hint);
+
+    if let Some(ack) = transport_ack {
+        let ack_offset = EsbHeader::PAYLOAD_OFFSET + SCHEDULE_COUNTER_HINT_PAYLOAD_LEN;
+        if ack_offset + TRANSPORT_ACK_LEN <= buf.len() {
+            let _ = encode_transport_ack(ack, &mut buf[ack_offset..ack_offset + TRANSPORT_ACK_LEN]);
+
+            let header = unsafe { &mut *(buf.as_mut_ptr().cast::<EsbHeader>()) };
+            header.length = (SCHEDULE_COUNTER_HINT_PAYLOAD_LEN + TRANSPORT_ACK_LEN) as u8;
+        }
+    }
+}
+
 pub(crate) fn read_counter_payload(buf: &[u8]) -> Option<u32> {
     let dma = EsbHeader::DMA_OFFSET;
     let payload = EsbHeader::PAYLOAD_OFFSET;
@@ -127,7 +148,7 @@ mod tests {
     use super::{
         NUM_PIPES, advance_pid, delta_per_pipe, next_pipe_in_mask, read_counter_payload,
         spin_until, write_counter_packet, write_counter_payload_packet,
-        write_counter_schedule_packet,
+        write_counter_schedule_packet, write_counter_schedule_transport_ack_packet,
     };
     use crate::header::EsbHeader;
     use crate::mpsl_schedule::{
@@ -221,6 +242,36 @@ mod tests {
         let payload = &buf[EsbHeader::PAYLOAD_OFFSET
             ..EsbHeader::PAYLOAD_OFFSET + SCHEDULE_COUNTER_HINT_PAYLOAD_LEN];
         assert_eq!(decode_counter_payload_schedule_hint(payload), Ok(hint));
+    }
+
+    #[test]
+    fn scheduled_counter_packet_can_append_transport_ack() {
+        let mut buf = [0u8; 256];
+        let hint = ScheduleHint::new(0, 9, 1500, 5000, 4500);
+
+        write_counter_schedule_transport_ack_packet(
+            &mut buf,
+            1,
+            0x4433_2211,
+            hint,
+            Some(crate::transport::TransportAck::new(2, 7)),
+        );
+
+        let header = unsafe { &*(buf.as_ptr().cast::<EsbHeader>()) };
+        assert_eq!(
+            header.length,
+            (SCHEDULE_COUNTER_HINT_PAYLOAD_LEN + crate::transport::TRANSPORT_ACK_LEN) as u8
+        );
+        assert_eq!(read_counter_payload(&buf), Some(0x4433_2211));
+
+        let payload = EsbHeader::PAYLOAD_OFFSET;
+        let ack_start = payload + SCHEDULE_COUNTER_HINT_PAYLOAD_LEN;
+        assert_eq!(
+            crate::transport::decode_transport_ack(
+                &buf[ack_start..ack_start + crate::transport::TRANSPORT_ACK_LEN]
+            ),
+            Ok(crate::transport::TransportAck::new(2, 7))
+        );
     }
 
     #[test]

@@ -25,12 +25,10 @@
 
 use core::fmt::Write as FmtWrite;
 
+use bt_hci::cmd::SyncCmd;
 use bt_hci::cmd::controller_baseband::SetEventMask;
 use bt_hci::cmd::le::{LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::cmd::SyncCmd;
-use bt_hci::param::{
-    AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
-};
+use bt_hci::param::{AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, EventMask, LeEventMask};
 use embassy_executor::Spawner;
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::usb::Driver as UsbDriver;
@@ -214,7 +212,10 @@ async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16
         let mut buf = [0u8; LOG_BUF_SIZE];
         let len = {
             let mut w = WriteBuf::new(&mut buf);
-            let _ = write!(w, "[BLE] L2CAP conn param update: int=100ms lat=4 to=6000ms\r\n");
+            let _ = write!(
+                w,
+                "[BLE] L2CAP conn param update: int=100ms lat=4 to=6000ms\r\n"
+            );
             w.pos
         };
         log(&buf[..len]);
@@ -225,11 +226,18 @@ async fn request_relaxed_conn_params(sdc: &SoftdeviceController<'_>, handle: u16
     let latency: u16 = 4;
     let timeout: u16 = 600;
     let payload: [u8; 12] = [
-        0x12, 0x01, 0x08, 0x00,
-        (interval_min & 0xff) as u8, (interval_min >> 8) as u8,
-        (interval_max & 0xff) as u8, (interval_max >> 8) as u8,
-        (latency & 0xff) as u8, (latency >> 8) as u8,
-        (timeout & 0xff) as u8, (timeout >> 8) as u8,
+        0x12,
+        0x01,
+        0x08,
+        0x00,
+        (interval_min & 0xff) as u8,
+        (interval_min >> 8) as u8,
+        (interval_max & 0xff) as u8,
+        (interval_max >> 8) as u8,
+        (latency & 0xff) as u8,
+        (latency >> 8) as u8,
+        (timeout & 0xff) as u8,
+        (timeout >> 8) as u8,
     ];
     send_l2cap(sdc, handle, 0x0005, &payload);
 }
@@ -680,6 +688,12 @@ async fn main(spawner: Spawner) {
                 continue;
             }
         };
+
+        // This diagnostic central reports radio statistics only; it does not
+        // consume application payloads. Drain them so the bounded transport
+        // event queue cannot fill and prevent subsequent frames from being
+        // acknowledged at the transport layer.
+        while prx_session.try_next_event().is_some() {}
 
         total_rx += r.rx_count;
         total_p0 += r.rx_per_pipe[0];

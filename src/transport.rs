@@ -22,6 +22,11 @@ pub const FLAG_RETRANSMIT: u8 = 0x02;
 /// Flags currently defined by transport version 1.
 pub const FLAGS_V1_MASK: u8 = FLAG_ACK | FLAG_RETRANSMIT;
 
+/// Transport acknowledgement marker carried inside an ESB ACK payload.
+pub const TRANSPORT_ACK_MAGIC: u16 = 0x4154; // "TA", little-endian on wire.
+/// Encoded transport acknowledgement length in bytes.
+pub const TRANSPORT_ACK_LEN: usize = 4;
+
 /// Return the ESB payload length required to carry a framed higher-level
 /// payload of `payload_len` bytes.
 pub const fn required_esb_payload_len(payload_len: usize) -> usize {
@@ -164,6 +169,53 @@ pub fn decode_frame(frame: &[u8]) -> Result<(TransportHeader, &[u8]), Error> {
     let start = TRANSPORT_HEADER_LEN;
     let end = start + header.payload_len as usize;
     Ok((header, &frame[start..end]))
+}
+
+/// Application-level acknowledgement for one accepted transport frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TransportAck {
+    pub device_id: u8,
+    pub sequence: u8,
+}
+
+impl TransportAck {
+    pub const fn new(device_id: u8, sequence: u8) -> Self {
+        Self {
+            device_id,
+            sequence,
+        }
+    }
+
+    pub fn matches(self, device_id: u8, sequence: u8) -> bool {
+        self.device_id == device_id && self.sequence == sequence
+    }
+}
+
+/// Encode a transport acknowledgement into `out`.
+pub fn encode_transport_ack(ack: TransportAck, out: &mut [u8]) -> Result<(), Error> {
+    if out.len() < TRANSPORT_ACK_LEN {
+        return Err(Error::InvalidParam);
+    }
+
+    out[0..2].copy_from_slice(&TRANSPORT_ACK_MAGIC.to_le_bytes());
+    out[2] = ack.device_id;
+    out[3] = ack.sequence;
+    Ok(())
+}
+
+/// Decode a transport acknowledgement from `buf`.
+pub fn decode_transport_ack(buf: &[u8]) -> Result<TransportAck, Error> {
+    if buf.len() < TRANSPORT_ACK_LEN {
+        return Err(Error::InvalidParam);
+    }
+
+    let magic = u16::from_le_bytes([buf[0], buf[1]]);
+    if magic != TRANSPORT_ACK_MAGIC {
+        return Err(Error::InvalidParam);
+    }
+
+    Ok(TransportAck::new(buf[2], buf[3]))
 }
 
 /// Decode and validate a frame received on `pipe`.
@@ -321,8 +373,9 @@ impl<const N: usize> Default for StaticBindingTable<N> {
 mod tests {
     use super::{
         FLAG_ACK, FLAG_RETRANSMIT, MAX_TRANSPORT_PAYLOAD_LEN, SequenceTracker, StaticBindingTable,
-        TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportHeader, accept_bound_frame, decode_frame,
-        encode_frame, fits_esb_payload, required_esb_payload_len, validate_payload_length,
+        TRANSPORT_ACK_LEN, TRANSPORT_HEADER_LEN, TRANSPORT_VERSION, TransportAck, TransportHeader,
+        accept_bound_frame, decode_frame, decode_transport_ack, encode_frame, encode_transport_ack,
+        fits_esb_payload, required_esb_payload_len, validate_payload_length,
     };
     use crate::error::Error;
 
@@ -347,6 +400,19 @@ mod tests {
             }
         );
         assert_eq!(decoded_payload, payload);
+    }
+
+    #[test]
+    fn transport_ack_round_trips() {
+        let mut buf = [0u8; TRANSPORT_ACK_LEN];
+        let ack = TransportAck::new(3, 9);
+
+        encode_transport_ack(ack, &mut buf).unwrap();
+
+        assert_eq!(decode_transport_ack(&buf), Ok(ack));
+        assert_eq!(decode_transport_ack(&buf[..3]), Err(Error::InvalidParam));
+        buf[0] = 0;
+        assert_eq!(decode_transport_ack(&buf), Err(Error::InvalidParam));
     }
 
     #[test]
