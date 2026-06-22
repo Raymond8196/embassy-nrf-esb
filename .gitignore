@@ -1,9 +1,10 @@
 /target
 *.hex
 *.uf2
-*_dfu.zip
+*.zip
 *.jsonl
 opencode.json
 /.agents/
 session-*.md
 plans/
+.DS_Store
