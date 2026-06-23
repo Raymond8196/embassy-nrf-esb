@@ -59,10 +59,10 @@ git dependency). nRF54L support remains out of scope for now.
 | Product priority | RMK prototype before finalizing the MPSL abstraction | The real RMK transport will expose the API shape that matters. Avoid designing a polished wrapper around diagnostic assumptions. | RMK split docs state that RMK supports multi-split keyboards and central-to-peripheral communication independently from host transport. |
 | RMK payload strategy | Carry RMK's existing serialized split message bytes; do not invent a parallel keyboard protocol first | This minimizes RMK-side blast radius and keeps this crate focused on radio transport. Add only a small ESB transport header for version, device id, sequence number, flags, and length. | RMK split docs describe split central/peripheral communication as a transport abstraction; current local review notes identify `SplitMessage` as the payload contract. |
 | ESB compatibility claim | Claim Nordic ESB packet/protocol compatibility, not Gazell wire compatibility | Gazell adds behavior above ESB. The immediate RMK path migrates both sides, so Gazell compatibility is not required. | Nordic ESB documentation describes ESB as a basic bidirectional packet protocol with ACK and retransmission. |
-| Pipe handling | Treat pipe as packet metadata via `send_to()` / `send_no_ack_to()` and pipe-filtered ACK queues | Multi-peripheral keyboards cannot rely on mutable ambient `set_pipe()` state when traffic can queue or tasks can interleave. | Current implementation in `src/isr.rs` and `src/payload.rs`; multi-pipe hardware regression in `docs/m10-verification.md`. |
+| Pipe handling | Treat pipe as packet metadata via `send_to()` / `send_no_ack_to()` and pipe-filtered ACK queues | Multi-peripheral keyboards cannot rely on mutable ambient `set_pipe()` state when traffic can queue or tasks can interleave. | Current implementation in `src/isr.rs` and `src/payload.rs`; multi-pipe hardware regression in `docs/archive/m10-verification.md`. |
 | MPSL slot ending | End using an in-slot TIMER0 compare before the granted slot expires | The application is responsible for tracking slot time and leaving enough cleanup margin before the slot ends. | `nrf-mpsl-sys::mpsl_timeslot_request` docs. |
 | MPSL callback design | Keep callback work deterministic and minimal; do not use normal async/locking primitives in the high-priority path | MPSL callbacks and high-priority radio work are timing-sensitive. Current Rust path should use atomics/wakers and tightly controlled mutexes only where proven safe. | Nordic DevZone MPSL guide; `nrf-mpsl` Rust examples and interrupt handlers. |
-| BLE coexistence tuning | Treat BLE connection interval, slave latency, ESB slot length, packet density, and priority as first-class parameters | Active BLE connection consumes materially more radio budget than advertising-only. Existing runs show relaxed connection parameters restore useful ESB ACK coverage. | Nordic DevZone guide notes priority and BLE slave latency as scheduling tools; current hardware logs in `docs/m10-verification.md`. |
+| BLE coexistence tuning | Treat BLE connection interval, slave latency, ESB slot length, packet density, and priority as first-class parameters | Active BLE connection consumes materially more radio budget than advertising-only. Existing runs show relaxed connection parameters restore useful ESB ACK coverage. | Nordic DevZone guide notes priority and BLE slave latency as scheduling tools; current hardware logs in `docs/archive/m10-verification.md`. |
 | Public Embassy style | Consume Embassy peripheral singletons (`Peri<'static, T>`) and use `bind_interrupts!` or explicit ISR hooks | This matches Embassy's ownership and interrupt-binding style and keeps normal users away from PAC details. | Embassy `embassy-nrf` docs for `Peri`, `Peripherals`, and `bind_interrupts!`. |
 | MPSL dependency boundary | Keep MPSL and nRF SDC under optional features/examples; do not make them part of the pure ESB core | MPSL and SDC involve Nordic binary libraries and special interrupt/critical-section requirements. Core ESB should remain small and publishable. | `nrf-mpsl` docs; `nrf-softdevice` notes on binary stacks, reserved resources, and critical-section constraints. |
 
@@ -78,7 +78,7 @@ Goal: make the current state explicit and create a no-regression gate.
   - Mark MPSL timeslot examples as experimental/diagnostic until the owned wrapper lands.
   - Document HFCLK ownership in exclusive and MPSL modes.
   - Document supported chip features and reserved status for nRF52833/nRF52832.
-- Update `docs/m10-verification.md`:
+- Update `docs/archive/m10-verification.md`:
   - Reconcile the top status table with the later 2026-05-20 hardware results.
   - Split outcomes into "passed", "functional but needs tuning", and "not started".
   - Keep active BLE pipe 1 throughput as an explicit blocker.
@@ -169,7 +169,7 @@ Run on two nRF52840 dongles or equivalent boards:
 ### Acceptance
 
 - Host tests cover all PAC-free protocol and buffer invariants.
-- Hardware long-runs are recorded in `docs/m9-verification.md` or a new `docs/core-verification.md`.
+- Hardware long-runs are recorded in `docs/archive/m9-verification.md` or a new `docs/core-verification.md`.
 - Exclusive ESB can be treated as a release candidate for RMK prototyping.
 
 ## Phase 3: RMK ESB Transport MVP
@@ -401,7 +401,7 @@ Official and project references to use while executing this plan:
 - Nordic ESB user guide: https://developer.nordicsemi.com/nRF51_SDK/nRF51_SDK_v4.x.x/doc/html/group__esb__users__guide.html
 - nRF SoftDevice Rust community reference: https://github.com/embassy-rs/nrf-softdevice
 - Community MPSL timeslot wrapper reference: https://github.com/inductivekickback/timeslot
-- Local current verification log: `docs/m10-verification.md`
-- Local lessons learned: `docs/m10-lessons-learned.md`
+- Local current verification log: `docs/archive/m10-verification.md`
+- Local lessons learned: `docs/archive/m10-lessons-learned.md`
 - Local review backlog: `docs/review-fix-backlog.md`
 

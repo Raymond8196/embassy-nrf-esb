@@ -160,7 +160,7 @@ buffer ────────────────────────�
 - [Core ESB Verification](docs/core-verification.md)
 - [Alpha Testing Guide](docs/alpha-testing.md)
 - [RMK ESB Integration Notes](docs/rmk-integration.md)
-- [M10 MPSL Verification](docs/m10-verification.md)
+- [M10 MPSL Verification](docs/archive/m10-verification.md)
 - [ESB+BLE Coexistence Analysis](docs/esb-ble-coexistence-analysis.md)
 
 ## License

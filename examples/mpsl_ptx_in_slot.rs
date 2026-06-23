@@ -4,7 +4,7 @@
 //! sends up to 10 ACK packets back-to-back, and waits for ACKs.
 //! Runs 100 chained slots (~600 ms at 6 ms each), 1000 total packets.
 //!
-//! Pass criteria (docs/m10-plan.md Step 4):
+//! Pass criteria (docs/archive/m10-plan.md Step 4):
 //!   - 100 slots completed, tx_count >= 900, 0 OVERSTAYED.
 //!   - PID continuity across slot boundaries verified by PRX.
 //!   - PRX duplicates == 0 (requires M9 prx_usb on second board).

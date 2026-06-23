@@ -3,7 +3,7 @@
 Created: 2026-05-20
 
 This document tracks verification for the non-MPSL ESB core. MPSL/BLE
-coexistence remains in `docs/m10-verification.md`.
+coexistence remains in `docs/archive/m10-verification.md`.
 
 ## Scope
 

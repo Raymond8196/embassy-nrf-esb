@@ -4,7 +4,7 @@
 //! arms TIMER0 CC[0] at 4.5 ms to end the slot. Loops 100 times and
 //! prints per-run signal counters. No ESB.
 //!
-//! Pass criteria (docs/m10-plan.md Step 1):
+//! Pass criteria (docs/archive/m10-plan.md Step 1):
 //!   - Per run: start=1 timer0=1 radio=0 idle=1 blocked=0 cancelled=0.
 //!   - 100/100 runs complete successfully.
 

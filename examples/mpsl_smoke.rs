@@ -8,7 +8,7 @@
 //! any baud, e.g.:
 //!     screen /dev/cu.usbmodemXXXX
 //!
-//! Pass criteria (docs/m10-plan.md Step 0):
+//! Pass criteria (docs/archive/m10-plan.md Step 0):
 //!   - "MPSL build revision: <hex>" line appears once (16 non-zero bytes).
 //!   - "tick N: temp = <20..35> C" repeats every 5 s.
 //!   - 30 min continuous run with no panic.

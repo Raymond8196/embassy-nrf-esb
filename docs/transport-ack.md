@@ -22,7 +22,7 @@ no ACK arrives. That is enough for a single packet inside a single radio
 session, but a split keyboard needs more:
 
 - Frames must outlive a single radio session. Under MPSL timesharing, the radio
-  is periodically taken away from ESB for BLE (`docs/m10-verification.md`),
+  is periodically taken away from ESB for BLE (`docs/archive/m10-verification.md`),
   which means a frame queued at time T may not be delivered until a later ESB
   timeslot.
 - The central (left half) may reboot or re-pair. After a restart the PRX side
@@ -371,7 +371,7 @@ Two details worth calling out from this example:
 - **Single-pipe backchannel.** The transport ACK rides inside an ESB ACK
   payload, so its bandwidth is bounded by the PRX->PTX ACK payload size and by
   the radio schedule. Under MPSL coexistence this backchannel is the
-  scarce direction; see `docs/m10-verification.md` for measured ACK return rates
+  scarce direction; see `docs/archive/m10-verification.md` for measured ACK return rates
   under various PRX slot profiles.
 - **No ACK-in-frame today.** `FLAG_ACK` is defined and round-trips, but the
   current transport ACK path is always carried as an ESB ACK payload, never as a

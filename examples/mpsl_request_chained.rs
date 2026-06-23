@@ -4,7 +4,7 @@
 //! Also tests BLOCKED recovery by running a second round with an
 //! intentionally impossible first request (1 µs timeout).
 //!
-//! Pass criteria (docs/m10-plan.md Step 2):
+//! Pass criteria (docs/archive/m10-plan.md Step 2):
 //!   - Round 1: 100 slots, start=100 timer0=100, total time 500–600 ms.
 //!   - Round 2 (BLOCKED test): blocked >= 1, then recovery to start=100.
 
