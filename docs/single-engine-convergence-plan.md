@@ -363,22 +363,43 @@ tag before PTX (S6) starts.
 
 ### Single-dongle work still available before S5
 
-- Add host-side/unit coverage for the new diagnostic ACK fallback and RX-drain
-  behavior by factoring the pure payload/counter pieces into testable helpers.
-- Tighten `TimeslotPrxDriver` API shape before it becomes public surface: decide
-  whether diagnostic-only methods should remain in the trait or move behind a
-  session wrapper/internal adapter.
-- Implement the S4-d `EsbTimeslotPrx` wrapper skeleton around
-  `open_prx_session`/`set_prx_driver`/`clear_prx_driver`, with compile-only tests
-  and docs. Single-dongle smoke can verify open/start/drop lifecycle and driver
-  cleanup, but not RX/ACK correctness.
-- Add a single-dongle regression example or script that flashes
-  `mpsl_3mode_central`, captures CDC logs for a fixed window, and asserts the
-  smoke invariants: CDC up, converged active, `s/t0 > 0`, `iv/ov/dt/sc == 0`,
-  and `rx=rd=0` accepted in no-peer mode.
-- Do PTX S6 design-only preparation: factor the reusable timer-mode interface and
-  keep it compile-checked. Hardware acceptance for PTX still waits for S7 with a
-  peer dongle.
+These items were listed as pre-S5 single-dongle work. All have been completed
+or superseded by the merge + S6:
+
+- ~~Host tests for diagnostic ACK fallback and RX-drain~~ — done (54/0 → 70/0
+  after merge).
+- ~~Tighten `TimeslotPrxDriver` API shape~~ — done (`ts_configure` in trait).
+- ~~S4-d `EsbTimeslotPrx` wrapper skeleton~~ — done.
+- ~~Single-dongle regression script~~ — done (`scripts/smoke_single_dongle_3mode.py`).
+- ~~PTX S6 design-only preparation~~ — done (S6 fully implemented, not just design).
+
+- **2026-06-23** — Merge + S6 + cleanup landed on `feat/single-engine-convergence`:
+  - **Merge:** `feat/mpsl-timeslot` merged into the convergence branch (transport
+    ACK protocol, CI gates, clippy `-D warnings`, elytra UF2 layout,
+    `left_central` PRX firmware). Resolved 2 conflicts (`.gitignore`,
+    `mpsl_timeslot.rs` — kept `EsbTimeslotPrx` wrapper above the upgraded
+    `open_prx_session` pair).
+  - **S6 (PTX convergence):** `PtxStateMachine` gained `ts_start_tx` /
+    `ts_on_radio` / `ts_force_stop` entrypoints (mirroring PRX S4).
+    `EsbPtx::new_timeslot` constructor, `TimeslotPtxDriver` trait + impl.
+    `ptx_timeslot_callback` dispatches through `driver.ts_*()` when registered;
+    legacy inline path preserved as fallback. TIMER0 CC[1] ACK-timeout and CC[0]
+    slot-end remain mpsl-layer owned (D1=B2: protocol logic in the SM, timing
+    source split by mode). `set_ptx_driver` / `clear_ptx_driver` API +
+    `EsbTimeslotPtx` lifecycle wrapper.
+  - **Cleanup:** 7 historical docs archived to `docs/archive/`; 2 debug examples
+    deleted (`ptx_debug`, `prx_debug`); `review-fix-backlog.md` compressed
+    293 → 33 lines.
+  - **Verified:** fmt clean, host tests 70/0, exclusive + mpsl cargo check,
+    feature-conflict fires, clippy `-D warnings` clean. CI 4/4 green.
+  - **Safety for hardware testing:** S6 code is entirely behind
+    `if let Some(driver) = state.driver` guards in every PTX signal branch.
+    Elytra (`left_central.rs` + `main.rs`) does NOT call `set_prx_driver` /
+    `set_ptx_driver`, so it runs the legacy inline engine unchanged. PRX
+    callback was not touched by S6 at all.
+  - **Pending S5/S7:** full PRX + PTX hardware verification needs Elytra boards.
+    Legacy path is the default until a driver is registered.
+
 
 - **2026-06-16 single-dongle prep follow-up:**
   - Added host tests for the review-fix invariants: `PacketPool::discard_received`
