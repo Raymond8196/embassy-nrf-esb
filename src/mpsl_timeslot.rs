@@ -1409,39 +1409,36 @@ unsafe extern "C" fn ptx_timeslot_callback(
         }),
 
         raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PTX_STATE.with_inner(|state| {
-                state.counters.overstayed += 1;
-                state.phase = PtxPhase::Idle;
-                if state.poll_pipes > 0 {
-                    state.schedule_lock_active = false;
-                    state.schedule_lock_miss_streak = 0;
-                    state.schedule_next_distance_us = 0;
-                    state.schedule_reacquire_count += 1;
-                    ptx_set_earliest_request(
-                        state,
-                        TIMESLOT_PRIORITY_HIGH,
-                        raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US,
-                    );
+            state.counters.overstayed += 1;
+            state.phase = PtxPhase::Idle;
+            if state.poll_pipes > 0 {
+                state.schedule_lock_active = false;
+                state.schedule_lock_miss_streak = 0;
+                state.schedule_next_distance_us = 0;
+                state.schedule_reacquire_count += 1;
+                ptx_set_earliest_request(
+                    state,
+                    TIMESLOT_PRIORITY_HIGH,
+                    raw::MPSL_TIMESLOT_EARLIEST_TIMEOUT_MAX_US,
+                );
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+            } else {
+                if state.event_mode {
+                    state.event_result_ready = true;
+                    state.event_pending = false;
+                    state.event_ack_ok = false;
+                    state.waker.wake();
                     state.return_param.callback_action =
-                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-                    state.return_param.params.request.p_next =
-                        core::ptr::from_mut(&mut state.request);
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
                 } else {
-                    if state.event_mode {
-                        state.event_result_ready = true;
-                        state.event_pending = false;
-                        state.event_ack_ok = false;
-                        state.waker.wake();
-                        state.return_param.callback_action =
-                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
-                    } else {
-                        state.done = true;
-                        state.waker.wake();
-                        state.return_param.callback_action =
-                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
-                    }
+                    state.done = true;
+                    state.waker.wake();
+                    state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
                 }
-                &mut state.return_param as *mut _
-            }),
+            }
+            &mut state.return_param as *mut _
+        }),
 
         _ => PTX_STATE.with_inner(|state| {
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;

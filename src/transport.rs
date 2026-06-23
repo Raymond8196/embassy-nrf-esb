@@ -593,7 +593,8 @@ mod tests {
 
     #[test]
     fn encode_decode_transport_ack_round_trips_typical_and_boundary_values() {
-        for (device_id, sequence) in [(0u8, 0u8), (1, 1), (3, 9), (254, 255), (255, 255), (255, 0)] {
+        for (device_id, sequence) in [(0u8, 0u8), (1, 1), (3, 9), (254, 255), (255, 255), (255, 0)]
+        {
             let mut buf = [0u8; TRANSPORT_ACK_LEN];
             let ack = TransportAck::new(device_id, sequence);
 
