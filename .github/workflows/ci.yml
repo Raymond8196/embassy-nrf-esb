@@ -76,6 +76,8 @@ jobs:
         run: cargo check --example ptx_suspend_usb --features nrf52840,_cs-cortex
       - name: PRX idle USB
         run: cargo check --example prx_idle_usb --features nrf52840,_cs-cortex
+      - name: Dongle central (G2)
+        run: cargo check --example dongle_central --features nrf52840,defmt,_cs-cortex
 
   examples-mpsl:
     name: MPSL examples

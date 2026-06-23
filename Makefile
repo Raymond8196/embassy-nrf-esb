@@ -1,6 +1,6 @@
 EXAMPLES    := usb_minimal ptx_silent prx_usb
 EXCLUSIVE_DEFFMT_EXAMPLES := ptx_basic prx_basic ptx_multipipe ptx_suspend
-EXCLUSIVE_USB_EXAMPLES := prx_usb ptx_silent usb_minimal ptx_ack_echo ptx_multipipe_ack prx_multipipe_usb ptx_noack_usb prx_noack_usb ptx_suspend_usb prx_idle_usb
+EXCLUSIVE_USB_EXAMPLES := prx_usb ptx_silent usb_minimal ptx_ack_echo ptx_multipipe_ack prx_multipipe_usb ptx_noack_usb prx_noack_usb ptx_suspend_usb prx_idle_usb dongle_central
 MPSL_EXAMPLES := mpsl_smoke mpsl_request_basic mpsl_request_chained mpsl_ptx_in_slot mpsl_prx_in_slot mpsl_prx_ble mpsl_ble_connectable mpsl_3mode_poll mpsl_3mode_central mpsl_3mode_event mpsl_ptx_continuous
 RUSTFMT_CHECK_FILES := src/lib.rs src/mpsl_common.rs src/mpsl_profile.rs src/mpsl_radio.rs src/mpsl_timeslot.rs src/payload.rs src/transport.rs examples/mpsl_3mode_poll.rs examples/mpsl_3mode_central.rs
 RELEASE_DIR := target/thumbv7em-none-eabihf/release/examples
