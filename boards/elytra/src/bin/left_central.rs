@@ -4,7 +4,7 @@
 #![no_main]
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use bt_hci::cmd::SyncCmd;
 use bt_hci::cmd::controller_baseband::SetEventMask;
@@ -20,6 +20,7 @@ use embassy_futures::select::{Either, select};
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::{bind_interrupts, peripherals, rng, usb};
+use embassy_time::Timer;
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
@@ -82,6 +83,14 @@ static RIGHT_ROWS_STATE: [AtomicU8; ROWS] = [
 static RIGHT_DIRTY: AtomicBool = AtomicBool::new(false);
 static RIGHT_SEQUENCE: AtomicU8 = AtomicU8::new(0);
 static RIGHT_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Timestamp (embassy ticks) of the last received right-half packet.
+/// `hid_task` uses this to detect ESB link loss and release stale keys.
+static RIGHT_LAST_SEEN_MS: AtomicU32 = AtomicU32::new(0);
+/// Whether the PRX (right-half ESB) session is active. Set by `prx_task`;
+/// read by `hid_task` to know whether link-loss timeout applies.
+static PRX_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Signal to force an all-keys-up HID report (BLE disconnect, link loss, etc.).
+static HID_CLEAR_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SMP_STATE: Mutex<CriticalSectionRawMutex, RefCell<SmpState>> =
     Mutex::new(RefCell::new(SmpState::new()));
 
@@ -160,7 +169,15 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 
 #[embassy_executor::task]
 async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
-    let _hfclk = mpsl.request_hfclk().await.unwrap();
+    let _hfclk = loop {
+        match mpsl.request_hfclk().await {
+            Ok(guard) => break guard,
+            Err(e) => {
+                defmt::warn!("HFCLK request failed: {:?}, retrying in 500ms", e);
+                Timer::after_millis(500).await;
+            }
+        }
+    };
     core::future::pending().await
 }
 
@@ -249,14 +266,22 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     )
     .unwrap();
     let cfg = PrxSlotConfig::for_profile(CoexistenceProfile::NordicExtend);
-    let mut session = open_prx_session_with_ack_extension(
-        mpsl,
-        &esb_cfg,
-        &esb_addr,
-        cfg,
-        Some(right_transport_ack_extension),
-    )
-    .unwrap();
+    let mut session = loop {
+        match open_prx_session_with_ack_extension(
+            mpsl,
+            &esb_cfg,
+            &esb_addr,
+            cfg,
+            Some(right_transport_ack_extension),
+        ) {
+            Ok(s) => break s,
+            Err(e) => {
+                defmt::warn!("PRX session open failed: {:?}, retrying in 1s", e);
+                Timer::after_secs(1).await;
+            }
+        }
+    };
+    PRX_ACTIVE.store(true, Ordering::Release);
     let bindings = StaticBindingTable::<8>::from_pipe_entries([
         None,
         Some(RIGHT_DEVICE_ID),
@@ -299,6 +324,13 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
                         continue;
                     }
                 };
+
+                // Update link-loss watchdog timestamp on every valid frame.
+                RIGHT_LAST_SEEN_MS.store(
+                    embassy_time::Instant::now().as_millis() as u32,
+                    Ordering::Release,
+                );
+
                 if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
                     let mut changed_count = 0u8;
                     for r in 0..ROWS {
@@ -372,12 +404,61 @@ fn apply_right_snapshot(active: &mut [bool; TOTAL_KEYS]) {
     }
 }
 
+/// Clear all right-half key state and flag the HID task to send an updated report.
+fn clear_right_keys() {
+    for row in 0..ROWS {
+        RIGHT_ROWS_STATE[row].store(0, Ordering::Release);
+    }
+    RIGHT_DIRTY.store(true, Ordering::Release);
+    RIGHT_CHANGED.signal(());
+}
+
+/// Request the HID task to send an all-keys-up report on the next iteration.
+/// Called on mode switch, panic recovery, or other forced key-release paths.
+#[allow(dead_code)]
+fn request_hid_clear() {
+    HID_CLEAR_REQUESTED.store(true, Ordering::Release);
+}
+
 #[embassy_executor::task]
 async fn hid_task(sdc: &'static SoftdeviceController<'static>) {
     let mut active = [false; TOTAL_KEYS];
+    /// ESB link-loss timeout: if no right-half frame in this duration, release
+    /// all right-half keys to prevent stuck keys. Right half sends snapshots
+    /// every ~2ms scan; 500ms covers worst-case BLE-preempted gaps.
+    const LINK_LOSS_TIMEOUT_MS: u32 = 500;
+
     loop {
         let mut changed = false;
         let mut right_changed = false;
+
+        // Check for explicit HID clear request (BLE disconnect, etc.).
+        if HID_CLEAR_REQUESTED.swap(false, Ordering::AcqRel) {
+            // Clear all keys.
+            active = [false; TOTAL_KEYS];
+            changed = true;
+        }
+
+        // ESB link-loss watchdog: if PRX is active but no right-half data
+        // has arrived within the timeout, clear right-half key state.
+        if PRX_ACTIVE.load(Ordering::Acquire) {
+            let last_seen = RIGHT_LAST_SEEN_MS.load(Ordering::Acquire);
+            if last_seen > 0 {
+                let now = embassy_time::Instant::now().as_millis() as u32;
+                if now.saturating_sub(last_seen) > LINK_LOSS_TIMEOUT_MS {
+                    let any_right_held = RIGHT_ROWS_STATE
+                        .iter()
+                        .any(|r| r.load(Ordering::Acquire) != 0);
+                    if any_right_held {
+                        clear_right_keys();
+                        defmt::warn!(
+                            "ESB link-loss: no right-half data for {}ms, clearing keys",
+                            now.saturating_sub(last_seen)
+                        );
+                    }
+                }
+            }
+        }
 
         if RIGHT_DIRTY.swap(false, Ordering::AcqRel) {
             apply_right_snapshot(&mut active);
@@ -589,7 +670,9 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) -> bool {
         CONN_HANDLE.store(CONN_NONE, Ordering::Relaxed);
         HID_NOTIFY_ENABLED.store(false, Ordering::Relaxed);
         SMP_STATE.lock(|s| s.borrow_mut().reset_pairing());
-        defmt::info!("BLE disconnected");
+        // Clear right-half keys so stale state cannot survive BLE disconnect.
+        clear_right_keys();
+        defmt::info!("BLE disconnected, cleared right-half keys");
         return true;
     }
     if buf[0] == 0x08 && buf.len() >= 6 {
