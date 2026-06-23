@@ -17,10 +17,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,thumbv7em-none-eabihf
+          components: clippy
       - name: Format
         run: cargo fmt --check
       - name: Host unit tests
         run: cargo test --lib --target x86_64-unknown-linux-gnu --features nrf52840
+      - name: Clippy (lib)
+        run: cargo clippy --lib --target x86_64-unknown-linux-gnu --features nrf52840 -- -D warnings
       - name: Feature check without MPSL
         run: cargo check --features nrf52840,_cs-cortex
       - name: Feature check with MPSL
@@ -96,3 +99,28 @@ jobs:
         run: cargo check --example mpsl_prx_ble --features nrf52840,defmt,mpsl
       - name: MPSL BLE connectable diagnostic
         run: cargo check --example mpsl_ble_connectable --features nrf52840,defmt,mpsl
+      - name: MPSL PTX continuous
+        run: cargo check --example mpsl_ptx_continuous --features nrf52840,defmt,mpsl
+      - name: MPSL 3-mode central
+        run: cargo check --example mpsl_3mode_central --features nrf52840,defmt,mpsl
+      - name: MPSL 3-mode event
+        run: cargo check --example mpsl_3mode_event --features nrf52840,defmt,mpsl
+      - name: MPSL 3-mode poll
+        run: cargo check --example mpsl_3mode_poll --features nrf52840,defmt,mpsl
+
+  # Elytra is the real split-keyboard product firmware (nRF52833, MPSL). It is a
+  # separate workspace under boards/elytra and still in active development, so
+  # it is non-blocking here until the split bring-up stabilizes.
+  elytra:
+    name: Elytra board (nRF52833)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+      - name: Elytra event (peripheral half)
+        run: cargo check --manifest-path boards/elytra/Cargo.toml --bin elytra-event
+      - name: Elytra left central
+        run: cargo check --manifest-path boards/elytra/Cargo.toml --bin elytra-left-central

@@ -15,6 +15,10 @@ publish = false
 name = "elytra-event"
 path = "src/main.rs"
 
+[[bin]]
+name = "elytra-left-central"
+path = "src/bin/left_central.rs"
+
 [dependencies]
 # The ESB library, built for nRF52833. `default-features = false` opts out of the
 # library's build.rs memory.x injection; this crate supplies its own (build.rs).
@@ -35,6 +39,7 @@ embassy-executor = { version = "0.10", features = [
     "platform-cortex-m",
     "executor-thread",
 ] }
+embassy-futures = "0.1"
 embassy-sync = "0.8"
 embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
 embassy-usb = "0.6"

@@ -1,4 +1,4 @@
-//! Elytra (nRF52833) peripheral-half firmware: real key matrix -> ESB event PTX.
+//! Elytra (nRF52833) right/peripheral-half firmware: real key matrix -> ESB event PTX.
 //!
 //! Port of `examples/mpsl_3mode_event.rs` onto the Elytra split-keyboard
 //! peripheral half. The placeholder 2x2 dongle matrix + on-board SW1 are
@@ -17,27 +17,21 @@
 #![no_main]
 
 use core::fmt::Write as FmtWrite;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use bt_hci::cmd::controller_baseband::SetEventMask;
-use bt_hci::cmd::le::{LeConnUpdate, LeSetAdvData, LeSetAdvEnable, LeSetAdvParams, LeSetEventMask};
-use bt_hci::cmd::{AsyncCmd, SyncCmd};
-use bt_hci::param::{
-    AdvChannelMap, AdvFilterPolicy, AdvKind, BdAddr, ConnHandle, EventMask, LeEventMask,
-};
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::usb::Driver as UsbDriver;
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
-use embassy_nrf::{bind_interrupts, peripherals, rng, usb};
+use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::Instant;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
-use nrf_sdc::vendor::ZephyrWriteBdAddr;
-use nrf_sdc::{self as sdc, SoftdeviceController};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -47,13 +41,13 @@ use embassy_nrf_esb::mpsl_schedule::{LinkTiming, LinkTimingConfig, LinkTimingMod
 use embassy_nrf_esb::mpsl_timeslot::{
     CoexistenceProfile, PtxEventConfig, SignalCounters, open_event_session,
 };
+use embassy_nrf_esb::transport;
 
-type Rng = rng::Rng<'static, embassy_nrf::mode::Blocking>;
 type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 
 const LOG_BUF_SIZE: usize = 256;
-const MAX_RETRIES: u8 = 5;
-const RETRY_DELAY_MS: u64 = 2;
+const RETRY_DELAY_US: u64 = 250;
+const RIGHT_DEVICE_ID: u8 = 0;
 const ENABLE_FIRST_ATTEMPT_ALIGNMENT: bool = false;
 const ENABLE_HINT_RETRY_WAIT: bool = false;
 const MIN_HINT_RETRY_GAP_US: u32 = 500;
@@ -67,26 +61,32 @@ const LINK_TIMING_CONFIG: LinkTimingConfig = LinkTimingConfig {
 static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_SIZE>, 4> =
     Channel::new();
 
-// ---- Elytra key matrix event source (5 rows x 8 cols, col2row) ----
+// ---- Elytra right-hand key matrix event source (5 rows x 8 cols, col2row) ----
 //
 // Columns are driven outputs (idle low, pulsed high one at a time); rows are
 // pulled-down inputs that read high when a pressed key bridges the active
 // column. Pins mirror the Elytra peripheral half (HaoboGu/utb `feat/update`,
 // firmware/src/peripheral.rs). Scanning never requests a timeslot; only a real
-// press/release transition is pushed onto KEY_CHANNEL.
+// press/release transition updates a compact matrix snapshot. The ESB sender
+// retries the latest snapshot instead of serializing individual edges.
 
 const MATRIX_ROWS: usize = 5;
 const MATRIX_COLS: usize = 8;
 const SCAN_INTERVAL_MS: u64 = 2;
 const COL_SETTLE_US: u64 = 5;
 
-#[derive(Clone, Copy)]
-struct KeyEvent {
-    key_id: u8,
-    pressed: bool,
-}
+const SNAPSHOT_MSG: u8 = 0x53;
+const SNAPSHOT_PAYLOAD_LEN: usize = 1 + MATRIX_ROWS;
 
-static KEY_CHANNEL: Channel<CriticalSectionRawMutex, KeyEvent, 16> = Channel::new();
+static MATRIX_ROWS_STATE: [AtomicU8; MATRIX_ROWS] = [
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+];
+static MATRIX_DIRTY: AtomicBool = AtomicBool::new(false);
+static MATRIX_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[embassy_executor::task]
 async fn matrix_scan_task(
@@ -108,20 +108,34 @@ async fn matrix_scan_task(
                 }
                 if pressed != state[r][c] {
                     state[r][c] = pressed;
-                    let key_id = (r * MATRIX_COLS + c) as u8;
                     defmt::info!("edge r={} c={} pr={}", r, c, pressed as u8);
-                    // Drop on overflow: a full channel means the link is far
-                    // behind; losing an edge is better than blocking the scan.
-                    let _ = KEY_CHANNEL.try_send(KeyEvent { key_id, pressed });
                 }
             }
             raw[c] = mask;
             col.set_low();
         }
 
-        // Raw matrix-snapshot diagnostic: every ~500ms emit each column's
-        // row-readback bitmask (bit r set => row input r read high while that
-        // column was driven). Lets us see which input pins respond at all.
+        let mut rows = [0u8; MATRIX_ROWS];
+        for r in 0..MATRIX_ROWS {
+            let mut row_mask = 0u8;
+            for c in 0..MATRIX_COLS {
+                if state[r][c] {
+                    row_mask |= 1 << c;
+                }
+            }
+            rows[r] = row_mask;
+        }
+        let mut changed = false;
+        for r in 0..MATRIX_ROWS {
+            if MATRIX_ROWS_STATE[r].swap(rows[r], Ordering::AcqRel) != rows[r] {
+                changed = true;
+            }
+        }
+        if changed {
+            MATRIX_DIRTY.store(true, Ordering::Release);
+            MATRIX_CHANGED.signal(());
+        }
+
         tick = tick.wrapping_add(1);
         if tick % 250 == 0 {
             let mut dbg = [0u8; LOG_BUF_SIZE];
@@ -141,7 +155,6 @@ async fn matrix_scan_task(
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
-    RNG => rng::InterruptHandler<peripherals::RNG>;
     EGU0_SWI0 => nrf_mpsl::LowPrioInterruptHandler;
     CLOCK_POWER => nrf_mpsl::ClockInterruptHandler;
     RADIO => nrf_mpsl::HighPrioInterruptHandler;
@@ -158,19 +171,6 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     let _hfclk = mpsl.request_hfclk().await.unwrap();
     core::future::pending().await
-}
-
-#[embassy_executor::task]
-async fn sdc_task(sdc: &'static SoftdeviceController<'static>) -> ! {
-    let mut evt_buf = [0u8; sdc::raw::HCI_MSG_BUFFER_MAX_SIZE as usize];
-    loop {
-        match sdc.hci_get(&mut evt_buf).await {
-            Ok(bt_hci::PacketKind::AclData) => handle_acl(sdc, &evt_buf),
-            Ok(bt_hci::PacketKind::Event) => handle_hci_event(sdc, &evt_buf).await,
-            Ok(_) => {}
-            Err(e) => defmt::warn!("sdc error: {:?}", e),
-        }
-    }
 }
 
 #[embassy_executor::task]
@@ -227,177 +227,9 @@ fn link_mode_id(mode: LinkTimingMode) -> u8 {
     }
 }
 
-async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
-    if buf.len() < 2 {
-        return;
-    }
-    if buf[0] != 0x3e {
-        return;
-    }
-    let event_len = buf[1] as usize;
-    if buf.len() < 2 + event_len || event_len < 2 {
-        return;
-    }
-    let data = &buf[2..2 + event_len];
-    if data[1] == 0 && (data[0] == 1 || data[0] == 10) && data.len() >= 4 {
-        let handle = u16::from_le_bytes([data[2], data[3]]) & 0x0fff;
-        defmt::info!("BLE connected handle={}", handle);
-        let _ = LeConnUpdate::new(
-            ConnHandle::new(handle),
-            bt_hci::param::Duration::from_millis(100),
-            bt_hci::param::Duration::from_millis(100),
-            4,
-            bt_hci::param::Duration::from_millis(6000),
-            bt_hci::param::Duration::from_millis(0),
-            bt_hci::param::Duration::from_millis(0),
-        )
-        .exec(sdc)
-        .await;
-    }
-}
-
-fn handle_acl(sdc: &SoftdeviceController<'_>, buf: &[u8]) {
-    if buf.len() < 8 {
-        return;
-    }
-    let handle = u16::from_le_bytes([buf[0], buf[1]]) & 0x0fff;
-    let acl_len = u16::from_le_bytes([buf[2], buf[3]]) as usize;
-    if acl_len < 4 || buf.len() < 4 + acl_len {
-        return;
-    }
-    let l2cap_len = u16::from_le_bytes([buf[4], buf[5]]) as usize;
-    let cid = u16::from_le_bytes([buf[6], buf[7]]);
-    if buf.len() < 8 + l2cap_len {
-        return;
-    }
-    let payload = &buf[8..8 + l2cap_len];
-    match cid {
-        0x0004 => handle_att(sdc, handle, payload),
-        0x0005 => handle_l2cap_control(sdc, handle, payload),
-        0x0006 => handle_smp(sdc, handle, payload),
-        _ => {}
-    }
-}
-
-fn handle_att(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) {
-    if pdu.is_empty() {
-        return;
-    }
-    match pdu[0] {
-        0x02 => send_l2cap(sdc, handle, 0x0004, &[0x03, 23, 0]),
-        0x03 => {}
-        0x10 => {
-            let name = b"Elytra Evt";
-            let mut resp = [0u8; 64];
-            resp[0] = 0x11;
-            resp[1] = pdu.get(1).copied().unwrap_or(0);
-            resp[2] = pdu.get(2).copied().unwrap_or(0);
-            let end = 3 + name.len().min(61);
-            resp[3..end].copy_from_slice(&name[..end - 3]);
-            send_l2cap(sdc, handle, 0x0004, &resp[..end]);
-        }
-        0x52 => {
-            let resp = [0x13, pdu.get(1).copied().unwrap_or(0), 0x06];
-            send_l2cap(sdc, handle, 0x0004, &resp);
-        }
-        _ => {}
-    }
-}
-
-fn handle_l2cap_control(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) {
-    if pdu.is_empty() {
-        return;
-    }
-    if pdu[0] == 0x02 && pdu.len() >= 4 {
-        let resp = [0x03, pdu[1], pdu[2], pdu[3], 0x04, 0x00, 0x01, 0x00];
-        send_l2cap(sdc, handle, 0x0005, &resp);
-    }
-    if pdu[0] == 0x06 && pdu.len() >= 2 {
-        let resp = [0x07, pdu[1]];
-        send_l2cap(sdc, handle, 0x0005, &resp);
-    }
-}
-
-fn handle_smp(sdc: &SoftdeviceController<'_>, handle: u16, pdu: &[u8]) {
-    if pdu.is_empty() {
-        return;
-    }
-    if pdu[0] == 0x01 {
-        let resp = [0x03, 0x00, 0x00, 0x00, 0x00];
-        send_l2cap(sdc, handle, 0x0006, &resp);
-    }
-}
-
-fn send_l2cap(sdc: &SoftdeviceController<'_>, handle: u16, cid: u16, payload: &[u8]) {
-    let len = payload.len();
-    if len > 20 {
-        return;
-    }
-    let mut packet = [0u8; 31];
-    packet[0..2].copy_from_slice(&(handle & 0x0fff).to_le_bytes());
-    packet[2..4].copy_from_slice(&((len + 4) as u16).to_le_bytes());
-    packet[4..6].copy_from_slice(&(len as u16).to_le_bytes());
-    packet[6..8].copy_from_slice(&cid.to_le_bytes());
-    packet[8..8 + len].copy_from_slice(payload);
-    let _ = sdc.hci_data_put(&packet[..8 + len]);
-}
-
-fn bd_addr() -> BdAddr {
-    let ficr = embassy_nrf::pac::FICR;
-    let addr = (u64::from(ficr.deviceid(1).read()) << 32) | u64::from(ficr.deviceid(0).read());
-    BdAddr::new(
-        ((addr | 0x0000_c000_0000_0000).to_le_bytes()[..6])
-            .try_into()
-            .unwrap(),
-    )
-}
-
-async fn start_advertising(sdc: &SoftdeviceController<'_>) {
-    SetEventMask::new(
-        EventMask::new()
-            .enable_le_meta(true)
-            .enable_disconnection_complete(true),
-    )
-    .exec(sdc)
-    .await
-    .unwrap();
-    LeSetEventMask::new(
-        LeEventMask::new()
-            .enable_le_conn_complete(true)
-            .enable_le_enhanced_conn_complete(true),
-    )
-    .exec(sdc)
-    .await
-    .unwrap();
-    ZephyrWriteBdAddr::new(bd_addr()).exec(sdc).await.unwrap();
-    LeSetAdvParams::new(
-        bt_hci::param::Duration::from_millis(100),
-        bt_hci::param::Duration::from_millis(100),
-        AdvKind::AdvInd,
-        bt_hci::param::AddrKind::PUBLIC,
-        bt_hci::param::AddrKind::PUBLIC,
-        BdAddr::default(),
-        AdvChannelMap::ALL,
-        AdvFilterPolicy::default(),
-    )
-    .exec(sdc)
-    .await
-    .unwrap();
-    let adv_data = &[
-        0x02, 0x01, 0x06, 0x08, 0x09, b'E', b'l', b'y', b't', b'r', b'a',
-    ];
-    let mut data = [0u8; 31];
-    data[..adv_data.len()].copy_from_slice(adv_data);
-    LeSetAdvData::new(adv_data.len() as u8, data)
-        .exec(sdc)
-        .await
-        .unwrap();
-    LeSetAdvEnable::new(true).exec(sdc).await.unwrap();
-}
-
 // ---- Main ----
 
-const PROFILE: CoexistenceProfile = CoexistenceProfile::DiagnosticPipe1Prx12ms;
+const PROFILE: CoexistenceProfile = CoexistenceProfile::NordicExtend;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -431,28 +263,7 @@ async fn main(spawner: Spawner) {
     );
     spawner.spawn(mpsl_task(mpsl).unwrap());
     spawner.spawn(hfclk_task(mpsl).unwrap());
-
-    let sdc_p = sdc::Peripherals::new(
-        p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
-        p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
-    );
-    static RNG: StaticCell<Rng> = StaticCell::new();
-    let rng = RNG.init(rng::Rng::new_blocking(p.RNG));
-    static SDC_MEM: StaticCell<sdc::Mem<8192>> = StaticCell::new();
-    static SDC: StaticCell<SoftdeviceController> = StaticCell::new();
-    let sdc = SDC.init(
-        sdc::Builder::new()
-            .unwrap()
-            .support_adv()
-            .support_peripheral()
-            .peripheral_count(1)
-            .unwrap()
-            .build(sdc_p, rng, mpsl, SDC_MEM.init(sdc::Mem::new()))
-            .unwrap(),
-    );
-    start_advertising(sdc).await;
-    spawner.spawn(sdc_task(sdc).unwrap());
-    defmt::info!("BLE advertising as 'Elytra'");
+    defmt::info!("Right ESB PTX only; BLE disabled on this half");
 
     static VBUS: StaticCell<SoftwareVbusDetect> = StaticCell::new();
     let vbus: &'static SoftwareVbusDetect = VBUS.init(SoftwareVbusDetect::new(true, true));
@@ -479,7 +290,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(usb_task(usb_dev).unwrap());
     spawner.spawn(cdc_logger_task(cdc_class).unwrap());
 
-    // Real Elytra key matrix: 8 columns drive, 5 rows read with pulldown.
+    // Real Elytra right/peripheral-half key matrix from HaoboGu/utb
+    // `feat/update` firmware/src/peripheral.rs: 8 columns drive,
+    // 5 rows read with pulldown.
     let cols: [Output<'static>; MATRIX_COLS] = [
         Output::new(p.P0_00, Level::Low, OutputDrive::Standard),
         Output::new(p.P0_01, Level::Low, OutputDrive::Standard),
@@ -543,25 +356,33 @@ async fn main(spawner: Spawner) {
     let mut event_count: u32 = 0;
     let mut total_acked: u32 = 0;
     let mut total_sends: u32 = 0;
+    let mut sequence: u8 = 0;
     let mut link_timing = LinkTiming::new();
 
     loop {
-        // Block until a real key transition arrives. An untouched matrix
-        // produces no wakeup here, so the PTX issues no timeslot requests.
-        let key_ev = KEY_CHANNEL.receive().await;
+        while !MATRIX_DIRTY.swap(false, Ordering::AcqRel) {
+            MATRIX_CHANGED.wait().await;
+        }
+
         event_count += 1;
         let event_since_us = Instant::now().as_micros();
-        let report = [
-            key_ev.key_id,
-            key_ev.pressed as u8,
-            (event_count & 0xFF) as u8,
-            ((event_count >> 8) & 0xFF) as u8,
-        ];
-        let mut acked = false;
-        let mut attempts: u8 = 0;
+        let snapshot_seq = sequence;
+        sequence = sequence.wrapping_add(1);
+        let mut report = [0u8; SNAPSHOT_PAYLOAD_LEN];
+        report[0] = SNAPSHOT_MSG;
+        for r in 0..MATRIX_ROWS {
+            report[1 + r] = MATRIX_ROWS_STATE[r].load(Ordering::Acquire);
+        }
+        let mut frame = [0u8; 16];
+        let mut attempts: u32 = 0;
         let mut event_counters = SignalCounters::ZERO;
         let mut wait_us: u32 = 0;
-        let mut fallback_count: u8 = 0;
+        let mut fallback_count: u32 = 0;
+        let mut radio_ack_count: u32 = 0;
+        let mut transport_ack_count: u32 = 0;
+        let mut last_ack_dev: u8 = 0xff;
+        let mut last_ack_seq: u8 = 0xff;
+        let mut superseded = false;
 
         if ENABLE_FIRST_ATTEMPT_ALIGNMENT {
             let wait = link_timing.bounded_wait(Instant::now().as_micros(), LINK_TIMING_CONFIG);
@@ -574,31 +395,70 @@ async fn main(spawner: Spawner) {
         }
 
         loop {
-            attempts += 1;
-            total_sends += 1;
+            let flags = if attempts == 0 {
+                0
+            } else {
+                transport::FLAG_RETRANSMIT
+            };
+            let frame_len =
+                transport::encode_frame(RIGHT_DEVICE_ID, snapshot_seq, flags, &report, &mut frame)
+                    .unwrap();
 
-            let result = match session.send(&report).await {
+            attempts = attempts.saturating_add(1);
+            total_sends = total_sends.saturating_add(1);
+
+            let result = match session.send(&frame[..frame_len]).await {
                 Ok(r) => r,
                 Err(e) => {
                     defmt::warn!("send error: {:?}", e);
-                    log(b"[ERR] send\r\n");
-                    break;
+                    let mut err_buf = [0u8; LOG_BUF_SIZE];
+                    let mut ew = WriteBuf::new(&mut err_buf);
+                    let _ = write!(
+                        ew,
+                        "[ERR] send seq={} att={} err={:?} rows={},{},{},{},{}\r\n",
+                        snapshot_seq,
+                        attempts,
+                        e,
+                        report[1],
+                        report[2],
+                        report[3],
+                        report[4],
+                        report[5],
+                    );
+                    let err_len = ew.pos;
+                    log(&err_buf[..err_len]);
+                    fallback_count = fallback_count.saturating_add(1);
+                    embassy_time::Timer::after_micros(RETRY_DELAY_US).await;
+                    if MATRIX_DIRTY.load(Ordering::Acquire) {
+                        superseded = true;
+                        break;
+                    }
+                    continue;
                 }
             };
 
             event_counters = event_counters.saturating_add(result.counters);
 
             if result.ack_ok {
-                acked = true;
+                radio_ack_count = radio_ack_count.saturating_add(1);
                 if let Some(hint) = result.schedule_hint {
                     link_timing.observe_hint(Instant::now().as_micros(), hint);
                 }
-                break;
+                if let Some(extension) = result.ack_extension {
+                    if let Ok(ack) = transport::decode_transport_ack(extension.as_slice()) {
+                        transport_ack_count = transport_ack_count.saturating_add(1);
+                        last_ack_dev = ack.device_id;
+                        last_ack_seq = ack.sequence;
+                        if ack.matches(RIGHT_DEVICE_ID, snapshot_seq) {
+                            break;
+                        }
+                    }
+                }
             }
 
             link_timing.observe_miss(LINK_TIMING_CONFIG);
-
-            if attempts >= MAX_RETRIES {
+            if MATRIX_DIRTY.load(Ordering::Acquire) {
+                superseded = true;
                 break;
             }
 
@@ -606,7 +466,7 @@ async fn main(spawner: Spawner) {
                 let wait = link_timing.bounded_wait(Instant::now().as_micros(), LINK_TIMING_CONFIG);
                 if wait.fallback.is_some() {
                     fallback_count = fallback_count.saturating_add(1);
-                    embassy_time::Timer::after_millis(RETRY_DELAY_MS).await;
+                    embassy_time::Timer::after_micros(RETRY_DELAY_US).await;
                 } else {
                     let actual_wait_us = wait.wait_us.max(MIN_HINT_RETRY_GAP_US);
                     wait_us = wait_us.saturating_add(actual_wait_us);
@@ -614,31 +474,60 @@ async fn main(spawner: Spawner) {
                 }
             } else {
                 fallback_count = fallback_count.saturating_add(1);
-                embassy_time::Timer::after_millis(RETRY_DELAY_MS).await;
+                embassy_time::Timer::after_micros(RETRY_DELAY_US).await;
+            }
+
+            if MATRIX_DIRTY.load(Ordering::Acquire) {
+                superseded = true;
+                break;
             }
         }
 
+        let acked = !superseded;
         if acked {
-            total_acked += 1;
+            total_acked = total_acked.saturating_add(1);
         }
 
         let now_us = Instant::now().as_micros();
         let latency_us = now_us.saturating_sub(event_since_us);
         let link = link_timing.snapshot(now_us);
+        defmt::info!(
+            "snap seq={} ok={} att={} rack={} tack={} ack={}:{} sup={} lat={} rows={},{},{},{},{}",
+            snapshot_seq,
+            acked as u8,
+            attempts,
+            radio_ack_count,
+            transport_ack_count,
+            last_ack_dev,
+            last_ack_seq,
+            superseded as u8,
+            latency_us,
+            report[1],
+            report[2],
+            report[3],
+            report[4],
+            report[5],
+        );
 
         let mut buf = [0u8; LOG_BUF_SIZE];
         let mut w = WriteBuf::new(&mut buf);
         let _ = write!(
             w,
-            "e={} key={} r={} c={} pr={} ok={} att={} drop={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} lat={} sync={} wait={} fb={} lock={} miss={} age={}\r\n",
+            "snap={} seq={} rows={},{},{},{},{} ok={} att={} rack={} tack={} ack={}:{} drop={} s={} t0={} rd={} bk={} cn={} dt={} si={} sc={} ov={} iv={} lat={} sync={} wait={} fb={} lock={} miss={} age={}\r\n",
             event_count,
-            key_ev.key_id,
-            key_ev.key_id / MATRIX_COLS as u8,
-            key_ev.key_id % MATRIX_COLS as u8,
-            key_ev.pressed as u8,
+            snapshot_seq,
+            report[1],
+            report[2],
+            report[3],
+            report[4],
+            report[5],
             acked,
             attempts,
-            !acked,
+            radio_ack_count,
+            transport_ack_count,
+            last_ack_dev,
+            last_ack_seq,
+            superseded,
             event_counters.start,
             event_counters.timer0,
             event_counters.radio,

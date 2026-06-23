@@ -710,6 +710,12 @@ async fn main(spawner: Spawner) {
             }
         };
 
+        // This diagnostic central reports radio statistics only; it does not
+        // consume application payloads. Drain them so the bounded transport
+        // event queue cannot fill and prevent subsequent frames from being
+        // acknowledged at the transport layer.
+        while prx_session.try_next_event().is_some() {}
+
         total_rx += r.rx_count;
         total_p0 += r.rx_per_pipe[0];
         total_p1 += r.rx_per_pipe[1];

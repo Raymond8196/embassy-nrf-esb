@@ -187,12 +187,7 @@ impl<const N: usize, const SIZE: usize> PacketPool<N, SIZE> {
 
     /// Dequeue the next TX packet (called from ISR).
     pub fn try_dequeue_tx(&self) -> Option<usize> {
-        for index in 0..N {
-            if self.try_claim_queued_tx(index) {
-                return Some(index);
-            }
-        }
-        None
+        (0..N).find(|&index| self.try_claim_queued_tx(index))
     }
 
     /// Dequeue a queued TX packet for a specific pipe (called from ISR).

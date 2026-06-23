@@ -334,6 +334,7 @@ dependencies = [
  "defmt 0.3.100",
  "defmt-rtt",
  "embassy-executor",
+ "embassy-futures",
  "embassy-nrf",
  "embassy-nrf-esb",
  "embassy-sync",
@@ -484,6 +485,7 @@ dependencies = [
  "embassy-nrf",
  "embassy-sync",
  "nrf-mpsl",
+ "nrf-sdc",
 ]
 
 [[package]]
