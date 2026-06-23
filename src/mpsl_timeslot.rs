@@ -646,6 +646,14 @@ struct PtxInnerState {
     target_count: u32,
     config: Option<crate::config::EsbConfig>,
     addresses: Option<crate::addresses::EsbAddresses>,
+    /// When `Some`, the timeslot callback dispatches through the
+    /// shared `EsbPtx` state machine via `TimeslotPtxDriver`; when `None`,
+    /// the legacy inline PTX engine runs (fallback / A-B regression path).
+    driver: Option<&'static dyn crate::isr::TimeslotPtxDriver>,
+    /// Cross-slot duplicate-detection state for the converged driver.
+    saved_pid: [u8; 8],
+    saved_crc: [u16; 8],
+    saved_valid: [bool; 8],
     pid: u8,
     phase: PtxPhase,
     tx_count: u32,
@@ -729,6 +737,13 @@ impl PtxInnerState {
         self.schedule_lock_miss_streak = 0;
         self.schedule_lock_count = 0;
         self.schedule_reacquire_count = 0;
+        self.schedule_period_us = 0;
+        self.schedule_next_distance_us = 0;
+        self.pid = 0;
+        // Converged-driver cross-slot dup state starts cleared.
+        self.saved_pid = [0; 8];
+        self.saved_crc = [0; 8];
+        self.saved_valid = [false; 8];
         self.schedule_period_us = 0;
         self.schedule_next_distance_us = 0;
         self.pid = 0;
@@ -904,6 +919,10 @@ impl PtxState {
                 target_count: 0,
                 config: None,
                 addresses: None,
+                driver: None,
+                saved_pid: [0; 8],
+                saved_crc: [0; 8],
+                saved_valid: [false; 8],
                 pid: 0,
                 phase: PtxPhase::Idle,
                 tx_count: 0,
@@ -1023,6 +1042,62 @@ unsafe extern "C" fn ptx_timeslot_callback(
                 return &mut state.return_param as *mut _;
             }
 
+            // ---- Converged-driver path (S6) ----
+            // When a TimeslotPtxDriver is registered, the shared PtxStateMachine
+            // owns RADIO register programming, PID, and retransmit logic. This
+            // layer only arms TIMER0 (slot end + ACK timeout) and unmasks RADIO
+            // NVIC so events arrive as SIGNAL_RADIO.
+            if let Some(driver) = state.driver {
+                let _ = config; // addresses already recorded in driver via set_ptx_driver
+                let _ = addresses;
+
+                // Drive the shared SM: power-cycle, re-init, restore dup state,
+                // arm first TX. The SM dequeues from PacketPool.
+                if let Err(_) =
+                    driver.ts_start_tx(state.saved_pid, state.saved_crc, state.saved_valid)
+                {
+                    state.counters.invalid_return += 1;
+                    state.phase = PtxPhase::Done;
+                    state.return_param.callback_action =
+                        raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                    let t = pac::TIMER0;
+                    t.cc(0).write_value(state.in_slot_match_us);
+                    t.intenset().write(|w| w.set_compare(0, true));
+                    return &mut state.return_param as *mut _;
+                }
+
+                state.tx_count = state.tx_count.wrapping_add(1);
+                state.packets_sent_this_slot = 1;
+                state.retry_count = 0;
+                state.acked_this_slot = false;
+                let pipe = driver.ts_last_pipe() as usize;
+                if pipe < NUM_PIPES {
+                    state.tx_per_pipe[pipe] += 1;
+                }
+
+                // Arm TIMER0 CC[0] for slot end, CC[1] for ACK timeout. The SM
+                // is now in Tx (TX ramping); when RADIO END fires, SIGNAL_RADIO
+                // will call ts_on_radio(false) and the SM will enter WaitAck.
+                let t = pac::TIMER0;
+                t.events_compare(0).write_value(0);
+                t.events_compare(1).write_value(0);
+                t.cc(0).write_value(state.in_slot_match_us);
+                t.cc(1).write_value(0xFFFFFFFF);
+                t.intenset().write(|w| {
+                    w.set_compare(0, true);
+                    w.set_compare(1, true);
+                });
+
+                // Unmask RADIO so events are delivered as SIGNAL_RADIO.
+                unsafe {
+                    cortex_m::peripheral::NVIC::unmask(pac::Interrupt::RADIO);
+                }
+
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                return &mut state.return_param as *mut _;
+            }
+
+            // ---- Legacy inline-engine path (fallback) ----
             // Power cycle RADIO.
             let r = pac::RADIO;
             r.power().write(|w| w.set_power(false));
@@ -1081,6 +1156,62 @@ unsafe extern "C" fn ptx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_RADIO => PTX_STATE.with_inner(|state| {
             state.counters.radio += 1;
 
+            // ---- Converged-driver path (S6) ----
+            if let Some(driver) = state.driver {
+                let r = pac::RADIO;
+                let disabled = r.events_disabled().read() == 1;
+                if disabled {
+                    r.events_disabled().write_value(0);
+                }
+
+                // timer_flag=false: this is a RADIO event, not a TIMER0 ACK-timeout.
+                let event = driver.ts_on_radio(false);
+                let sm_state = driver.ts_state();
+
+                // Update mpsl-layer counters from the SM event.
+                use crate::state_machine::{PtxEvent, StatePtx};
+                match (event, sm_state) {
+                    // Tx END → SM entered WaitAck. Arm TIMER0 CC[1] ACK timeout.
+                    (PtxEvent::None, StatePtx::WaitAck) => {
+                        let t = pac::TIMER0;
+                        t.tasks_capture(1).write_value(1);
+                        let now = t.cc(1).read();
+                        t.cc(1).write_value(now.wrapping_add(state.ack_timeout_us));
+                        t.events_compare(1).write_value(0);
+                        t.intenset().write(|w| w.set_compare(1, true));
+                    }
+                    // ACK received OK → SM advanced PID, released TX, sent next or idle.
+                    // Also covers Tx/TxNoAck (SM dequeued next packet) and Idle (queue empty).
+                    (PtxEvent::None, StatePtx::Idle | StatePtx::Tx | StatePtx::TxNoAck) => {
+                        state.acked_this_slot = true;
+                        state.ack_ok_count += 1;
+                        let pipe = driver.ts_last_pipe() as usize;
+                        if pipe < NUM_PIPES {
+                            state.ack_ok_per_pipe[pipe] += 1;
+                        }
+                        // Disarm TIMER0 ACK-timeout (slot-end CC[0] still armed).
+                        let t = pac::TIMER0;
+                        t.intenclr().write(|w| w.set_compare(1, true));
+                        t.events_compare(1).write_value(0);
+                        state.phase = PtxPhase::Done;
+                    }
+                    // Max retransmit attempts reached — packet dropped.
+                    (PtxEvent::MaxAttempts, _) => {
+                        state.phase = PtxPhase::Done;
+                        let t = pac::TIMER0;
+                        t.intenclr().write(|w| w.set_compare(1, true));
+                    }
+                    // WaitRetransmit cannot occur in timeslot mode (EsbTimer ISR
+                    // is not active; retransmit timing is driven by TIMER0 CC[1]
+                    // via the SIGNAL_TIMER0 path with timer_flag=true). No-op.
+                    (PtxEvent::None, StatePtx::WaitRetransmit) => {}
+                }
+
+                state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_NONE as u8;
+                return &mut state.return_param as *mut _;
+            }
+
+            // ---- Legacy inline-engine path (fallback) ----
             let r = pac::RADIO;
             let disabled = r.events_disabled().read() == 1;
 
@@ -1204,6 +1335,116 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
             let t = pac::TIMER0;
 
+            // ---- Converged-driver path (S6) ----
+            if let Some(driver) = state.driver {
+                // CC[1]: ACK timeout. Feed timer_flag=true to the SM so it
+                // enters its retransmit/MaxAttempts path. The SM itself calls
+                // radio.stop() and radio.transmit() to re-arm the TX.
+                if t.events_compare(1).read() == 1 {
+                    t.events_compare(1).write_value(0);
+                    t.intenclr().write(|w| w.set_compare(1, true));
+
+                    state.ack_timeout_count += 1;
+                    ptx_observe_schedule_miss(state);
+                    let pipe = driver.ts_last_pipe() as usize;
+                    if pipe < NUM_PIPES {
+                        state.ack_timeout_per_pipe[pipe] += 1;
+                    }
+
+                    let event = driver.ts_on_radio(true);
+                    let sm_state = driver.ts_state();
+                    use crate::state_machine::{PtxEvent, StatePtx};
+
+                    match (event, sm_state) {
+                        // SM retransmitted — back in Tx. Re-arm CC[1] for the
+                        // next ACK wait window.
+                        (PtxEvent::None, StatePtx::Tx) => {
+                            state.retry_count = driver.ts_attempts();
+                            t.tasks_capture(1).write_value(1);
+                            let now = t.cc(1).read();
+                            t.cc(1).write_value(now.wrapping_add(state.ack_timeout_us));
+                            t.events_compare(1).write_value(0);
+                            t.intenset().write(|w| w.set_compare(1, true));
+                        }
+                        // Max retransmit reached — packet dropped.
+                        (PtxEvent::MaxAttempts, _) => {
+                            state.phase = PtxPhase::Done;
+                        }
+                        // Any other state (Idle, TxNoAck, WaitAck with late ACK
+                        // arrival, etc.) — end this slot's attempt.
+                        _ => {
+                            state.phase = PtxPhase::Done;
+                        }
+                    }
+                }
+
+                // CC[0]: slot end. Force-stop the SM and reschedule.
+                if t.events_compare(0).read() == 1 {
+                    t.events_compare(0).write_value(0);
+                    t.intenclr().write(|w| {
+                        w.set_compare(0, true);
+                        w.set_compare(1, true);
+                    });
+
+                    if state.phase != PtxPhase::Done {
+                        driver.ts_force_stop();
+                        // Save dup state for next slot.
+                        let (p, c, v) = driver.ts_snapshot_dup_state();
+                        state.saved_pid = p;
+                        state.saved_crc = c;
+                        state.saved_valid = v;
+                        state.phase = PtxPhase::Done;
+                    } else {
+                        // Already Done — still capture dup state.
+                        let (p, c, v) = driver.ts_snapshot_dup_state();
+                        state.saved_pid = p;
+                        state.saved_crc = c;
+                        state.saved_valid = v;
+                    }
+
+                    let poll_active = state.poll_pipes > 0;
+                    let event_active = state.event_mode;
+
+                    if event_active {
+                        state.event_result_ready = true;
+                        state.event_pending = false;
+                        state.event_ack_ok = state.acked_this_slot;
+                        state.waker.wake();
+                        state.return_param.callback_action =
+                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                    } else if poll_active {
+                        state.poll_slots_since_report += 1;
+                        if state.poll_slots_since_report >= state.poll_report_every {
+                            state.poll_slots_since_report = 0;
+                            state.poll_report_ready = true;
+                            state.waker.wake();
+                        }
+                        ptx_configure_next_poll_request(state);
+                        state.return_param.callback_action =
+                            raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                        state.return_param.params.request.p_next =
+                            core::ptr::from_mut(&mut state.request);
+                    } else {
+                        let chain =
+                            state.target_count > 0 && state.counters.start < state.target_count;
+                        if chain {
+                            state.return_param.callback_action =
+                                raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+                            state.return_param.params.request.p_next =
+                                core::ptr::from_mut(&mut state.request);
+                        } else {
+                            state.done = true;
+                            state.waker.wake();
+                            state.return_param.callback_action =
+                                raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+                        }
+                    }
+                }
+
+                return &mut state.return_param as *mut _;
+            }
+
+            // ---- Legacy inline-engine path (fallback) ----
             // Check CC[1] first: ACK timeout → retry.
             if t.events_compare(1).read() == 1 && state.phase == PtxPhase::WaitAck {
                 t.events_compare(1).write_value(0);
@@ -1410,6 +1651,14 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
         raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PTX_STATE.with_inner(|state| {
             state.counters.overstayed += 1;
+            // Converged-driver: force SM to quiescent state before rescheduling.
+            if let Some(driver) = state.driver {
+                driver.ts_force_stop();
+                let (p, c, v) = driver.ts_snapshot_dup_state();
+                state.saved_pid = p;
+                state.saved_crc = c;
+                state.saved_valid = v;
+            }
             state.phase = PtxPhase::Idle;
             if state.poll_pipes > 0 {
                 state.schedule_lock_active = false;
@@ -2706,6 +2955,72 @@ where
     }
 }
 
+/// Convenience wrapper for driving an [`EsbPtx`](crate::isr::EsbPtx) from MPSL
+/// timeslots.
+///
+/// This is the S6-d lifecycle surface: it opens a PTX timeslot session,
+/// registers the shared PTX state machine as the callback driver, and clears
+/// the registration when dropped. The wrapper is intentionally thin while the
+/// diagnostic `PtxPollSession` / `PtxEventSession` APIs remain available for
+/// bring-up.
+pub struct EsbTimeslotPtx<T, const N: usize, const SIZE: usize>
+where
+    T: crate::timer::TimerInstance,
+{
+    ptx: &'static crate::isr::EsbPtx<T, N, SIZE>,
+    session: PtxPollSession,
+}
+
+impl<T, const N: usize, const SIZE: usize> EsbTimeslotPtx<T, N, SIZE>
+where
+    T: crate::timer::TimerInstance,
+{
+    /// Open a converged PTX timeslot session.
+    ///
+    /// Creates the poll session, registers `ptx` as the timeslot driver so the
+    /// callback dispatches through the shared `PtxStateMachine` instead of the
+    /// inline engine.
+    pub fn start(
+        mpsl: &MultiprotocolServiceLayer<'_>,
+        ptx: &'static crate::isr::EsbPtx<T, N, SIZE>,
+        config: &EsbConfig,
+        addresses: &EsbAddresses,
+        poll_config: PtxPollConfig,
+    ) -> Result<Self, Error> {
+        let session = open_ptx_poll_session(mpsl, config, addresses, poll_config)?;
+        let first_pipe = poll_config.pipe_mask.trailing_zeros() as u8;
+        set_ptx_driver(ptx, addresses, first_pipe);
+        Ok(Self { ptx, session })
+    }
+
+    /// Wait for the next periodic report from the poll session.
+    pub async fn next_report(&mut self) -> Result<PtxPollResult, Error> {
+        self.session.next_report().await
+    }
+
+    /// Queue a payload for transmission on the given pipe.
+    pub async fn send_to(&self, pipe: u8, payload: &[u8]) -> Result<(), Error> {
+        self.ptx.send_to(pipe, payload).await
+    }
+
+    /// Queue a payload on the default pipe.
+    pub async fn send(&self, payload: &[u8]) -> Result<(), Error> {
+        self.ptx.send(payload).await
+    }
+
+    /// Returns the underlying PTX driver.
+    pub fn ptx(&self) -> &'static crate::isr::EsbPtx<T, N, SIZE> {
+        self.ptx
+    }
+
+    /// Close the session, unregister the driver, and return the PTX driver.
+    pub fn stop(self) -> &'static crate::isr::EsbPtx<T, N, SIZE> {
+        let ptx = self.ptx;
+        drop(self);
+        ptx
+    }
+}
+
 /// Open a long-lived PRX session with scheduler counter ACK payloads only.
 ///
 /// For a higher-level protocol that needs to append caller-defined bytes to
@@ -2840,6 +3155,41 @@ pub fn set_prx_driver(
 /// Unregister the converged-engine driver, reverting to the legacy inline path.
 pub fn clear_prx_driver() {
     PRX_STATE.with_inner(|state| {
+        state.driver = None;
+    });
+}
+
+/// Register a converged-engine PTX driver so the PTX timeslot callback dispatches
+/// through the shared [`EsbPtx`](crate::isr::EsbPtx) state machine instead of the
+/// legacy inline PTX engine. Must be called between `open_ptx_poll_session`
+/// (or `open_event_session`) and the first slot. The driver must live in a
+/// `&'static` (StaticCell) and already be configured with the same
+/// `config`/`addresses`/`tx_pipe` as the session. Pass `addresses` and `tx_pipe`
+/// so the driver can re-init RADIO each slot.
+///
+/// To revert to the inline engine (e.g. for A/B regression), call
+/// [`clear_ptx_driver`] before the next slot starts.
+pub fn set_ptx_driver(
+    driver: &'static dyn crate::isr::TimeslotPtxDriver,
+    addresses: &EsbAddresses,
+    tx_pipe: u8,
+) {
+    driver.ts_configure(addresses, tx_pipe);
+    PTX_STATE.with_inner(|state| {
+        state.driver = Some(driver);
+        let (p, c, v) = driver.ts_snapshot_dup_state();
+        state.saved_pid = p;
+        state.saved_crc = c;
+        state.saved_valid = v;
+        state.pid = driver.ts_pid();
+        state.tx_pipe = tx_pipe;
+        state.addresses = Some(addresses.clone());
+    });
+}
+
+/// Unregister the converged-engine PTX driver, reverting to the legacy inline path.
+pub fn clear_ptx_driver() {
+    PTX_STATE.with_inner(|state| {
         state.driver = None;
     });
 }
@@ -3008,6 +3358,9 @@ impl PtxPollSession {
 
 impl Drop for PtxPollSession {
     fn drop(&mut self) {
+        PTX_STATE.with_inner(|state| {
+            state.driver = None;
+        });
         let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
     }
 }
@@ -3303,6 +3656,7 @@ impl PtxEventSession {
 impl Drop for PtxEventSession {
     fn drop(&mut self) {
         PTX_STATE.with_inner(|state| {
+            state.driver = None;
             state.event_mode = false;
             state.event_pending = false;
         });

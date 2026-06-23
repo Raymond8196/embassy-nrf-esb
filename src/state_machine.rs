@@ -132,6 +132,10 @@ pub struct PtxStateMachine<T: TimerInstance> {
     pub(crate) radio: EsbRadio,
     pub(crate) timer: EsbTimer<T>,
     config: EsbConfig,
+    /// ESB addresses. Kept in the SM so the timeslot entrypoints can re-init
+    /// the RADIO at the start of every slot (the MPSL path power-cycles RADIO
+    /// between slots). Filled in by `set_addresses` at wrap time.
+    addresses: Option<EsbAddresses>,
     state: StatePtx,
     /// Retransmit attempt counter for the current packet.
     attempts: u8,
@@ -151,6 +155,9 @@ pub struct PtxStateMachine<T: TimerInstance> {
     tx_idx: usize,
     /// Current ACK RX buffer pool index (IN_DMA while waiting for ACK).
     ack_rx_idx: usize,
+    /// Last pipe a TX was sent on (0xFF = none yet). Exposed for timeslot-mode
+    /// per-pipe diagnostics.
+    last_pipe: u8,
     /// MPSL timeslot-managed mode. When `true`, this state machine is driven
     /// from the MPSL timeslot callback (`SIGNAL_RADIO`) rather than the RADIO
     /// ISR, and timing comes from the timeslot layer (TIMER0 / in-slot poll)
@@ -172,6 +179,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             radio,
             timer,
             config: config.clone(),
+            addresses: None,
             state: StatePtx::Idle,
             attempts: 0,
             tx_pipe,
@@ -185,6 +193,7 @@ impl<T: TimerInstance> PtxStateMachine<T> {
             pid: 0,
             tx_idx: NO_IDX,
             ack_rx_idx: NO_IDX,
+            last_pipe: 0xFF,
             timeslot_managed: false,
         }
     }
@@ -207,6 +216,137 @@ impl<T: TimerInstance> PtxStateMachine<T> {
     /// Returns whether MPSL timeslot-managed operation is enabled.
     pub(crate) fn is_timeslot_managed(&self) -> bool {
         self.timeslot_managed
+    }
+
+    /// Store ESB addresses for timeslot-mode RADIO re-init.
+    ///
+    /// In exclusive mode the RADIO is initialized once at construction; in
+    /// timeslot mode each slot power-cycles RADIO, so the entrypoints need the
+    /// addresses to re-run `init`. Set once at wrap time.
+    pub(crate) fn set_addresses(&mut self, addresses: &EsbAddresses) {
+        self.addresses = Some(addresses.clone());
+    }
+
+    /// Update the TX pipe (used by the timeslot wrapper when arming a slot).
+    pub(crate) fn set_tx_pipe(&mut self, pipe: u8) {
+        self.tx_pipe = pipe;
+    }
+
+    /// Returns the saved duplicate-detection PID array (for cross-slot
+    /// preservation by the timeslot wrapper).
+    pub(crate) fn saved_pid(&self) -> [u8; 8] {
+        self.radio.save_pid_state()
+    }
+
+    /// Returns the saved duplicate-detection CRC array.
+    pub(crate) fn saved_crc(&self) -> [u16; 8] {
+        self.radio.save_crc_state()
+    }
+
+    /// Returns the saved duplicate-detection valid-flags array.
+    pub(crate) fn saved_valid(&self) -> [bool; 8] {
+        self.radio.save_detection_valid_state()
+    }
+
+    /// Returns the last pipe a TX was sent on (0xFF if none yet). Diagnostic only.
+    pub(crate) fn last_pipe(&self) -> u8 {
+        self.last_pipe
+    }
+
+    /// Returns the current PID (2-bit packet identifier).
+    pub(crate) fn pid(&self) -> u8 {
+        self.pid
+    }
+
+    /// Returns the current retransmit attempt count for this packet.
+    pub(crate) fn attempts(&self) -> u8 {
+        self.attempts
+    }
+
+    /// Timeslot entrypoint: slot start.
+    ///
+    /// Power-cycles RADIO, re-inits ESB registers, restores duplicate-detection
+    /// state, sets `timeslot_managed = true`, and arms the first TX. Must be
+    /// called from the MPSL signal context (not the RADIO ISR). The caller
+    /// passes the saved PID/CRC/valid arrays (last slot's final state).
+    ///
+    /// After this returns, the caller (mpsl layer) is responsible for:
+    /// - Programming TIMER0 CC[0] for slot end and CC[1] for ACK timeout
+    /// - Unmasking the RADIO NVIC line so events arrive as SIGNAL_RADIO
+    /// - Driving retransmit timing via TIMER0 (D1=B2: protocol logic in the SM,
+    ///   timing source split by mode)
+    pub(crate) fn ts_start_tx<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+        saved_pid: [u8; 8],
+        saved_crc: [u16; 8],
+        saved_valid: [bool; 8],
+    ) -> Result<(), Error> {
+        let addresses = self
+            .addresses
+            .clone()
+            .expect("ts_start_tx: addresses must be set via set_addresses first");
+
+        self.radio.power_cycle();
+        self.radio.init(&self.config, &addresses);
+        self.radio.restore_pid_state(saved_pid);
+        self.radio.restore_crc_state(saved_crc);
+        self.radio.restore_detection_valid_state(saved_valid);
+
+        self.timeslot_managed = true;
+        self.state = StatePtx::Idle;
+        self.attempts = 0;
+        self.tx_idx = NO_IDX;
+        self.ack_rx_idx = NO_IDX;
+
+        // Arm first TX (dequeues from pool if available).
+        self.send_next(pool);
+        if self.state == StatePtx::Tx || self.state == StatePtx::TxNoAck {
+            self.last_pipe = self.active_tx_pipe;
+        }
+        Ok(())
+    }
+
+    /// Timeslot entrypoint: SIGNAL_RADIO.
+    ///
+    /// Drives one state-machine event. `timer_flag` is `true` when the mpsl
+    /// layer's TIMER0 CC[1] (ACK timeout) fired before this RADIO event; the
+    /// caller reads and clears TIMER0 events before calling. Returns the PTX
+    /// event so the mpsl layer can update diagnostic counters and decide
+    /// whether to re-arm TIMER0 for a retransmit.
+    pub(crate) fn ts_on_radio<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+        timer_flag: bool,
+    ) -> PtxEvent {
+        if self.state == StatePtx::Idle && !timer_flag {
+            return PtxEvent::None;
+        }
+
+        let event = self.handle_radio_event(pool, timer_flag, false);
+
+        if self.state == StatePtx::Tx || self.state == StatePtx::TxNoAck {
+            self.last_pipe = self.active_tx_pipe;
+        }
+
+        event
+    }
+
+    /// Timeslot entrypoint: slot end / EXTEND_FAILED / OVERSTAYED / handoff.
+    ///
+    /// Stops the radio, releases any in-flight TX/ACK-RX buffer, and clears
+    /// `timeslot_managed`. After this, the SM is in `Idle` and ready for the
+    /// next slot.
+    pub(crate) fn ts_force_stop<const N: usize, const SIZE: usize>(
+        &mut self,
+        pool: &PacketPool<N, SIZE>,
+    ) {
+        self.radio.stop();
+        self.release_tx(pool);
+        self.release_ack_rx(pool);
+        self.state = StatePtx::Idle;
+        self.attempts = 0;
+        self.timeslot_managed = false;
     }
 
     /// Check and clear ISR event flags.
