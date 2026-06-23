@@ -744,9 +744,6 @@ impl PtxInnerState {
         self.saved_pid = [0; 8];
         self.saved_crc = [0; 8];
         self.saved_valid = [false; 8];
-        self.schedule_period_us = 0;
-        self.schedule_next_distance_us = 0;
-        self.pid = 0;
         self.poll_pipes = 0;
         self.poll_pipe_mask = 0;
         self.poll_report_every = 0;
