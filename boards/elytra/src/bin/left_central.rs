@@ -604,6 +604,7 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) -> bool {
         );
         if status == 0 && enabled != 0 {
             maybe_send_bond_keys(sdc, handle);
+            request_conn_params(sdc, handle).await;
         }
         return false;
     }
@@ -667,6 +668,40 @@ fn on_ble_connected(
         0x0006,
         &[SMP_SECURITY_REQUEST, SMP_AUTH_BONDING],
     );
+}
+
+/// Request BLE connection parameters tuned for keyboard latency + ESB coexistence.
+///
+/// Sent once after encryption completes. 15 ms interval is the HOGP/Apple
+/// recommended low-latency value while halving BLE radio load vs 7.5 ms (eases
+/// ESB timeslot coexistence); slave latency 30 lets the peripheral skip idle
+/// connection events (saves power, frees radio for ESB) without affecting
+/// keypress response — the peripheral still sends immediately on a key event;
+/// 5 s supervision timeout tolerates coexistence jitter so idle disconnects
+/// (seen with default host params) don't trigger. Try 7.5 ms (interval=6) later
+/// once coexistence under tighter BLE scheduling is verified.
+async fn request_conn_params(sdc: &SoftdeviceController<'_>, handle: u16) {
+    embassy_time::Timer::after_millis(500).await;
+    defmt::info!("BLE conn param update: 15ms / latency 30 / timeout 5s");
+    let interval_min: u16 = 12; // 12 * 1.25ms = 15ms
+    let interval_max: u16 = 12;
+    let latency: u16 = 30;
+    let timeout: u16 = 500; // 500 * 10ms = 5s
+    let payload: [u8; 12] = [
+        0x12, // Connection Parameter Update Request
+        0x01, // identifier
+        0x08,
+        0x00, // length
+        interval_min as u8,
+        (interval_min >> 8) as u8,
+        interval_max as u8,
+        (interval_max >> 8) as u8,
+        latency as u8,
+        (latency >> 8) as u8,
+        timeout as u8,
+        (timeout >> 8) as u8,
+    ];
+    send_l2cap(sdc, handle, 0x0005, &payload);
 }
 
 async fn reply_ltk_request(sdc: &SoftdeviceController<'_>, handle: u16, rand: [u8; 8], ediv: u16) {
