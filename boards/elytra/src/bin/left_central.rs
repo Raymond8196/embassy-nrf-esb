@@ -484,9 +484,58 @@ async fn prx_parked_test_task(mpsl: &'static MultiprotocolServiceLayer<'static>)
             return;
         }
     };
-    defmt::info!("ESB PRX parked session opened (self-trigger test)");
+    let bindings = StaticBindingTable::<8>::from_pipe_entries([
+        None,
+        Some(RIGHT_DEVICE_ID),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]);
+    let mut tracker = SequenceTracker::<1>::new();
+    defmt::info!("ESB PRX parked session opened (self-trigger + receive test)");
     loop {
         INACTIVE_SIGNAL.wait().await;
+        // Drain events from the previous slot before requesting the next window.
+        // (try_next_event is non-blocking; next_event would wait and could stall
+        //  on a slot that received nothing.)
+        while let Some(ev) = session.try_next_event() {
+            let frame = &ev.payload[..ev.len as usize];
+            let Ok(Some((header, payload))) =
+                accept_bound_frame(&bindings, &mut tracker, ev.pipe, frame)
+            else {
+                continue;
+            };
+            RIGHT_LAST_SEEN_MS.store(
+                embassy_time::Instant::now().as_millis() as u32,
+                Ordering::Release,
+            );
+            if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
+                let mut changed_count = 0u8;
+                for r in 0..ROWS {
+                    let next = payload[1 + r];
+                    let previous = RIGHT_ROWS_STATE[r].swap(next, Ordering::AcqRel);
+                    if previous != next {
+                        changed_count =
+                            changed_count.saturating_add((previous ^ next).count_ones() as u8);
+                    }
+                }
+                if changed_count != 0 {
+                    RIGHT_SEQUENCE.store(header.sequence, Ordering::Release);
+                    RIGHT_DIRTY.store(true, Ordering::Release);
+                    RIGHT_CHANGED.signal(());
+                }
+                defmt::info!(
+                    "right snapshot (parked) pipe={} dev={} seq={} chg={}",
+                    ev.pipe,
+                    header.device_id,
+                    header.sequence,
+                    changed_count
+                );
+            }
+        }
         match session.request_window() {
             Ok(true) => {
                 REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
