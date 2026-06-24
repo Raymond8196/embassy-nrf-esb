@@ -1879,6 +1879,13 @@ struct PrxInnerState {
     report_ready: bool,
     prx_schedule: PrxScheduleConfig,
     prx_windows_since_gap: u32,
+    /// Whether a completed PRX window should immediately request another one.
+    /// Parked sessions leave this false and are resumed explicitly by the
+    /// application, for example after a BLE radio notification.
+    auto_reschedule: bool,
+    /// An earliest request is queued with MPSL or its granted slot is active.
+    /// This prevents callers from queuing overlapping manual PRX windows.
+    request_outstanding: bool,
     retry_blocked_at_high_priority: bool,
     last_request_kind: u8,
     normal_blocked: u32,
@@ -1932,6 +1939,8 @@ impl PrxInnerState {
         self.last_report_start = 0;
         self.report_ready = false;
         self.prx_windows_since_gap = 0;
+        self.auto_reschedule = true;
+        self.request_outstanding = false;
         self.last_request_kind = PRX_REQ_EARLIEST;
         self.normal_blocked = 0;
         self.earliest_blocked = 0;
@@ -2001,6 +2010,18 @@ struct PrxState {
 }
 
 static PRX_STATE: PrxState = PrxState::new();
+
+/// Whether the shared PRX timeslot currently owns the radio.
+///
+/// This is intentionally an atomic snapshot for high-priority callbacks such
+/// as MPSL radio notifications. It is not a replacement for session ownership
+/// or a guarantee that a packet is being received at the exact instant read.
+static PRX_TIMESLOT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Return whether the active PRX timeslot currently owns the radio.
+pub fn prx_timeslot_active() -> bool {
+    PRX_TIMESLOT_ACTIVE.load(Ordering::Acquire)
+}
 
 #[repr(C, align(4))]
 struct PrxBuffers {
@@ -2072,12 +2093,18 @@ fn prx_finalize_and_reschedule(state: &mut PrxInnerState) {
         state.waker.wake();
     }
 
-    if long_session || state.counters.start < state.target_count {
+    if state.auto_reschedule && (long_session || state.counters.start < state.target_count) {
         let distance_us = prx_next_normal_distance_us(state);
         prx_set_normal_request(state, distance_us);
         state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
         state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
     } else {
+        state.request_outstanding = false;
+        if !state.auto_reschedule {
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+            return;
+        }
+
         state.done = true;
         state.waker.wake();
         state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
@@ -2174,6 +2201,8 @@ impl PrxState {
                 report_ready: false,
                 prx_schedule: PrxScheduleConfig::continuous(),
                 prx_windows_since_gap: 0,
+                auto_reschedule: true,
+                request_outstanding: false,
                 retry_blocked_at_high_priority: true,
                 last_request_kind: PRX_REQ_EARLIEST,
                 normal_blocked: 0,
@@ -2221,6 +2250,8 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_START => PRX_STATE.with_inner(|state| {
             state.counters.start += 1;
             state.slot_active = true;
+            state.request_outstanding = true;
+            PRX_TIMESLOT_ACTIVE.store(true, Ordering::Release);
             state.extend_count = 0;
 
             let (Some(config), Some(addresses)) = (state.config.as_ref(), state.addresses.as_ref())
@@ -2507,6 +2538,7 @@ unsafe extern "C" fn prx_timeslot_callback(
             }
 
             state.slot_active = false;
+            PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
             t.intenclr().write(|w| w.set_compare(0, true));
             t.shorts().write(|w| w.set_compare_clear(0, false));
 
@@ -2548,6 +2580,7 @@ unsafe extern "C" fn prx_timeslot_callback(
 
             if state.extend_count >= state.max_extends {
                 state.slot_active = false;
+                PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
                 let t = pac::TIMER0;
                 t.intenclr().write(|w| w.set_compare(0, true));
                 t.shorts().write(|w| w.set_compare_clear(0, false));
@@ -2576,6 +2609,7 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_EXTEND_FAILED => PRX_STATE.with_inner(|state| {
             state.counters.extend_failed += 1;
             state.slot_active = false;
+            PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
 
             let t = pac::TIMER0;
             t.intenclr().write(|w| w.set_compare(0, true));
@@ -2601,21 +2635,39 @@ unsafe extern "C" fn prx_timeslot_callback(
 
         raw::MPSL_TIMESLOT_SIGNAL_SESSION_IDLE => PRX_STATE.with_inner(|state| {
             state.counters.session_idle += 1;
+            state.request_outstanding = false;
             state.waker.wake();
             core::ptr::null_mut()
         }),
 
         raw::MPSL_TIMESLOT_SIGNAL_BLOCKED | raw::MPSL_TIMESLOT_SIGNAL_CANCELLED => {
-            let request = PRX_STATE.with_inner(|state| {
+            let manual_session = PRX_STATE.with_inner(|state| {
                 if signal == raw::MPSL_TIMESLOT_SIGNAL_BLOCKED {
                     state.counters.blocked += 1;
+                } else {
+                    state.counters.cancelled += 1;
+                }
+
+                if !state.auto_reschedule {
+                    state.request_outstanding = false;
+                    state.waker.wake();
+                    true
+                } else {
+                    false
+                }
+            });
+            if manual_session {
+                return core::ptr::null_mut();
+            }
+
+            let request = PRX_STATE.with_inner(|state| {
+                if signal == raw::MPSL_TIMESLOT_SIGNAL_BLOCKED {
                     match state.last_request_kind {
                         PRX_REQ_NORMAL => state.normal_blocked += 1,
                         PRX_REQ_EARLIEST => state.earliest_blocked += 1,
                         _ => {}
                     }
                 } else {
-                    state.counters.cancelled += 1;
                     match state.last_request_kind {
                         PRX_REQ_NORMAL => state.normal_cancelled += 1,
                         PRX_REQ_EARLIEST => state.earliest_cancelled += 1,
@@ -2647,6 +2699,8 @@ unsafe extern "C" fn prx_timeslot_callback(
 
         raw::MPSL_TIMESLOT_SIGNAL_SESSION_CLOSED => PRX_STATE.with_inner(|state| {
             state.counters.session_closed += 1;
+            state.request_outstanding = false;
+            PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
             state.done = true;
             state.waker.wake();
             core::ptr::null_mut()
@@ -2655,6 +2709,8 @@ unsafe extern "C" fn prx_timeslot_callback(
         raw::MPSL_TIMESLOT_SIGNAL_OVERSTAYED => PRX_STATE.with_inner(|state| {
             state.counters.overstayed += 1;
             state.slot_active = false;
+            state.request_outstanding = false;
+            PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
             if let Some(driver) = state.driver {
                 driver.ts_force_stop();
             } else {
@@ -2786,6 +2842,41 @@ pub struct PrxSlotSession {
 }
 
 impl PrxSlotSession {
+    /// Request one earliest PRX receive window for a parked session.
+    ///
+    /// Returns `Ok(true)` when a request was submitted. `Ok(false)` means a
+    /// previous request or its granted slot is still active, so callers can
+    /// safely coalesce repeated wakeups such as radio notifications.
+    pub fn request_window(&mut self) -> Result<bool, Error> {
+        let request = PRX_STATE.with_inner(|state| {
+            if state.done || state.slot_active || state.request_outstanding {
+                return None;
+            }
+
+            prx_set_earliest_request(
+                state,
+                TIMESLOT_PRIORITY_NORMAL,
+                state.request_timeout_us,
+            );
+            state.request_outstanding = true;
+            Some(core::ptr::from_ref(&state.request))
+        });
+
+        let Some(request) = request else {
+            return Ok(false);
+        };
+
+        let ret = unsafe { raw::mpsl_timeslot_request(self.session_id, request) };
+        if let Err(e) = mpsl_ok(ret) {
+            PRX_STATE.with_inner(|state| {
+                state.request_outstanding = false;
+            });
+            return Err(e);
+        }
+
+        Ok(true)
+    }
+
     /// Remove and return one received application payload without waiting.
     ///
     /// Report-only consumers should call this often enough to avoid dropping
@@ -2893,7 +2984,9 @@ impl Drop for PrxSlotSession {
     fn drop(&mut self) {
         PRX_STATE.with_inner(|state| {
             state.driver = None;
+            state.request_outstanding = false;
         });
+        PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
         let _ = unsafe { raw::mpsl_timeslot_session_close(self.session_id) };
     }
 }
@@ -3044,6 +3137,48 @@ pub fn open_prx_session_with_ack_extension(
     slot_config: PrxSlotConfig,
     ack_extension_provider: Option<PrxAckExtensionProvider>,
 ) -> Result<PrxSlotSession, Error> {
+    open_prx_session_with_mode(
+        _mpsl,
+        config,
+        addresses,
+        slot_config,
+        ack_extension_provider,
+        true,
+    )
+}
+
+/// Open a PRX session that waits for [`PrxSlotSession::request_window`] before
+/// requesting its first receive window.
+///
+/// This is useful for application-owned scheduling policies, such as opening a
+/// bounded ESB receive window immediately after another protocol's radio
+/// activity. Each request runs at most one PRX window; the session stays open
+/// for a later request instead of chaining a NORMAL timeslot automatically.
+pub fn open_parked_prx_session_with_ack_extension(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_config: PrxSlotConfig,
+    ack_extension_provider: Option<PrxAckExtensionProvider>,
+) -> Result<PrxSlotSession, Error> {
+    open_prx_session_with_mode(
+        _mpsl,
+        config,
+        addresses,
+        slot_config,
+        ack_extension_provider,
+        false,
+    )
+}
+
+fn open_prx_session_with_mode(
+    _mpsl: &MultiprotocolServiceLayer<'_>,
+    config: &EsbConfig,
+    addresses: &EsbAddresses,
+    slot_config: PrxSlotConfig,
+    ack_extension_provider: Option<PrxAckExtensionProvider>,
+    start_immediately: bool,
+) -> Result<PrxSlotSession, Error> {
     let busy = PRX_STATE.try_enter()?;
     if config.payload_length < 4 {
         drop(busy);
@@ -3080,6 +3215,8 @@ pub fn open_prx_session_with_ack_extension(
         state.extend_length_us = slot_config.extend_length_us;
         state.retry_blocked_at_high_priority = slot_config.request.retry_blocked_at_high_priority;
         state.ack_extension_provider = ack_extension_provider;
+        state.auto_reschedule = start_immediately;
+        state.request_outstanding = start_immediately;
         prx_set_earliest_request(
             state,
             TIMESLOT_PRIORITY_NORMAL,
@@ -3087,15 +3224,7 @@ pub fn open_prx_session_with_ack_extension(
         );
     });
 
-    let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
-    let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
-    if let Err(e) = mpsl_ok(ret) {
-        let _ = unsafe { raw::mpsl_timeslot_session_close(session_id) };
-        drop(busy);
-        return Err(e);
-    }
-
-    Ok(PrxSlotSession {
+    let session = PrxSlotSession {
         _busy: busy,
         session_id,
         last_counters: SignalCounters::ZERO,
@@ -3110,7 +3239,20 @@ pub fn open_prx_session_with_ack_extension(
         last_earliest_blocked: 0,
         last_normal_cancelled: 0,
         last_earliest_cancelled: 0,
-    })
+    };
+
+    if !start_immediately {
+        return Ok(session);
+    }
+
+    let request = PRX_STATE.with_inner(|state| core::ptr::from_ref(&state.request));
+    let ret = unsafe { raw::mpsl_timeslot_request(session_id, request) };
+    if let Err(e) = mpsl_ok(ret) {
+        drop(session);
+        return Err(e);
+    }
+
+    Ok(session)
 }
 
 /// Register the converged-engine driver on the current PRX session (S3/D6).

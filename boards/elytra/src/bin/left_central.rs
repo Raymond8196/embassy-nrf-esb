@@ -20,10 +20,10 @@ use embassy_futures::select::{Either, select};
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::interrupt::typelevel;
 use embassy_nrf::{bind_interrupts, peripherals, rng, usb};
-use embassy_time::Timer;
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_time::Timer;
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use nrf_sdc::vendor::ZephyrWriteBdAddr;
 use nrf_sdc::{self as sdc, SoftdeviceController};
@@ -33,7 +33,8 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::mpsl_timeslot::{
-    CoexistenceProfile, PrxAckExtension, PrxSlotConfig, open_prx_session_with_ack_extension,
+    CoexistenceProfile, PrxAckExtension, PrxSlotConfig, open_parked_prx_session_with_ack_extension,
+    open_prx_session_with_ack_extension,
 };
 use embassy_nrf_esb::transport::{
     SequenceTracker, StaticBindingTable, TRANSPORT_ACK_LEN, TransportAck, accept_bound_frame,
@@ -93,6 +94,19 @@ static PRX_ACTIVE: AtomicBool = AtomicBool::new(false);
 static HID_CLEAR_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SMP_STATE: Mutex<CriticalSectionRawMutex, RefCell<SmpState>> =
     Mutex::new(RefCell::new(SmpState::new()));
+
+// Radio-notification observation counters (Step 1 — observe before wiring RX
+// windows). Incremented from the priority-0 callback only; read by radio_obs_task.
+static RADIO_NOTIF_ACTIVE: AtomicU32 = AtomicU32::new(0);
+static RADIO_NOTIF_INACTIVE: AtomicU32 = AtomicU32::new(0);
+
+// Step 2 self-trigger test state. INACTIVE_SIGNAL is set by the priority-0 cb on
+// BLE-INACTIVE; prx_parked_test_task waits on it and calls request_window.
+// REQUEST_COUNT = windows actually requested (Ok(true)); REQUEST_COALESCED =
+// suppressed because a window/slot was already active or pending.
+static INACTIVE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static REQUEST_COUNT: AtomicU32 = AtomicU32::new(0);
+static REQUEST_COALESCED: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct KeyEvent {
@@ -179,6 +193,51 @@ async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
         }
     };
     core::future::pending().await
+}
+
+/// Priority-0 MPSL radio-notification callback — observation only (Step 1).
+/// Counts ACTIVE/INACTIVE edges. Must stay tiny: no logging, no timeslot reqs.
+unsafe extern "C" fn radio_notification_cb(source: raw::mpsl_radio_notification_source_t) {
+    match source {
+        raw::MPSL_RADIO_NOTIFICATION_SOURCE_ACTIVE => {
+            RADIO_NOTIF_ACTIVE.fetch_add(1, Ordering::Relaxed);
+        }
+        raw::MPSL_RADIO_NOTIFICATION_SOURCE_INACTIVE => {
+            RADIO_NOTIF_INACTIVE.fetch_add(1, Ordering::Relaxed);
+            INACTIVE_SIGNAL.signal(());
+        }
+        _ => {}
+    }
+}
+
+/// Step 1 observation: print radio-notification edge rates every 2 s. The key
+/// question is whether ESB timeslots (continuous PRX here) also fire INACTIVE —
+/// if inactive/s is far above the BLE conn-event rate, the self-trigger loop is
+/// real and the parked-RX design must self-mask ESB-origin notifications.
+#[embassy_executor::task]
+async fn radio_obs_task() {
+    let mut last_active: u32 = 0;
+    let mut last_inactive: u32 = 0;
+    let mut last_req: u32 = 0;
+    let mut last_coal: u32 = 0;
+    loop {
+        Timer::after_secs(2).await;
+        let active = RADIO_NOTIF_ACTIVE.load(Ordering::Relaxed);
+        let inactive = RADIO_NOTIF_INACTIVE.load(Ordering::Relaxed);
+        let req = REQUEST_COUNT.load(Ordering::Relaxed);
+        let coal = REQUEST_COALESCED.load(Ordering::Relaxed);
+        defmt::info!(
+            "radio notif/s: active={} inactive={} req={}/s coal={}",
+            (active - last_active) / 2,
+            (inactive - last_inactive) / 2,
+            (req - last_req) / 2,
+            (coal - last_coal) / 2
+        );
+        last_active = active;
+        last_inactive = inactive;
+        last_req = req;
+        last_coal = coal;
+    }
 }
 
 #[embassy_executor::task]
@@ -389,6 +448,54 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
             Err(e) => {
                 defmt::warn!("prx event error: {:?}", e);
                 embassy_time::Timer::after_millis(20).await;
+            }
+        }
+    }
+}
+
+/// Step 2 self-trigger test: open a PARKED PRX session, wait for a BLE-INACTIVE
+/// radio notification, then request one RX window. Does NOT consume events —
+/// only measures request_window fire rate to judge whether ESB RX windows
+/// self-trigger further INACTIVE notifications (the documented risk, since
+/// notification covers application timeslots and is only skipped when events
+/// are too close, which parked windows at BLE-interval spacing are not).
+/// Verdict: req≈66/s = BLE-only (no self-trigger); req≫66 = self-loop confirmed.
+#[embassy_executor::task]
+async fn prx_parked_test_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
+    let esb_cfg = EsbConfig::default();
+    let esb_addr = EsbAddresses::new(
+        [0xE7, 0xE7, 0xE7, 0xE7],
+        [0xC2, 0xC2, 0xC2, 0xC2],
+        [0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
+        8,
+    )
+    .unwrap();
+    let cfg = PrxSlotConfig::for_profile(CoexistenceProfile::NordicExtend);
+    let mut session = match open_parked_prx_session_with_ack_extension(
+        mpsl,
+        &esb_cfg,
+        &esb_addr,
+        cfg,
+        Some(right_transport_ack_extension),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            defmt::error!("parked PRX open failed: {:?}", e);
+            return;
+        }
+    };
+    defmt::info!("ESB PRX parked session opened (self-trigger test)");
+    loop {
+        INACTIVE_SIGNAL.wait().await;
+        match session.request_window() {
+            Ok(true) => {
+                REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                REQUEST_COALESCED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                defmt::warn!("request_window: {:?}", e);
             }
         }
     }
@@ -1385,6 +1492,22 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mpsl_task(mpsl).unwrap());
     spawner.spawn(hfclk_task(mpsl).unwrap());
 
+    // Radio notification: observation only (Step 1). Configure after MPSL is
+    // enabled and before the SDC protocol stack starts, else it returns
+    // EINPROGRESS. INT_ON_BOTH to see both edges; distance_min satisfies the
+    // ACTIVE pre-notification requirement (INACTIVE ignores distance).
+    {
+        let r = unsafe {
+            raw::mpsl_radio_notification_cfg_set(
+                raw::MPSL_RADIO_NOTIFICATION_TYPE_INT_ON_BOTH as u8,
+                raw::MPSL_RADIO_NOTIFICATION_DISTANCE_MIN_US as u16,
+                Some(radio_notification_cb),
+            )
+        };
+        defmt::info!("radio notification cfg ret={}", r);
+    }
+    spawner.spawn(radio_obs_task().unwrap());
+
     let sdc_p = sdc::Peripherals::new(
         p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
         p.PPI_CH25, p.PPI_CH26, p.PPI_CH27, p.PPI_CH28, p.PPI_CH29,
@@ -1408,7 +1531,7 @@ async fn main(spawner: Spawner) {
     start_advertising(sdc).await;
     spawner.spawn(sdc_task(sdc, mpsl).unwrap());
     spawner.spawn(hid_task(sdc).unwrap());
-    spawner.spawn(prx_task(mpsl).unwrap());
+    spawner.spawn(prx_parked_test_task(mpsl).unwrap());
 
     let cols = [
         Output::new(p.P0_30, Level::Low, OutputDrive::Standard),
