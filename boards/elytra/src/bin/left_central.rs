@@ -1318,7 +1318,7 @@ async fn start_advertising(sdc: &SoftdeviceController<'_>) {
         LeEventMask::new()
             .enable_le_conn_complete(true)
             .enable_le_long_term_key_request(true)
-            .enable_le_enhanced_conn_complete(true),
+            .enable_le_enhanced_conn_complete_v1(true),
     )
     .exec(sdc)
     .await

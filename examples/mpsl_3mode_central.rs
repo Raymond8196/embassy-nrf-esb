@@ -433,7 +433,7 @@ async fn start_advertising(sdc: &SoftdeviceController<'_>) {
 
     let le_event_mask = LeEventMask::new()
         .enable_le_conn_complete(true)
-        .enable_le_enhanced_conn_complete(true)
+        .enable_le_enhanced_conn_complete_v1(true)
         .enable_le_conn_update_complete(true)
         .enable_le_remote_conn_parameter_request(true);
     LeSetEventMask::new(le_event_mask).exec(sdc).await.unwrap();

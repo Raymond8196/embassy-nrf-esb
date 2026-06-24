@@ -250,7 +250,7 @@ async fn start_advertising(sdc: &SoftdeviceController<'_>) {
     LeSetEventMask::new(
         LeEventMask::new()
             .enable_le_conn_complete(true)
-            .enable_le_enhanced_conn_complete(true),
+            .enable_le_enhanced_conn_complete_v1(true),
     )
     .exec(sdc)
     .await

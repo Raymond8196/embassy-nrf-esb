@@ -27,12 +27,14 @@ defmt = { version = "0.3", optional = true }
 # (cargo refuses git deps in published crates). Publishing the `mpsl` feature
 # must wait until nrf-mpsl cuts a crates.io release built against embassy-nrf
 # 0.10. Until then, only the default (non-mpsl) feature set is publishable.
-nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
+nrf-mpsl = { git = "https://github.com/Raymond8196/nrf-sdc", branch = "nrfxlib-3.3-embassy-0.10", optional = true, default-features = false }
 # nrf-sdc: used only by the BLE+ESB coexistence examples (mpsl_*_ble, mpsl_3mode_*).
 # Optional + gated behind the `mpsl` feature so it stays out of non-mpsl builds —
 # in particular the nrf52833 `hw` test, which must not pull nrf-sdc's nrf52840
 # pin (that would enable two chip features at once). Same git pin as nrf-mpsl.
-nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", optional = true, default-features = false }
+# Fork branch nrfxlib-3.3-embassy-0.10: nrfxlib 3.3.0 (mpsl_radio_notification)
+# + hfclk API fix, kept on embassy-nrf 0.10 for RMK compatibility.
+nrf-sdc = { git = "https://github.com/Raymond8196/nrf-sdc", branch = "nrfxlib-3.3-embassy-0.10", optional = true, default-features = false }
 
 [features]
 default = ["provide-memory-x"]
@@ -65,7 +67,7 @@ _cs-cortex = ["cortex-m/critical-section-single-core"]
 critical-section = { version = "1", features = ["std"] }
 
 [target.'cfg(target_arch = "arm")'.dev-dependencies]
-bt-hci = { version = "0.8", default-features = false }
+bt-hci = { version = "0.9", default-features = false }
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"] }
 # Chip is intentionally not pinned here: the lib's chip feature (nrf52840 /
 # nrf52833) selects `embassy-nrf/<chip>`, so examples and the `hw` test each

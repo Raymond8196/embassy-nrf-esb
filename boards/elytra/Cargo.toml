@@ -45,17 +45,17 @@ embassy-time = { version = "0.5", features = ["tick-hz-32_768"] }
 embassy-usb = "0.6"
 
 # Same git rev as the library so cargo unifies a single MPSL/SDC copy.
-nrf-mpsl = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", default-features = false, features = [
+nrf-mpsl = { git = "https://github.com/Raymond8196/nrf-sdc", branch = "nrfxlib-3.3-embassy-0.10", default-features = false, features = [
     "nrf52833",
     "defmt",
 ] }
-nrf-sdc = { git = "https://github.com/alexmoon/nrf-sdc", rev = "08620f00fa54e1423c4d54d2da073fb819602d27", default-features = false, features = [
+nrf-sdc = { git = "https://github.com/Raymond8196/nrf-sdc", branch = "nrfxlib-3.3-embassy-0.10", default-features = false, features = [
     "nrf52833",
     "peripheral",
     "defmt",
 ] }
 
-bt-hci = { version = "0.8", default-features = false }
+bt-hci = { version = "0.9", default-features = false }
 cortex-m = { version = "0.7", default-features = false }
 cortex-m-rt = "0.7"
 defmt = "0.3"

@@ -90,9 +90,9 @@ checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
 name = "bt-hci"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "211713d2e9fb4793ce4360a712c0764264aff6be48932ccf02ca2a331c0436a9"
+checksum = "8f3c66fd0a41a3b3a5906847b1bf5516048ce083e24fa9341a0fa31d3b4cd73d"
 dependencies = [
  "btuuid",
  "defmt 1.0.1",
@@ -949,7 +949,7 @@ dependencies = [
 [[package]]
 name = "nrf-mpsl"
 version = "0.3.0"
-source = "git+https://github.com/alexmoon/nrf-sdc?rev=08620f00fa54e1423c4d54d2da073fb819602d27#08620f00fa54e1423c4d54d2da073fb819602d27"
+source = "git+https://github.com/Raymond8196/nrf-sdc?branch=nrfxlib-3.3-embassy-0.10#eb0bf16fe455d5f7d96cdd34e2d8031e5f59e85a"
 dependencies = [
  "cfg-if",
  "cortex-m",
@@ -966,7 +966,7 @@ dependencies = [
 [[package]]
 name = "nrf-mpsl-sys"
 version = "0.2.1"
-source = "git+https://github.com/alexmoon/nrf-sdc?rev=08620f00fa54e1423c4d54d2da073fb819602d27#08620f00fa54e1423c4d54d2da073fb819602d27"
+source = "git+https://github.com/Raymond8196/nrf-sdc?branch=nrfxlib-3.3-embassy-0.10#eb0bf16fe455d5f7d96cdd34e2d8031e5f59e85a"
 dependencies = [
  "bindgen",
  "doxygen-rs",
@@ -985,7 +985,7 @@ dependencies = [
 [[package]]
 name = "nrf-sdc"
 version = "0.4.0"
-source = "git+https://github.com/alexmoon/nrf-sdc?rev=08620f00fa54e1423c4d54d2da073fb819602d27#08620f00fa54e1423c4d54d2da073fb819602d27"
+source = "git+https://github.com/Raymond8196/nrf-sdc?branch=nrfxlib-3.3-embassy-0.10#eb0bf16fe455d5f7d96cdd34e2d8031e5f59e85a"
 dependencies = [
  "bt-hci",
  "critical-section",
@@ -1002,7 +1002,7 @@ dependencies = [
 [[package]]
 name = "nrf-sdc-sys"
 version = "0.2.1"
-source = "git+https://github.com/alexmoon/nrf-sdc?rev=08620f00fa54e1423c4d54d2da073fb819602d27#08620f00fa54e1423c4d54d2da073fb819602d27"
+source = "git+https://github.com/Raymond8196/nrf-sdc?branch=nrfxlib-3.3-embassy-0.10#eb0bf16fe455d5f7d96cdd34e2d8031e5f59e85a"
 dependencies = [
  "bindgen",
  "doxygen-rs",
