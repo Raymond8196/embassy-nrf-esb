@@ -313,103 +313,98 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     defmt::info!("ESB parked PRX session opened (BLE-gap triggered)");
 
     loop {
-        BLE_INACTIVE_SIGNAL.wait().await;
-
-        // Drain events from the previous slot before requesting the next window.
-        // try_next_event is non-blocking; next_event would wait and could stall
-        // on a slot that received nothing.
-        while let Some(ev) = session.try_next_event() {
-            let frame = &ev.payload[..ev.len as usize];
-            let (header, payload) = match accept_bound_frame(
-                &bindings,
-                &mut tracker,
-                ev.pipe,
-                frame,
-            ) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => continue,
-                Err(_) => {
-                    defmt::warn!(
-                        "right frame invalid pipe={} len={} b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={}",
-                        ev.pipe,
-                        ev.len,
-                        ev.payload[0],
-                        ev.payload[1],
-                        ev.payload[2],
-                        ev.payload[3],
-                        ev.payload[4],
-                        ev.payload[5],
-                        ev.payload[6],
-                        ev.payload[7]
-                    );
-                    continue;
-                }
-            };
-
-            RIGHT_LAST_SEEN_MS.store(
-                embassy_time::Instant::now().as_millis() as u32,
-                Ordering::Release,
-            );
-
-            if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
-                let mut changed_count = 0u8;
-                for r in 0..ROWS {
-                    let next = payload[1 + r];
-                    let previous = RIGHT_ROWS_STATE[r].swap(next, Ordering::AcqRel);
-                    if previous != next {
-                        changed_count =
-                            changed_count.saturating_add((previous ^ next).count_ones() as u8);
+        // Drive both concurrently: process a received snapshot the instant it
+        // arrives (next_event wakes on push_event), and open a fresh RX window
+        // on each BLE-INACTIVE. This avoids the up-to-one-conn-interval latency
+        // the previous BLE_INACTIVE-gated drain loop added.
+        match select(session.next_event(), BLE_INACTIVE_SIGNAL.wait()).await {
+            Either::First(Ok(ev)) => {
+                let frame = &ev.payload[..ev.len as usize];
+                match accept_bound_frame(&bindings, &mut tracker, ev.pipe, frame) {
+                    Ok(Some((header, payload))) => {
+                        RIGHT_LAST_SEEN_MS.store(
+                            embassy_time::Instant::now().as_millis() as u32,
+                            Ordering::Release,
+                        );
+                        if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
+                            let mut changed_count = 0u8;
+                            for r in 0..ROWS {
+                                let next = payload[1 + r];
+                                let previous = RIGHT_ROWS_STATE[r].swap(next, Ordering::AcqRel);
+                                if previous != next {
+                                    changed_count = changed_count
+                                        .saturating_add((previous ^ next).count_ones() as u8);
+                                }
+                            }
+                            if changed_count != 0 {
+                                RIGHT_SEQUENCE.store(header.sequence, Ordering::Release);
+                                RIGHT_DIRTY.store(true, Ordering::Release);
+                                RIGHT_CHANGED.signal(());
+                            }
+                            defmt::info!(
+                                "right snapshot pipe={} dev={} seq={} rows={},{},{},{},{} chg={}",
+                                ev.pipe,
+                                header.device_id,
+                                header.sequence,
+                                payload[1],
+                                payload[2],
+                                payload[3],
+                                payload[4],
+                                payload[5],
+                                changed_count
+                            );
+                        } else if payload.len() == 2 {
+                            let key_id = payload[0];
+                            let pressed = payload[1] != 0;
+                            defmt::info!(
+                                "right event pipe={} dev={} key={} pr={} seq={}",
+                                ev.pipe,
+                                header.device_id,
+                                key_id,
+                                pressed as u8,
+                                header.sequence
+                            );
+                            if key_id < (ROWS * RIGHT_COLS) as u8 {
+                                let _ = HID_EVENTS.try_send(KeyEvent {
+                                    key_id: key_id + RIGHT_KEY_BASE,
+                                    pressed,
+                                });
+                            } else {
+                                defmt::warn!(
+                                    "right event invalid key={} pr={}",
+                                    key_id,
+                                    pressed as u8
+                                );
+                            }
+                        } else {
+                            defmt::warn!("right event invalid payload len={}", payload.len());
+                        }
+                    }
+                    Ok(None) => {} // duplicate, already counted
+                    Err(_) => {
+                        defmt::warn!(
+                            "right frame invalid pipe={} len={} b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={}",
+                            ev.pipe,
+                            ev.len,
+                            ev.payload[0],
+                            ev.payload[1],
+                            ev.payload[2],
+                            ev.payload[3],
+                            ev.payload[4],
+                            ev.payload[5],
+                            ev.payload[6],
+                            ev.payload[7]
+                        );
                     }
                 }
-                if changed_count != 0 {
-                    RIGHT_SEQUENCE.store(header.sequence, Ordering::Release);
-                    RIGHT_DIRTY.store(true, Ordering::Release);
-                    RIGHT_CHANGED.signal(());
-                }
-                defmt::info!(
-                    "right snapshot pipe={} dev={} seq={} rows={},{},{},{},{} chg={}",
-                    ev.pipe,
-                    header.device_id,
-                    header.sequence,
-                    payload[1],
-                    payload[2],
-                    payload[3],
-                    payload[4],
-                    payload[5],
-                    changed_count
-                );
-                continue;
             }
-
-            if payload.len() != 2 {
-                defmt::warn!("right event invalid payload len={}", payload.len());
-                continue;
+            Either::First(Err(e)) => {
+                defmt::warn!("prx event error: {:?}", e);
             }
-            let key_id = payload[0];
-            let pressed = payload[1] != 0;
-            defmt::info!(
-                "right event pipe={} dev={} key={} pr={} seq={}",
-                ev.pipe,
-                header.device_id,
-                key_id,
-                pressed as u8,
-                header.sequence
-            );
-            if key_id < (ROWS * RIGHT_COLS) as u8 {
-                let _ = HID_EVENTS.try_send(KeyEvent {
-                    key_id: key_id + RIGHT_KEY_BASE,
-                    pressed,
-                });
-            } else {
-                defmt::warn!("right event invalid key={} pr={}", key_id, pressed as u8);
-            }
-        }
-
-        match session.request_window() {
-            Ok(_) => {}
-            Err(e) => {
-                defmt::warn!("request_window: {:?}", e);
-            }
+            Either::Second(_) => match session.request_window() {
+                Ok(_) => {}
+                Err(e) => defmt::warn!("request_window: {:?}", e),
+            },
         }
     }
 }
@@ -726,6 +721,23 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) -> bool {
             let mut peer_addr = [0u8; 6];
             peer_addr.copy_from_slice(&data[6..12]);
             on_ble_connected(sdc, handle, peer_addr_type, peer_addr);
+            // LE Connection Complete carries the initial ConnInterval at [12..14].
+            if data.len() >= 14 {
+                let interval = u16::from_le_bytes([data[12], data[13]]);
+                embassy_nrf_esb::mpsl_timeslot::set_prx_conn_interval_us(interval as u32 * 1250);
+            }
+        }
+        3 if data.len() >= 6 && data[1] == 0 => {
+            // LE Connection Update Complete — carries the *negotiated* interval.
+            // Fires after request_conn_params' L2CAP update is accepted; this is
+            // the authoritative value the parked-PRX hint should use.
+            let interval = u16::from_le_bytes([data[4], data[5]]);
+            embassy_nrf_esb::mpsl_timeslot::set_prx_conn_interval_us(interval as u32 * 1250);
+            defmt::info!(
+                "BLE conn interval: raw={} ({}us)",
+                interval,
+                interval as u32 * 1250
+            );
         }
         5 if data.len() >= 13 => {
             let handle = u16::from_le_bytes([data[1], data[2]]) & 0x0fff;
@@ -740,6 +752,18 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) -> bool {
             let mut peer_addr = [0u8; 6];
             peer_addr.copy_from_slice(&data[6..12]);
             on_ble_connected(sdc, handle, peer_addr_type, peer_addr);
+            // LE Enhanced Connection Complete: ConnInterval at [24..26]
+            // (after local+peer RPA). Host's actual interval — used by parked-PRX
+            // hint even if the host rejected our L2CAP update (no subevent 3).
+            if data.len() >= 26 {
+                let interval = u16::from_le_bytes([data[24], data[25]]);
+                embassy_nrf_esb::mpsl_timeslot::set_prx_conn_interval_us(interval as u32 * 1250);
+                defmt::info!(
+                    "BLE conn interval (enhanced): raw={} ({}us)",
+                    interval,
+                    interval as u32 * 1250
+                );
+            }
         }
         _ => {}
     }

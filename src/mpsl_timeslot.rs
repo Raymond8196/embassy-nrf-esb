@@ -25,7 +25,7 @@
 
 use core::cell::RefCell;
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, compiler_fence};
 use core::task::Poll;
 
 use cortex_m::peripheral::NVIC;
@@ -2023,6 +2023,17 @@ pub fn prx_timeslot_active() -> bool {
     PRX_TIMESLOT_ACTIVE.load(Ordering::Acquire)
 }
 
+/// BLE conn interval (μs) learned from the host, used so the parked-PRX
+/// schedule hint tells the PTX when the next BLE-gap RX window will land
+/// (one conn interval away). 0 = unset → hint falls back to slot_length.
+static PRX_CONN_INTERVAL_US: AtomicU32 = AtomicU32::new(0);
+
+/// Set the BLE connection interval (μs) for parked-PRX schedule hints.
+/// Call from the host HCI Connection-Complete / Connection-Update handler.
+pub fn set_prx_conn_interval_us(us: u32) {
+    PRX_CONN_INTERVAL_US.store(us, Ordering::Relaxed);
+}
+
 #[repr(C, align(4))]
 struct PrxBuffers {
     rx: UnsafeCell<[u8; 256]>,
@@ -2119,7 +2130,12 @@ fn prx_next_window_delay_us(state: &PrxInnerState) -> u32 {
 }
 
 fn prx_schedule_period_us(state: &PrxInnerState) -> u32 {
-    if state.prx_schedule.normal_distance_us > 0 {
+    // Parked PRX (BLE-gap triggered): the next RX window is one conn-interval
+    // away, so the hint period must be the conn interval, not the slot length.
+    let conn_interval = PRX_CONN_INTERVAL_US.load(Ordering::Relaxed);
+    if conn_interval > 0 {
+        conn_interval
+    } else if state.prx_schedule.normal_distance_us > 0 {
         state.prx_schedule.normal_distance_us
     } else {
         state.slot_length_us

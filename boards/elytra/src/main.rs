@@ -48,8 +48,8 @@ type MyUsbDriver = UsbDriver<'static, &'static SoftwareVbusDetect>;
 const LOG_BUF_SIZE: usize = 256;
 const RETRY_DELAY_US: u64 = 250;
 const RIGHT_DEVICE_ID: u8 = 0;
-const ENABLE_FIRST_ATTEMPT_ALIGNMENT: bool = false;
-const ENABLE_HINT_RETRY_WAIT: bool = false;
+const ENABLE_FIRST_ATTEMPT_ALIGNMENT: bool = true;
+const ENABLE_HINT_RETRY_WAIT: bool = true;
 const MIN_HINT_RETRY_GAP_US: u32 = 500;
 const LINK_TIMING_CONFIG: LinkTimingConfig = LinkTimingConfig {
     hint_valid_us: 200_000,
