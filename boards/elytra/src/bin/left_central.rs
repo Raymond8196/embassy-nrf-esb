@@ -28,7 +28,7 @@ use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use nrf_sdc::vendor::ZephyrWriteBdAddr;
 use nrf_sdc::{self as sdc, SoftdeviceController};
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+use {defmt_rtt as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
@@ -1501,3 +1501,20 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("Elytra left central BLE HID + ESB PRX started");
 }
+
+// --- Production panic handler (replaces panic-probe) ---
+// Prints via defmt (non-blocking if no RTT client), waits for flush, then
+// resets. panic-probe hangs forever when no probe is attached; this ensures
+// the keyboard reboots and recovers.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    if let Some(loc) = info.location() {
+        defmt::error!("PANIC: {}:{}", loc.file(), loc.line());
+    } else {
+        defmt::error!("PANIC: unknown location");
+    }
+    defmt::flush();
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
+

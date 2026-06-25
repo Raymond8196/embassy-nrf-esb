@@ -33,7 +33,7 @@ use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use nrf_mpsl::{MultiprotocolServiceLayer, Peripherals, SessionMem, raw};
 use static_cell::StaticCell;
-use {defmt_rtt as _, panic_probe as _};
+use {defmt_rtt as _};
 
 use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
@@ -563,4 +563,19 @@ async fn main(spawner: Spawner) {
             log(&buf[..cum_len]);
         }
     }
+}
+
+// --- Production panic handler (replaces panic-probe) ---
+// Prints via defmt (non-blocking if no RTT client), waits ~50ms for flush,
+// then resets. panic-probe hangs forever when no probe is attached; this
+// ensures the keyboard reboots and recovers.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    if let Some(loc) = info.location() {
+        defmt::error!("PANIC: {}:{}", loc.file(), loc.line());
+    } else {
+        defmt::error!("PANIC: unknown location");
+    }
+    defmt::flush();
+    cortex_m::peripheral::SCB::sys_reset();
 }
