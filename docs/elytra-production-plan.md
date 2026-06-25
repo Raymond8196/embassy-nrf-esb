@@ -155,17 +155,17 @@ dongle insertion/removal is a later extension, not the first implementation.
   - **Record baseline metrics**: OK rate, ACK rate, retry/max-attempt count,
     duplicate drops, and the chosen latency measurement method
 
-- [ ] **D1: Production hardening items** (Mon evening, code-only)
-  - Audit `left_central.rs` error handling: all session open failures must
-    degrade gracefully (currently some panic)
-  - Add BLE disconnect/reconnect resilience: verify G1 survives phone
-    walking out of range and coming back
-  - Verify transport ACK dedup under retransmit: rapid key bursts should
-    not produce duplicate events after RMK-layer `SequenceTracker`
-  - Add defmt panic handler (not panic-probe) for production: must not
-    hang on RTT if defmt isn't connected
-  - Add explicit all-keys-up / HID clear path for disconnect, panic recovery,
-    and future mode switches
+- [x] **D1: Production hardening items** (Mon evening, code-only) ✅ commit `bfa60da`+`2971f54`
+  - [x] Audit `left_central.rs` error handling: all session open failures
+    degrade gracefully (PRX retry 1s backoff, HFCLK retry 500ms backoff)
+  - [ ] Add BLE disconnect/reconnect resilience: verify G1 survives phone
+    walking out of range and coming back *(needs hardware)*
+  - [ ] Verify transport ACK dedup under retransmit: rapid key bursts should
+    not produce duplicate events after RMK-layer `SequenceTracker` *(needs hardware)*
+  - [x] Add defmt panic handler (not panic-probe) for production: must not
+    hang on RTT if defmt isn't connected (commit `2971f54`)
+  - [x] Add explicit all-keys-up / HID clear path for disconnect, panic recovery,
+    and future mode switches (clear_right_keys, request_hid_clear, HID_CLEAR_REQUESTED)
 
 - [ ] **D2: Right half hardening** (Tue evening, code + hardware)
   - Matrix scan: verify all rows (P0.03 issue documented in bring-up —
@@ -178,17 +178,16 @@ dongle insertion/removal is a later extension, not the first implementation.
 
 #### D3-D4 (Wed-Thu evening): Dongle firmware (G2 PRX exclusive)
 
-- [ ] **D3: Dongle PRX exclusive firmware** (Wed evening, code-only)
-  - New `boards/elytra/src/bin/dongle_central.rs` (or example)
-  - Uses `EsbPrx::new()` (exclusive mode, not MPSL)
-  - Multi-pipe: pipe 0 = left half, pipe 1 = right half
-  - USB HID: start with a minimal fixed keymap, then grow toward full keymap
-    once transport and multi-pipe routing are stable
-  - Transport layer: `accept_bound_frame` per pipe, merge into one keymap
-  - HFCLK: direct `CLOCK.tasks_hfclkstart()` (no MPSL)
-  - No BLE, no SDC, no MPSL code linked
-  - Track per-device counters: rx, duplicate drop, decode error, binding
-    mismatch, max-attempt/ACK information if available
+- [x] **D3: Dongle PRX exclusive firmware** (Wed evening, code-only) ✅ commit `553b178`
+  - [x] New `examples/dongle_central.rs`
+  - [x] Uses `EsbPrx::new()` (exclusive mode, not MPSL)
+  - [x] Multi-pipe: pipe 0 = left half, pipe 1 = right half
+  - [x] USB HID: full Elytra keymap (6KRO)
+  - [x] Transport layer: `accept_bound_frame` per pipe, merge into one keymap
+  - [x] HFCLK: direct `CLOCK.tasks_hfclkstart()` (no MPSL)
+  - [x] No BLE, no SDC, no MPSL code linked
+  - [x] Track per-device counters: rx, duplicate drop, decode error, binding
+    mismatch
 
 - [ ] **D4: Dongle bring-up** (Thu evening, hardware)
   - Flash dongle firmware to nRF52840 dongle

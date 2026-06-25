@@ -72,7 +72,7 @@ Costs / risks:
   (current `max_retries=0`). Expect 100% → ~95–99%.
 - Re-verify OK rate, right latency, and BLE coexistence for each period.
 
-## Current status (2026-06-24)
+## Current status (2026-06-25)
 
 - Host BLE conn params now actively requested: `request_conn_params()` in
   `boards/elytra/src/bin/left_central.rs` sends L2CAP 0x12 after encryption
@@ -80,6 +80,15 @@ Costs / risks:
   not the prototype's 100ms coexistence value). Fixes the intermittent idle BLE
   disconnect (the port had dropped the active param update). Long-run
   confirmation pending.
-- Open work: verify 7.5ms host BLE coexistence; design/implement
-  `NordicExtendPaced` for power; PPK2 measurement to confirm the ~4-5mA left
-  idle figure.
+- **Parked PRX implemented and hardware-verified** (commit `dbab4db`): left half
+  now opens a single ESB RX window on each BLE-INACTIVE radio notification
+  instead of continuous chaining. Uses `mpsl_radio_notification_cfg_set`
+  (`INT_ON_INACTIVE`, nrfxlib 3.3.0 API). Right-half packets received with no
+  drops/dupes (seq 195..219 contiguous). No self-trigger loop (ESB timeslots
+  are back-to-back with BLE events ⇒ notification merges/skips them). See
+  `docs/radio-notification-self-trigger.md`.
+- The `NordicExtendPaced` profile concept has been superseded by parked PRX,
+  which achieves the same goal (RX only in BLE gaps) without requiring PTX
+  polling or phase-locked timing changes on the right half.
+- Open work: PPK2 measurement to confirm idle current dropped from ~4-5mA to
+  the BLE-event-rate cost (~200µA theoretical).
