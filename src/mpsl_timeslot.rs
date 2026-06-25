@@ -2853,11 +2853,7 @@ impl PrxSlotSession {
                 return None;
             }
 
-            prx_set_earliest_request(
-                state,
-                TIMESLOT_PRIORITY_NORMAL,
-                state.request_timeout_us,
-            );
+            prx_set_earliest_request(state, TIMESLOT_PRIORITY_NORMAL, state.request_timeout_us);
             state.request_outstanding = true;
             Some(core::ptr::from_ref(&state.request))
         });

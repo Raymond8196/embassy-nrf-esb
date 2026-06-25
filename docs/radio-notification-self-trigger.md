@@ -59,11 +59,22 @@ Only BLE (protocol stack) edges fire the cb.
 - The radio-notification-driven parked-RX design is viable as-is for the
   self-trigger concern.
 
-## Not yet verified (Step 3)
+## Step 3 — receive verification (done)
 
-- Whether parked windows actually **receive** right-half packets — the probe only
-  counts (`request_window`), does not call `try_next_event`.
-- Right-half PTX is currently `PhaseLocked` to the old continuous rhythm; parked
-  windows sit in BLE gaps on a different cadence, so packets likely miss until
-  PTX timing is adapted (disable `PhaseLocked`, or switch to explicit
-  window/backoff). This is the paired change called out in the review.
+Parked windows **do receive** right-half packets. Verified on hardware:
+
+- Right snapshot seq 195..219 chg=1, contiguous — keypresses received in
+  BLE-gap windows with no drops/dupes.
+- req=66/s coal=0 steady — still no self-trigger with receive enabled.
+- End-to-end: right-half keys produce characters on host (BLE HID), no
+  perceivable latency/stuck-key issues vs continuous PRX.
+
+Right half needs **no change** — it stays event-driven (PTX sends on key press,
+retries until ACK). The parked window in each BLE gap is enough to catch the
+retransmitted packet.
+
+## Production status
+
+The parked PRX path is now the default in `left_central.rs` (continuous PRX
+removed). The self-trigger probe instrumentation has been cleaned up; only
+`BLE_INACTIVE_SIGNAL` + `radio_notification_cb(INACTIVE)` remain.

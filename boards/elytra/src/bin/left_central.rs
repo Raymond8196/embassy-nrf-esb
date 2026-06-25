@@ -34,7 +34,6 @@ use embassy_nrf_esb::addresses::EsbAddresses;
 use embassy_nrf_esb::config::EsbConfig;
 use embassy_nrf_esb::mpsl_timeslot::{
     CoexistenceProfile, PrxAckExtension, PrxSlotConfig, open_parked_prx_session_with_ack_extension,
-    open_prx_session_with_ack_extension,
 };
 use embassy_nrf_esb::transport::{
     SequenceTracker, StaticBindingTable, TRANSPORT_ACK_LEN, TransportAck, accept_bound_frame,
@@ -95,18 +94,9 @@ static HID_CLEAR_REQUESTED: AtomicBool = AtomicBool::new(false);
 static SMP_STATE: Mutex<CriticalSectionRawMutex, RefCell<SmpState>> =
     Mutex::new(RefCell::new(SmpState::new()));
 
-// Radio-notification observation counters (Step 1 — observe before wiring RX
-// windows). Incremented from the priority-0 callback only; read by radio_obs_task.
-static RADIO_NOTIF_ACTIVE: AtomicU32 = AtomicU32::new(0);
-static RADIO_NOTIF_INACTIVE: AtomicU32 = AtomicU32::new(0);
-
-// Step 2 self-trigger test state. INACTIVE_SIGNAL is set by the priority-0 cb on
-// BLE-INACTIVE; prx_parked_test_task waits on it and calls request_window.
-// REQUEST_COUNT = windows actually requested (Ok(true)); REQUEST_COALESCED =
-// suppressed because a window/slot was already active or pending.
-static INACTIVE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static REQUEST_COUNT: AtomicU32 = AtomicU32::new(0);
-static REQUEST_COALESCED: AtomicU32 = AtomicU32::new(0);
+// BLE-INACTIVE radio-notification signal. Set by the priority-0 callback when
+// a BLE connection event ends; prx_task waits on it to request an ESB RX window.
+static BLE_INACTIVE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[derive(Clone, Copy)]
 struct KeyEvent {
@@ -195,48 +185,11 @@ async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     core::future::pending().await
 }
 
-/// Priority-0 MPSL radio-notification callback — observation only (Step 1).
-/// Counts ACTIVE/INACTIVE edges. Must stay tiny: no logging, no timeslot reqs.
+/// Priority-0 MPSL radio-notification callback. Fires at the end of each BLE
+/// radio event (INACTIVE). Must stay tiny: just signal the PRX task.
 unsafe extern "C" fn radio_notification_cb(source: raw::mpsl_radio_notification_source_t) {
-    match source {
-        raw::MPSL_RADIO_NOTIFICATION_SOURCE_ACTIVE => {
-            RADIO_NOTIF_ACTIVE.fetch_add(1, Ordering::Relaxed);
-        }
-        raw::MPSL_RADIO_NOTIFICATION_SOURCE_INACTIVE => {
-            RADIO_NOTIF_INACTIVE.fetch_add(1, Ordering::Relaxed);
-            INACTIVE_SIGNAL.signal(());
-        }
-        _ => {}
-    }
-}
-
-/// Step 1 observation: print radio-notification edge rates every 2 s. The key
-/// question is whether ESB timeslots (continuous PRX here) also fire INACTIVE —
-/// if inactive/s is far above the BLE conn-event rate, the self-trigger loop is
-/// real and the parked-RX design must self-mask ESB-origin notifications.
-#[embassy_executor::task]
-async fn radio_obs_task() {
-    let mut last_active: u32 = 0;
-    let mut last_inactive: u32 = 0;
-    let mut last_req: u32 = 0;
-    let mut last_coal: u32 = 0;
-    loop {
-        Timer::after_secs(2).await;
-        let active = RADIO_NOTIF_ACTIVE.load(Ordering::Relaxed);
-        let inactive = RADIO_NOTIF_INACTIVE.load(Ordering::Relaxed);
-        let req = REQUEST_COUNT.load(Ordering::Relaxed);
-        let coal = REQUEST_COALESCED.load(Ordering::Relaxed);
-        defmt::info!(
-            "radio notif/s: active={} inactive={} req={}/s coal={}",
-            (active - last_active) / 2,
-            (inactive - last_inactive) / 2,
-            (req - last_req) / 2,
-            (coal - last_coal) / 2
-        );
-        last_active = active;
-        last_inactive = inactive;
-        last_req = req;
-        last_coal = coal;
+    if source == raw::MPSL_RADIO_NOTIFICATION_SOURCE_INACTIVE {
+        BLE_INACTIVE_SIGNAL.signal(());
     }
 }
 
@@ -325,8 +278,13 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     )
     .unwrap();
     let cfg = PrxSlotConfig::for_profile(CoexistenceProfile::NordicExtend);
+
+    // Parked PRX: opens a single RX window on each BLE-INACTIVE notification
+    // instead of continuous chaining. Cuts idle current from ~4-5mA (continuous
+    // RX) to the BLE-event-rate cost only (~200µA). Hardware-verified: right-half
+    // packets arrive with no drops/dupes; no self-trigger loop.
     let mut session = loop {
-        match open_prx_session_with_ack_extension(
+        match open_parked_prx_session_with_ack_extension(
             mpsl,
             &esb_cfg,
             &esb_addr,
@@ -335,7 +293,7 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
         ) {
             Ok(s) => break s,
             Err(e) => {
-                defmt::warn!("PRX session open failed: {:?}, retrying in 1s", e);
+                defmt::warn!("parked PRX open failed: {:?}, retrying in 1s", e);
                 Timer::after_secs(1).await;
             }
         }
@@ -352,166 +310,47 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
         None,
     ]);
     let mut tracker = SequenceTracker::<1>::new();
-    defmt::info!("ESB PRX session opened");
+    defmt::info!("ESB parked PRX session opened (BLE-gap triggered)");
 
     loop {
-        match session.next_event().await {
-            Ok(ev) => {
-                let frame = &ev.payload[..ev.len as usize];
-                let (header, payload) = match accept_bound_frame(
-                    &bindings,
-                    &mut tracker,
-                    ev.pipe,
-                    frame,
-                ) {
-                    Ok(Some(frame)) => frame,
-                    Ok(None) => continue,
-                    Err(_) => {
-                        defmt::warn!(
-                            "right frame invalid pipe={} len={} b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={}",
-                            ev.pipe,
-                            ev.len,
-                            ev.payload[0],
-                            ev.payload[1],
-                            ev.payload[2],
-                            ev.payload[3],
-                            ev.payload[4],
-                            ev.payload[5],
-                            ev.payload[6],
-                            ev.payload[7]
-                        );
-                        continue;
-                    }
-                };
+        BLE_INACTIVE_SIGNAL.wait().await;
 
-                // Update link-loss watchdog timestamp on every valid frame.
-                RIGHT_LAST_SEEN_MS.store(
-                    embassy_time::Instant::now().as_millis() as u32,
-                    Ordering::Release,
-                );
-
-                if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
-                    let mut changed_count = 0u8;
-                    for r in 0..ROWS {
-                        let next = payload[1 + r];
-                        let previous = RIGHT_ROWS_STATE[r].swap(next, Ordering::AcqRel);
-                        if previous != next {
-                            changed_count =
-                                changed_count.saturating_add((previous ^ next).count_ones() as u8);
-                        }
-                    }
-
-                    if changed_count != 0 {
-                        RIGHT_SEQUENCE.store(header.sequence, Ordering::Release);
-                        RIGHT_DIRTY.store(true, Ordering::Release);
-                        RIGHT_CHANGED.signal(());
-                    }
-
-                    defmt::info!(
-                        "right snapshot pipe={} dev={} seq={} rows={},{},{},{},{} chg={}",
+        // Drain events from the previous slot before requesting the next window.
+        // try_next_event is non-blocking; next_event would wait and could stall
+        // on a slot that received nothing.
+        while let Some(ev) = session.try_next_event() {
+            let frame = &ev.payload[..ev.len as usize];
+            let (header, payload) = match accept_bound_frame(
+                &bindings,
+                &mut tracker,
+                ev.pipe,
+                frame,
+            ) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => continue,
+                Err(_) => {
+                    defmt::warn!(
+                        "right frame invalid pipe={} len={} b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={}",
                         ev.pipe,
-                        header.device_id,
-                        header.sequence,
-                        payload[1],
-                        payload[2],
-                        payload[3],
-                        payload[4],
-                        payload[5],
-                        changed_count
+                        ev.len,
+                        ev.payload[0],
+                        ev.payload[1],
+                        ev.payload[2],
+                        ev.payload[3],
+                        ev.payload[4],
+                        ev.payload[5],
+                        ev.payload[6],
+                        ev.payload[7]
                     );
                     continue;
                 }
-
-                if payload.len() != 2 {
-                    defmt::warn!("right event invalid payload len={}", payload.len());
-                    continue;
-                }
-                let key_id = payload[0];
-                let pressed = payload[1] != 0;
-                defmt::info!(
-                    "right event pipe={} dev={} key={} pr={} seq={}",
-                    ev.pipe,
-                    header.device_id,
-                    key_id,
-                    pressed as u8,
-                    header.sequence
-                );
-                if key_id < (ROWS * RIGHT_COLS) as u8 {
-                    let _ = HID_EVENTS.try_send(KeyEvent {
-                        key_id: key_id + RIGHT_KEY_BASE,
-                        pressed,
-                    });
-                } else {
-                    defmt::warn!("right event invalid key={} pr={}", key_id, pressed as u8);
-                }
-            }
-            Err(e) => {
-                defmt::warn!("prx event error: {:?}", e);
-                embassy_time::Timer::after_millis(20).await;
-            }
-        }
-    }
-}
-
-/// Step 2 self-trigger test: open a PARKED PRX session, wait for a BLE-INACTIVE
-/// radio notification, then request one RX window. Does NOT consume events —
-/// only measures request_window fire rate to judge whether ESB RX windows
-/// self-trigger further INACTIVE notifications (the documented risk, since
-/// notification covers application timeslots and is only skipped when events
-/// are too close, which parked windows at BLE-interval spacing are not).
-/// Verdict: req≈66/s = BLE-only (no self-trigger); req≫66 = self-loop confirmed.
-#[embassy_executor::task]
-async fn prx_parked_test_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
-    let esb_cfg = EsbConfig::default();
-    let esb_addr = EsbAddresses::new(
-        [0xE7, 0xE7, 0xE7, 0xE7],
-        [0xC2, 0xC2, 0xC2, 0xC2],
-        [0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8],
-        8,
-    )
-    .unwrap();
-    let cfg = PrxSlotConfig::for_profile(CoexistenceProfile::NordicExtend);
-    let mut session = match open_parked_prx_session_with_ack_extension(
-        mpsl,
-        &esb_cfg,
-        &esb_addr,
-        cfg,
-        Some(right_transport_ack_extension),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            defmt::error!("parked PRX open failed: {:?}", e);
-            return;
-        }
-    };
-    let bindings = StaticBindingTable::<8>::from_pipe_entries([
-        None,
-        Some(RIGHT_DEVICE_ID),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ]);
-    let mut tracker = SequenceTracker::<1>::new();
-    defmt::info!("ESB PRX parked session opened (self-trigger + receive test)");
-    loop {
-        INACTIVE_SIGNAL.wait().await;
-        // Drain events from the previous slot before requesting the next window.
-        // (try_next_event is non-blocking; next_event would wait and could stall
-        //  on a slot that received nothing.)
-        while let Some(ev) = session.try_next_event() {
-            let frame = &ev.payload[..ev.len as usize];
-            let Ok(Some((header, payload))) =
-                accept_bound_frame(&bindings, &mut tracker, ev.pipe, frame)
-            else {
-                continue;
             };
+
             RIGHT_LAST_SEEN_MS.store(
                 embassy_time::Instant::now().as_millis() as u32,
                 Ordering::Release,
             );
+
             if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
                 let mut changed_count = 0u8;
                 for r in 0..ROWS {
@@ -528,21 +367,46 @@ async fn prx_parked_test_task(mpsl: &'static MultiprotocolServiceLayer<'static>)
                     RIGHT_CHANGED.signal(());
                 }
                 defmt::info!(
-                    "right snapshot (parked) pipe={} dev={} seq={} chg={}",
+                    "right snapshot pipe={} dev={} seq={} rows={},{},{},{},{} chg={}",
                     ev.pipe,
                     header.device_id,
                     header.sequence,
+                    payload[1],
+                    payload[2],
+                    payload[3],
+                    payload[4],
+                    payload[5],
                     changed_count
                 );
+                continue;
+            }
+
+            if payload.len() != 2 {
+                defmt::warn!("right event invalid payload len={}", payload.len());
+                continue;
+            }
+            let key_id = payload[0];
+            let pressed = payload[1] != 0;
+            defmt::info!(
+                "right event pipe={} dev={} key={} pr={} seq={}",
+                ev.pipe,
+                header.device_id,
+                key_id,
+                pressed as u8,
+                header.sequence
+            );
+            if key_id < (ROWS * RIGHT_COLS) as u8 {
+                let _ = HID_EVENTS.try_send(KeyEvent {
+                    key_id: key_id + RIGHT_KEY_BASE,
+                    pressed,
+                });
+            } else {
+                defmt::warn!("right event invalid key={} pr={}", key_id, pressed as u8);
             }
         }
+
         match session.request_window() {
-            Ok(true) => {
-                REQUEST_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(false) => {
-                REQUEST_COALESCED.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(_) => {}
             Err(e) => {
                 defmt::warn!("request_window: {:?}", e);
             }
@@ -1541,21 +1405,21 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mpsl_task(mpsl).unwrap());
     spawner.spawn(hfclk_task(mpsl).unwrap());
 
-    // Radio notification: observation only (Step 1). Configure after MPSL is
-    // enabled and before the SDC protocol stack starts, else it returns
-    // EINPROGRESS. INT_ON_BOTH to see both edges; distance_min satisfies the
-    // ACTIVE pre-notification requirement (INACTIVE ignores distance).
+    // Radio notification: fires at the end of each BLE radio event (INACTIVE).
+    // Configured after MPSL is enabled and before the SDC protocol stack starts,
+    // else it returns EINPROGRESS. prx_task waits on this signal to open a
+    // single ESB RX window in each BLE gap, replacing continuous RX (~4-5mA →
+    // ~200µA idle).
     {
         let r = unsafe {
             raw::mpsl_radio_notification_cfg_set(
-                raw::MPSL_RADIO_NOTIFICATION_TYPE_INT_ON_BOTH as u8,
+                raw::MPSL_RADIO_NOTIFICATION_TYPE_INT_ON_INACTIVE as u8,
                 raw::MPSL_RADIO_NOTIFICATION_DISTANCE_MIN_US as u16,
                 Some(radio_notification_cb),
             )
         };
         defmt::info!("radio notification cfg ret={}", r);
     }
-    spawner.spawn(radio_obs_task().unwrap());
 
     let sdc_p = sdc::Peripherals::new(
         p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
@@ -1580,7 +1444,7 @@ async fn main(spawner: Spawner) {
     start_advertising(sdc).await;
     spawner.spawn(sdc_task(sdc, mpsl).unwrap());
     spawner.spawn(hid_task(sdc).unwrap());
-    spawner.spawn(prx_parked_test_task(mpsl).unwrap());
+    spawner.spawn(prx_task(mpsl).unwrap());
 
     let cols = [
         Output::new(p.P0_30, Level::Low, OutputDrive::Standard),
