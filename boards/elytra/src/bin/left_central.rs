@@ -317,8 +317,8 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
         // arrives (next_event wakes on push_event), and open a fresh RX window
         // on each BLE-INACTIVE. This avoids the up-to-one-conn-interval latency
         // the previous BLE_INACTIVE-gated drain loop added.
-        match select(session.next_event(), BLE_INACTIVE_SIGNAL.wait()).await {
-            Either::First(Ok(ev)) => {
+        match select(BLE_INACTIVE_SIGNAL.wait(), session.next_event()).await {
+            Either::Second(Ok(ev)) => {
                 let frame = &ev.payload[..ev.len as usize];
                 match accept_bound_frame(&bindings, &mut tracker, ev.pipe, frame) {
                     Ok(Some((header, payload))) => {
@@ -398,10 +398,10 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
                     }
                 }
             }
-            Either::First(Err(e)) => {
+            Either::Second(Err(e)) => {
                 defmt::warn!("prx event error: {:?}", e);
             }
-            Either::Second(_) => match session.request_window() {
+            Either::First(_) => match session.request_window() {
                 Ok(_) => {}
                 Err(e) => defmt::warn!("request_window: {:?}", e),
             },

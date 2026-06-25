@@ -2883,6 +2883,7 @@ impl PrxSlotSession {
             PRX_STATE.with_inner(|state| {
                 state.request_outstanding = false;
             });
+            defmt::warn!("mpsl_timeslot_request ret={}", ret);
             return Err(e);
         }
 
