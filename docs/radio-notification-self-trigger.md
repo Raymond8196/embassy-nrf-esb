@@ -78,3 +78,39 @@ retransmitted packet.
 The parked PRX path is now the default in `left_central.rs` (continuous PRX
 removed). The self-trigger probe instrumentation has been cleaned up; only
 `BLE_INACTIVE_SIGNAL` + `radio_notification_cb(INACTIVE)` remain.
+
+## select order tradeoff + idle BLE disconnect (open)
+
+`prx_task` runs `select(BLE_INACTIVE_SIGNAL.wait(), session.next_event())` with
+BLE_INACTIVE polled first, so `request_window` (open an RX window) wins over
+`next_event` processing. This prevents ESB co-channel noise (0x83 invalid
+frames from a nearby powered dongle on the same addr/pipe) from starving
+`request_window` and dropping right-half snapshots (drops 17% -> ~0%).
+
+Tradeoff: BLE_INACTIVE-first opens a window on *every* conn event (30ms). When
+idle (no HID traffic keeping the link active), these windows contend with BLE
+conn events for radio time -> occasional conn event loss -> supervision timeout
+-> BLE disconnect. Observed: active typing stays connected; idle for a while
+disconnects.
+
+Both select orders have a failure mode:
+- `next_event` first: no idle disconnect, but invalid noise starves
+  `request_window` -> snapshot drops.
+- `BLE_INACTIVE` first: no drops, but idle disconnect.
+
+Root cause is parked-window vs BLE-conn-event radio contention (uncoordinated
+cadence). Fixes to try next:
+- Throttle `request_window` (not every conn event; every Nth, or right-half
+  demand-driven).
+- Idle disconnect -> auto-reconnect (adv restart already in code; Mac
+  reconnects) — treat symptom, robust.
+
+Also open:
+- `request_window` occasionally returns `ret=-35` (~1%, likely MPSL
+  EINPROGRESS timing race).
+- Host (Mac) rejects conn 15ms / latency 30, keeps 30ms / latency 0 — so BLE
+  itself costs ~550uA idle (every conn event received). Getting Mac to accept
+  latency 30 would cut BLE idle to ~tens of uA.
+- Co-channel dongle: use distinct ESB addresses (base/prefix) so the PRX
+  hardware address-filter drops the dongle's packets instead of relying on
+  unplug.
