@@ -34,7 +34,7 @@ use embassy_nrf_esb::isr::{DEFAULT_POOL_N, DEFAULT_POOL_SIZE, EsbPrx};
 use embassy_nrf_esb::payload::PacketPool;
 use embassy_nrf_esb::transport::{self, SequenceTracker, StaticBindingTable, TransportAck};
 
-use panic_halt as _;
+use {defmt_rtt as _, panic_halt as _};
 mod interrupt {
     pub use embassy_nrf::pac::Interrupt::*;
 }
