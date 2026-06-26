@@ -79,7 +79,7 @@ The parked PRX path is now the default in `left_central.rs` (continuous PRX
 removed). The self-trigger probe instrumentation has been cleaned up; only
 `BLE_INACTIVE_SIGNAL` + `radio_notification_cb(INACTIVE)` remain.
 
-## select order tradeoff + idle BLE disconnect (open)
+## select order + idle BLE disconnect (resolved: cause was the dongle)
 
 `prx_task` runs `select(BLE_INACTIVE_SIGNAL.wait(), session.next_event())` with
 BLE_INACTIVE polled first, so `request_window` (open an RX window) wins over
@@ -87,30 +87,33 @@ BLE_INACTIVE polled first, so `request_window` (open an RX window) wins over
 frames from a nearby powered dongle on the same addr/pipe) from starving
 `request_window` and dropping right-half snapshots (drops 17% -> ~0%).
 
-Tradeoff: BLE_INACTIVE-first opens a window on *every* conn event (30ms). When
-idle (no HID traffic keeping the link active), these windows contend with BLE
-conn events for radio time -> occasional conn event loss -> supervision timeout
--> BLE disconnect. Observed: active typing stays connected; idle for a while
-disconnects.
+**Earlier hypothesis (now refuted):** BLE_INACTIVE-first opens a window on
+*every* conn event (30ms), which was believed to contend with BLE conn events
+-> conn-event loss -> supervision timeout -> idle disconnect.
 
-Both select orders have a failure mode:
-- `next_event` first: no idle disconnect, but invalid noise starves
-  `request_window` -> snapshot drops.
-- `BLE_INACTIVE` first: no drops, but idle disconnect.
+**Verified wrong on hardware:** with the co-channel dongle removed, a 12+ minute
+run opening a window every 30ms (heavy typing, ~290 snapshots, seq contiguous)
+produced **0 BLE disconnects**. Window cadence is independent of HID traffic,
+so if windows contended they would disconnect under load too — they don't. The
+earlier idle disconnect was the **co-channel dongle's ESB transmissions jamming
+the left's BLE conn events** (2.4GHz co-channel RF interference), not the parked
+windows. The BLE_INACTIVE-first select order is kept: it costs nothing (no
+disconnect confirmed) and stays robust to a future dongle.
 
-Root cause is parked-window vs BLE-conn-event radio contention (uncoordinated
-cadence). Fixes to try next:
-- Throttle `request_window` (not every conn event; every Nth, or right-half
-  demand-driven).
-- Idle disconnect -> auto-reconnect (adv restart already in code; Mac
-  reconnects) — treat symptom, robust.
+`request_window` occasionally returns `ret=-35` (~1-2%). Identified:
+`-NRF_EAGAIN` ("the session is not IDLE", per `mpsl_timeslot.h`) — a benign race
+between our `request_outstanding` guard and MPSL's actual session state. The
+next 30ms window recovers; no packet loss, no disconnect. Not worth fixing.
 
-Also open:
-- `request_window` occasionally returns `ret=-35` (~1%, likely MPSL
-  EINPROGRESS timing race).
-- Host (Mac) rejects conn 15ms / latency 30, keeps 30ms / latency 0 — so BLE
-  itself costs ~550uA idle (every conn event received). Getting Mac to accept
-  latency 30 would cut BLE idle to ~tens of uA.
-- Co-channel dongle: use distinct ESB addresses (base/prefix) so the PRX
-  hardware address-filter drops the dongle's packets instead of relying on
-  unplug.
+## Still open
+
+- **Host (Mac) rejects conn 15ms / latency 30, keeps 30ms / latency 0.** With
+  latency 0 the left must RX every conn event -> BLE costs ~550uA idle. Getting
+  Mac to accept a non-zero slave latency would let the left sleep through conn
+  events and cut BLE idle to ~tens of uA. **Biggest remaining idle-power lever.**
+- **Co-channel dongle** (only relevant if a dongle runs alongside the halves):
+  use distinct ESB addresses (base/prefix) so the PRX hardware address-filter
+  drops the dongle's packets instead of relying on unplug. This stops the left
+  *receiving* dongle frames, but does not eliminate RF co-channel energy; BLE
+  frequency-hopping makes occasional jams tolerable (supervision timeout needs
+  ~6s of consecutive misses). Verify with the dongle powered.
