@@ -171,20 +171,6 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
     mpsl.run().await
 }
 
-#[embassy_executor::task]
-async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
-    let _hfclk = loop {
-        match mpsl.request_hfclk().await {
-            Ok(guard) => break guard,
-            Err(e) => {
-                defmt::warn!("HFCLK request failed: {:?}, retrying in 500ms", e);
-                Timer::after_millis(500).await;
-            }
-        }
-    };
-    core::future::pending().await
-}
-
 /// Priority-0 MPSL radio-notification callback. Fires at the end of each BLE
 /// radio event (INACTIVE). Must stay tiny: just signal the PRX task.
 unsafe extern "C" fn radio_notification_cb(source: raw::mpsl_radio_notification_source_t) {
@@ -1427,7 +1413,6 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
     spawner.spawn(mpsl_task(mpsl).unwrap());
-    spawner.spawn(hfclk_task(mpsl).unwrap());
 
     // Radio notification: fires at the end of each BLE radio event (INACTIVE).
     // Configured after MPSL is enabled and before the SDC protocol stack starts,
