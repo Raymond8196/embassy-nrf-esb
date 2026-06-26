@@ -131,6 +131,12 @@ mostly BLE; the parked ESB windows piggyback on the already-scheduled BLE wake
 share (~0.3mA) and would worsen first-key latency — not worth it. **The scheme
 is at its practical idle-power floor for a macOS-connected HID keyboard.**
 
+Follow-up win: a redundant always-on HFCLK task (`hfclk_task`, which held an
+MPSL HFCLK guard forever via `pending()`) was keeping the 16MHz HFXO running
+continuously — pure idle drain, since MPSL already provides HFXO on demand per
+radio event. Removed (7ec5342); verified ESB parked-RX still receives right-half
+packets cleanly. Lowers the floor further; exact numbers pending PPK2.
+
 Cadence-probe aside (corrects the self-trigger reasoning above): a window
 counter showed ~66.7 BLE_INACTIVE signals/sec at a 30ms conn interval = **two
 INACTIVE edges per conn event** (the BLE radio event + the ESB parked window
