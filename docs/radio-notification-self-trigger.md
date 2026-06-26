@@ -105,12 +105,42 @@ disconnect confirmed) and stays robust to a future dongle.
 between our `request_outstanding` guard and MPSL's actual session state. The
 next 30ms window recovers; no packet loss, no disconnect. Not worth fixing.
 
-## Still open
+## Slave-latency investigation (closed: unreachable on macOS)
 
-- **Host (Mac) rejects conn 15ms / latency 30, keeps 30ms / latency 0.** With
-  latency 0 the left must RX every conn event -> BLE costs ~550uA idle. Getting
-  Mac to accept a non-zero slave latency would let the left sleep through conn
-  events and cut BLE idle to ~tens of uA. **Biggest remaining idle-power lever.**
+Hypothesis: request non-zero slave latency so the left can sleep through BLE
+conn events -> cut BLE idle from ~550uA (latency 0) to ~tens of uA. Tested both
+mechanisms on hardware; both blocked:
+
+1. **L2CAP Connection Parameter Update (signaling code 0x12).** Sent after
+   encryption (interval 15-30ms, latency 6, timeout 5s). Mac responds `0`
+   (accepted) but applies **no update** — no LE Connection Update Complete event
+   fires; interval stays 30ms, latency stays 0. macOS accepts the request then
+   ignores the requested latency (enforces latency 0 for HID).
+2. **LL procedure (HCI LE_Connection_Update / `LeConnUpdate`).** Linker error:
+   `sdc_hci_cmd_le_conn_update` exists only in the **central** and **multirole**
+   SoftDevice Controller libraries, not the **peripheral** one the left links.
+   Nordic gates LE Connection Update as a master/central command; the peripheral
+   build only exposes the L2CAP path. Switching to multirole is inappropriate
+   (peripheral-only device) and won't fit — multirole lib ~697KB vs current
+   ~104KB total flash on the nRF52833's 512KB.
+
+**Conclusion: macOS will not grant slave latency via any available mechanism.**
+BLE idle (~550uA, RX every conn event) is host-capped. Total idle ~0.8mA is
+mostly BLE; the parked ESB windows piggyback on the already-scheduled BLE wake
+(nearly free timing). Decoupling ESB wake to an RTC can only cut the small ESB
+share (~0.3mA) and would worsen first-key latency — not worth it. **The scheme
+is at its practical idle-power floor for a macOS-connected HID keyboard.**
+
+Cadence-probe aside (corrects the self-trigger reasoning above): a window
+counter showed ~66.7 BLE_INACTIVE signals/sec at a 30ms conn interval = **two
+INACTIVE edges per conn event** (the BLE radio event + the ESB parked window
+each fire their own INACTIVE). So the ESB window's INACTIVE is **not** merged/
+skipped as the "why the naive reading was wrong" section claimed. There is still
+no self-trigger runaway — but the protection is the `request_outstanding` guard
+(`request_window` returns early while a window is active/outstanding), not
+notification merging. Conclusion unchanged; only the mechanism was mis-stated.
+
+## Still open
 - **Co-channel dongle** (only relevant if a dongle runs alongside the halves):
   use distinct ESB addresses (base/prefix) so the PRX hardware address-filter
   drops the dongle's packets instead of relying on unplug. This stops the left
