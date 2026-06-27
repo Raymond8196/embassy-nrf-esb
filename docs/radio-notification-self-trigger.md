@@ -134,8 +134,11 @@ is at its practical idle-power floor for a macOS-connected HID keyboard.**
 Follow-up win: a redundant always-on HFCLK task (`hfclk_task`, which held an
 MPSL HFCLK guard forever via `pending()`) was keeping the 16MHz HFXO running
 continuously — pure idle drain, since MPSL already provides HFXO on demand per
-radio event. Removed (7ec5342); verified ESB parked-RX still receives right-half
-packets cleanly. Lowers the floor further; exact numbers pending PPK2.
+radio event. Removed from the LEFT in 7ec5342 — but the symmetric fix was
+missed on the RIGHT half (the half meant to deep-sleep), so it still drew ~1mA
+idle and the "beats RMK on power" claim did not hold. An independent review
+caught it; the right's `hfclk_task` is now also removed (af32ae6). Exact idle
+numbers still pending PPK2 — but this was the largest single idle-power leak.
 
 Cadence-probe aside (corrects the self-trigger reasoning above): a window
 counter showed ~66.7 BLE_INACTIVE signals/sec at a 30ms conn interval = **two
