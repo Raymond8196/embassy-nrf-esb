@@ -146,6 +146,39 @@ no self-trigger runaway — but the protection is the `request_outstanding` guar
 (`request_window` returns early while a window is active/outstanding), not
 notification merging. Conclusion unchanged; only the mechanism was mis-stated.
 
+## Adaptive fast-cadence — right-key latency fixed (beats RMK)
+
+The parked-only design (one RX window per BLE conn event, ~30ms) made right-key
+latency ~46ms: a slow ESB hop (right waits up to 30ms for the next window) plus
+a ~28ms receive→HID gap (a packet received early in the BLE gap must wait for
+the *next* conn event to be forwarded). Both are artifacts of the 30ms cadence,
+not inherent to ESB.
+
+Fix (6328eb1 + d25677e): **budget-driven callback chaining**. While frames
+arrive, the PRX slot-end callback chains fast NORMAL windows (~8ms) — the proven
+continuous-PRX primitive, so it's MPSL-safe (no re-trigger of the earlier
+shift-late stall). A frame refills a budget; when it exhausts (~88ms of no
+traffic) the session falls back to parked. `prx_task` is unchanged; all logic is
+callback-context atomics (no app time source). The ACK hint refreshes on frame
+receipt (before the hint is built) so the right's `bounded_wait` sees the fast
+period with no one-ACK lag.
+
+Measured on hardware: `hid_leg` (receive→next-INACTIVE) **~9ms median** (from
+~28ms). Right-key ≈ ESB hop + hid_leg ≈ **~12-16ms**, beating RMK's pure-BLE
+split (~20ms). 0 BLE disconnects / errors across heavy typing. Idle stays
+low-power (parked ~30ms); the fast cadence only runs while typing.
+
+Held-key keepalive (right half): the matrix doesn't change during a hold, so
+without keepalives the link-loss watchdog (500ms) released the key mid-hold and
+OS auto-repeat died after ~2 chars. The right now re-sends the current snapshot
+every 150ms while a key is held, keeping the left's `last_seen` fresh. The
+link-loss watchdog moved to a periodic `link_loss_task` (the inline `hid_task`
+check never re-ran when idle).
+
+Note: this fixes *ESB* latency. The BLE-idle power floor (~550uA, macOS-enforced
+latency 0 — see the slave-latency section above) is unchanged; adaptive cadence
+doesn't sleep BLE, it just stops the ESB from inheriting the 30ms cadence.
+
 ## Still open
 - **Co-channel dongle** (only relevant if a dongle runs alongside the halves):
   use distinct ESB addresses (base/prefix) so the PRX hardware address-filter
