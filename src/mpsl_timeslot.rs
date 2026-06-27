@@ -1050,8 +1050,9 @@ unsafe extern "C" fn ptx_timeslot_callback(
 
                 // Drive the shared SM: power-cycle, re-init, restore dup state,
                 // arm first TX. The SM dequeues from PacketPool.
-                if let Err(_) =
-                    driver.ts_start_tx(state.saved_pid, state.saved_crc, state.saved_valid)
+                if driver
+                    .ts_start_tx(state.saved_pid, state.saved_crc, state.saved_valid)
+                    .is_err()
                 {
                     state.counters.invalid_return += 1;
                     state.phase = PtxPhase::Done;
@@ -2034,6 +2035,46 @@ pub fn set_prx_conn_interval_us(us: u32) {
     PRX_CONN_INTERVAL_US.store(us, Ordering::Relaxed);
 }
 
+/// Adaptive fast-cadence state for parked PRX. When a frame arrives, the
+/// callback refills `PRX_FAST_BUDGET` to `PRX_FAST_BUDGET_REFILL` and each
+/// slot-end chains one more NORMAL window at `PRX_FAST_DISTANCE_US` until the
+/// budget is exhausted — i.e. while the right half is actively sending, RX
+/// windows chain fast (low ESB latency); when it goes idle the budget runs out
+/// and the session falls back to one BLE-gap-triggered window per conn event.
+/// All access is from the single MPSL high-priority callback context.
+static PRX_FAST_DISTANCE_US: AtomicU32 = AtomicU32::new(0);
+static PRX_FAST_BUDGET_REFILL: AtomicU32 = AtomicU32::new(0);
+static PRX_FAST_BUDGET: AtomicU32 = AtomicU32::new(0);
+
+/// Configure adaptive fast-window chaining. `distance_us` is the NORMAL-request
+/// distance between chained fast windows (must be >= slot_length_us); `refill`
+/// is how many fast windows a single received frame funds (sets the active-hold
+/// ≈ refill × distance). 0 distance disables (pure parked cadence).
+pub fn configure_prx_fast_window(distance_us: u32, refill: u32) {
+    PRX_FAST_DISTANCE_US.store(distance_us, Ordering::Relaxed);
+    PRX_FAST_BUDGET_REFILL.store(refill, Ordering::Relaxed);
+}
+
+/// Refill the fast-window budget (called from the callback on a received frame).
+fn prx_refill_fast_budget() {
+    let refill = PRX_FAST_BUDGET_REFILL.load(Ordering::Relaxed);
+    if refill > 0 {
+        PRX_FAST_BUDGET.store(refill, Ordering::Relaxed);
+    }
+}
+
+/// Consume one unit of fast-window budget. Returns true if chaining should
+/// continue (budget was > 0). Called from the callback at slot-end.
+fn prx_consume_fast_budget() -> bool {
+    let b = PRX_FAST_BUDGET.load(Ordering::Relaxed);
+    if b > 0 {
+        PRX_FAST_BUDGET.store(b - 1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 #[repr(C, align(4))]
 struct PrxBuffers {
     rx: UnsafeCell<[u8; 256]>,
@@ -2109,6 +2150,15 @@ fn prx_finalize_and_reschedule(state: &mut PrxInnerState) {
         prx_set_normal_request(state, distance_us);
         state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
         state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+    } else if prx_consume_fast_budget() {
+        // Adaptive fast-cadence chain: a recent frame funded this window; chain
+        // the next NORMAL window one fast-distance from this slot's start. When
+        // the budget runs out (right half idle) we fall through to ACTION_END
+        // and the parked loop's next BLE-INACTIVE re-opens a window.
+        let distance_us = PRX_FAST_DISTANCE_US.load(Ordering::Relaxed);
+        prx_set_normal_request(state, distance_us);
+        state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+        state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
     } else {
         state.request_outstanding = false;
         if !state.auto_reschedule {
@@ -2130,6 +2180,14 @@ fn prx_next_window_delay_us(state: &PrxInnerState) -> u32 {
 }
 
 fn prx_schedule_period_us(state: &PrxInnerState) -> u32 {
+    // Adaptive fast cadence: while the budget is non-zero (right half active),
+    // the hint period is the fast-window distance, not the BLE conn interval.
+    if PRX_FAST_BUDGET.load(Ordering::Relaxed) > 0 {
+        let fast = PRX_FAST_DISTANCE_US.load(Ordering::Relaxed);
+        if fast > 0 {
+            return fast;
+        }
+    }
     // Parked PRX (BLE-gap triggered): the next RX window is one conn-interval
     // away, so the hint period must be the conn interval, not the slot length.
     let conn_interval = PRX_CONN_INTERVAL_US.load(Ordering::Relaxed);
@@ -2456,6 +2514,11 @@ unsafe extern "C" fn prx_timeslot_callback(
                                 state.rx_per_pipe[pipe] += 1;
                             }
                             state.rx_count += 1;
+                            // A new frame arrived → the right half is active:
+                            // fund the fast-cadence budget so this slot chains
+                            // fast windows (and the ACK hint we're about to send
+                            // carries the fast period, no one-ACK lag).
+                            prx_refill_fast_budget();
 
                             let app_len = rx_buf[EsbHeader::DMA_OFFSET] as usize;
                             if app_len > 4 && pipe < NUM_PIPES {
@@ -2883,6 +2946,7 @@ impl PrxSlotSession {
             PRX_STATE.with_inner(|state| {
                 state.request_outstanding = false;
             });
+            #[cfg(feature = "defmt")]
             defmt::warn!("mpsl_timeslot_request ret={}", ret);
             return Err(e);
         }
