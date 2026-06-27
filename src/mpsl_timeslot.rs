@@ -1955,12 +1955,19 @@ impl PrxInnerState {
     }
 
     fn push_event(&mut self, pipe: u8, payload: &[u8]) -> bool {
+        if payload.len() > 32 {
+            // Payload exceeds the fixed 32-byte event slot — drop it (counted)
+            // rather than silently truncating, which would let the receiver act
+            // on partial data. The 32-byte cap is a known PrxReceivedEvent limit.
+            self.event_dropped = self.event_dropped.saturating_add(1);
+            return false;
+        }
         if self.event_len == PRX_EVENT_QUEUE_CAP {
             self.event_dropped = self.event_dropped.saturating_add(1);
             return false;
         }
 
-        let len = payload.len().min(32);
+        let len = payload.len();
         let mut event = PrxReceivedEvent {
             pipe,
             len: len as u8,
@@ -2154,11 +2161,22 @@ fn prx_finalize_and_reschedule(state: &mut PrxInnerState) {
         // Adaptive fast-cadence chain: a recent frame funded this window; chain
         // the next NORMAL window one fast-distance from this slot's start. When
         // the budget runs out (right half idle) we fall through to ACTION_END
-        // and the parked loop's next BLE-INACTIVE re-opens a window.
+        // and the parked loop's next BLE_INACTIVE re-opens a window.
         let distance_us = PRX_FAST_DISTANCE_US.load(Ordering::Relaxed);
-        prx_set_normal_request(state, distance_us);
-        state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
-        state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+        if distance_us >= state.slot_length_us && distance_us <= raw::MPSL_TIMESLOT_DISTANCE_MAX_US
+        {
+            prx_set_normal_request(state, distance_us);
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_REQUEST as u8;
+            state.return_param.params.request.p_next = core::ptr::from_mut(&mut state.request);
+        } else {
+            // Invalid fast distance (misconfiguration) — never submit a NORMAL
+            // request MPSL would reject (it surfaces as INVALID_RETURN, which
+            // otherwise leaves the session wedged). Drain the budget and fall
+            // back to parked (ACTION_END).
+            PRX_FAST_BUDGET.store(0, Ordering::Relaxed);
+            state.request_outstanding = false;
+            state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
+        }
     } else {
         state.request_outstanding = false;
         if !state.auto_reschedule {
@@ -2621,19 +2639,6 @@ unsafe extern "C" fn prx_timeslot_callback(
             t.intenclr().write(|w| w.set_compare(0, true));
             t.shorts().write(|w| w.set_compare_clear(0, false));
 
-            {
-                let r = pac::RADIO;
-                if r.events_disabled().read() != 0 {
-                    state.counters.session_closed += 1;
-                }
-                if r.events_address().read() != 0 {
-                    state.counters.overstayed += 1;
-                }
-                if r.events_payload().read() != 0 {
-                    state.counters.invalid_return += 1;
-                }
-            }
-
             // Converged path: stop driver + snapshot dup state for next slot.
             if let Some(driver) = state.driver {
                 driver.ts_force_stop();
@@ -2802,6 +2807,20 @@ unsafe extern "C" fn prx_timeslot_callback(
         }),
 
         _ => PRX_STATE.with_inner(|state| {
+            // Unhandled signal (e.g. INVALID_RETURN from a malformed request).
+            // Clear request_outstanding/slot_active so the parked loop can
+            // submit the next window instead of wedging, and end the slot.
+            // (INVALID_RETURN shouldn't occur now that the fast-distance is
+            // validated, but stay self-healing rather than hang the session.)
+            state.counters.invalid_return += 1;
+            state.slot_active = false;
+            state.request_outstanding = false;
+            PRX_TIMESLOT_ACTIVE.store(false, Ordering::Release);
+            if let Some(driver) = state.driver {
+                driver.ts_force_stop();
+            } else {
+                state.phase = PrxPhase::Idle;
+            }
             state.return_param.callback_action = raw::MPSL_TIMESLOT_SIGNAL_ACTION_END as u8;
             &mut state.return_param as *mut _
         }),
