@@ -77,8 +77,9 @@ const SCAN_INTERVAL_MS: u64 = 2;
 /// While a key is held, the matrix doesn't change so no event fires. Send a
 /// keepalive snapshot at this interval so the left's link-loss watchdog (500ms)
 /// sees fresh data and doesn't release the held key mid-hold (which would stop
-/// OS auto-repeat). Must be < the left's LINK_LOSS_TIMEOUT_MS (500ms).
-const KEY_HOLD_KEEPALIVE_MS: u64 = 150;
+/// OS auto-repeat). Keep well under the 500ms watchdog so jitter (bounded_wait
+/// + retries under interference) can't close the margin — 100ms gives ~5x.
+const KEY_HOLD_KEEPALIVE_MS: u64 = 100;
 const COL_SETTLE_US: u64 = 5;
 
 const SNAPSHOT_MSG: u8 = 0x53;
@@ -174,12 +175,6 @@ async fn mpsl_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn hfclk_task(mpsl: &'static MultiprotocolServiceLayer<'static>) -> ! {
-    let _hfclk = mpsl.request_hfclk().await.unwrap();
-    core::future::pending().await
-}
-
-#[embassy_executor::task]
 async fn usb_task(mut device: UsbDevice<'static, MyUsbDriver>) {
     device.run().await
 }
@@ -268,7 +263,6 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
     spawner.spawn(mpsl_task(mpsl).unwrap());
-    spawner.spawn(hfclk_task(mpsl).unwrap());
     defmt::info!("Right ESB PTX only; BLE disabled on this half");
 
     static VBUS: StaticCell<SoftwareVbusDetect> = StaticCell::new();
