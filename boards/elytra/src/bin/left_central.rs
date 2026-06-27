@@ -71,10 +71,13 @@ const TOTAL_KEYS: usize = ROWS * TOTAL_COLS;
 const RIGHT_DEVICE_ID: u8 = 0;
 /// Adaptive fast-cadence: while the right half is actively sending, RX windows
 /// chain at `FAST_DISTANCE_US`; after `FAST_BUDGET_REFILL` windows with no new
-/// frame the session falls back to parked (one window per BLE conn event).
-/// 8ms × 11 ≈ 88ms active hold before returning to low-power parked cadence.
+/// frame the session falls back to parked (one window per BLE conn event). The
+/// hold (distance × refill) should cover natural typing gaps so the first key
+/// after a brief pause doesn't pay the parked wake-up (~30ms). 8ms × 30 ≈ 240ms
+/// covers intra-burst + short inter-word gaps; longer = smoother but more RX
+/// power while settling.
 const FAST_DISTANCE_US: u32 = 8_000;
-const FAST_BUDGET_REFILL: u32 = 11;
+const FAST_BUDGET_REFILL: u32 = 30;
 
 static CONN_HANDLE: AtomicU16 = AtomicU16::new(CONN_NONE);
 static HID_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
