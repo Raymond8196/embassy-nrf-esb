@@ -69,6 +69,12 @@ const SNAPSHOT_PAYLOAD_LEN: usize = 1 + ROWS;
 const TOTAL_COLS: usize = COLS + RIGHT_COLS;
 const TOTAL_KEYS: usize = ROWS * TOTAL_COLS;
 const RIGHT_DEVICE_ID: u8 = 0;
+/// Adaptive fast-cadence: while the right half is actively sending, RX windows
+/// chain at `FAST_DISTANCE_US`; after `FAST_BUDGET_REFILL` windows with no new
+/// frame the session falls back to parked (one window per BLE conn event).
+/// 8ms × 11 ≈ 88ms active hold before returning to low-power parked cadence.
+const FAST_DISTANCE_US: u32 = 8_000;
+const FAST_BUDGET_REFILL: u32 = 11;
 
 static CONN_HANDLE: AtomicU16 = AtomicU16::new(CONN_NONE);
 static HID_NOTIFY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -298,6 +304,11 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
     let mut tracker = SequenceTracker::<1>::new();
     defmt::info!("ESB parked PRX session opened (BLE-gap triggered)");
 
+    // LATENCY PROBE: timestamp a right-half frame receive, then measure the gap
+    // until the next BLE-INACTIVE (the conn event that forwards it as HID).
+    // This is the "HID leg" — the structural receive->forward gap. 0 = none.
+    let mut pending_recv_ms: u32 = 0;
+
     loop {
         // Drive both concurrently: process a received snapshot the instant it
         // arrives (next_event wakes on push_event), and open a fresh RX window
@@ -308,10 +319,13 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
                 let frame = &ev.payload[..ev.len as usize];
                 match accept_bound_frame(&bindings, &mut tracker, ev.pipe, frame) {
                     Ok(Some((header, payload))) => {
-                        RIGHT_LAST_SEEN_MS.store(
-                            embassy_time::Instant::now().as_millis() as u32,
-                            Ordering::Release,
-                        );
+                        let now_ms = embassy_time::Instant::now().as_millis() as u32;
+                        RIGHT_LAST_SEEN_MS.store(now_ms, Ordering::Release);
+                        // Record only the FIRST frame in a BLE gap so a burst
+                        // doesn't overwrite and undercount receive->HID latency.
+                        if pending_recv_ms == 0 {
+                            pending_recv_ms = now_ms;
+                        }
                         if payload.len() == SNAPSHOT_PAYLOAD_LEN && payload[0] == SNAPSHOT_MSG {
                             let mut changed_count = 0u8;
                             for r in 0..ROWS {
@@ -387,10 +401,18 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
             Either::Second(Err(e)) => {
                 defmt::warn!("prx event error: {:?}", e);
             }
-            Either::First(_) => match session.request_window() {
-                Ok(_) => {}
-                Err(e) => defmt::warn!("request_window: {:?}", e),
-            },
+            Either::First(_) => {
+                if pending_recv_ms != 0 {
+                    let gap = (embassy_time::Instant::now().as_millis() as u32)
+                        .saturating_sub(pending_recv_ms);
+                    defmt::info!("hid_leg={}ms", gap);
+                    pending_recv_ms = 0;
+                }
+                match session.request_window() {
+                    Ok(_) => {}
+                    Err(e) => defmt::warn!("request_window: {:?}", e),
+                }
+            }
         }
     }
 }
@@ -421,13 +443,35 @@ fn request_hid_clear() {
     HID_CLEAR_REQUESTED.store(true, Ordering::Release);
 }
 
+/// Periodic ESB link-loss watchdog. `hid_task` blocks on a select when idle, so
+/// its inline timeout check never re-runs — this task polls independently and
+/// releases held right-half keys if no frame arrives within the timeout, so a
+/// dropped ESB link while idle can't leave keys stuck.
+#[embassy_executor::task]
+async fn link_loss_task() {
+    const LINK_LOSS_TIMEOUT_MS: u32 = 500;
+    const POLL_MS: u64 = 100;
+    loop {
+        Timer::after_millis(POLL_MS).await;
+        if PRX_ACTIVE.load(Ordering::Acquire)
+            && let last_seen = RIGHT_LAST_SEEN_MS.load(Ordering::Acquire)
+            && last_seen > 0
+        {
+            let now = embassy_time::Instant::now().as_millis() as u32;
+            let elapsed = now.saturating_sub(last_seen);
+            if elapsed > LINK_LOSS_TIMEOUT_MS
+                && RIGHT_ROWS_STATE.iter().any(|r| r.load(Ordering::Acquire) != 0)
+            {
+                clear_right_keys();
+                defmt::warn!("ESB link-loss: no right-half data for {}ms, clearing keys", elapsed);
+            }
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn hid_task(sdc: &'static SoftdeviceController<'static>) {
     let mut active = [false; TOTAL_KEYS];
-    /// ESB link-loss timeout: if no right-half frame in this duration, release
-    /// all right-half keys to prevent stuck keys. Right half sends snapshots
-    /// every ~2ms scan; 500ms covers worst-case BLE-preempted gaps.
-    const LINK_LOSS_TIMEOUT_MS: u32 = 500;
 
     loop {
         let mut changed = false;
@@ -440,26 +484,8 @@ async fn hid_task(sdc: &'static SoftdeviceController<'static>) {
             changed = true;
         }
 
-        // ESB link-loss watchdog: if PRX is active but no right-half data
-        // has arrived within the timeout, clear right-half key state.
-        if PRX_ACTIVE.load(Ordering::Acquire) {
-            let last_seen = RIGHT_LAST_SEEN_MS.load(Ordering::Acquire);
-            if last_seen > 0 {
-                let now = embassy_time::Instant::now().as_millis() as u32;
-                if now.saturating_sub(last_seen) > LINK_LOSS_TIMEOUT_MS {
-                    let any_right_held = RIGHT_ROWS_STATE
-                        .iter()
-                        .any(|r| r.load(Ordering::Acquire) != 0);
-                    if any_right_held {
-                        clear_right_keys();
-                        defmt::warn!(
-                            "ESB link-loss: no right-half data for {}ms, clearing keys",
-                            now.saturating_sub(last_seen)
-                        );
-                    }
-                }
-            }
-        }
+        // ESB link-loss watchdog lives in `link_loss_task` — this task blocks
+        // on a select when idle, so an inline check here wouldn't re-run.
 
         if RIGHT_DIRTY.swap(false, Ordering::AcqRel) {
             apply_right_snapshot(&mut active);
@@ -1429,6 +1455,10 @@ async fn main(spawner: Spawner) {
         };
         defmt::info!("radio notification cfg ret={}", r);
     }
+    // Adaptive fast-window chaining: received frames fund a fast-cadence budget
+    // so RX windows chain at ~8ms while typing, and revert to parked (~30ms,
+    // BLE-gap-triggered) when idle. See `configure_prx_fast_window`.
+    embassy_nrf_esb::mpsl_timeslot::configure_prx_fast_window(FAST_DISTANCE_US, FAST_BUDGET_REFILL);
 
     let sdc_p = sdc::Peripherals::new(
         p.PPI_CH17, p.PPI_CH18, p.PPI_CH20, p.PPI_CH21, p.PPI_CH22, p.PPI_CH23, p.PPI_CH24,
@@ -1453,6 +1483,7 @@ async fn main(spawner: Spawner) {
     start_advertising(sdc).await;
     spawner.spawn(sdc_task(sdc, mpsl).unwrap());
     spawner.spawn(hid_task(sdc).unwrap());
+    spawner.spawn(link_loss_task().unwrap());
     spawner.spawn(prx_task(mpsl).unwrap());
 
     let cols = [

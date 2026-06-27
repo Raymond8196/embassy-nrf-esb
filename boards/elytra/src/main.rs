@@ -28,6 +28,7 @@ use embassy_nrf::{bind_interrupts, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use embassy_futures::select::{select, Either};
 use embassy_time::Instant;
 use embassy_usb::UsbDevice;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
@@ -73,6 +74,11 @@ static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, LOG_BUF_S
 const MATRIX_ROWS: usize = 5;
 const MATRIX_COLS: usize = 8;
 const SCAN_INTERVAL_MS: u64 = 2;
+/// While a key is held, the matrix doesn't change so no event fires. Send a
+/// keepalive snapshot at this interval so the left's link-loss watchdog (500ms)
+/// sees fresh data and doesn't release the held key mid-hold (which would stop
+/// OS auto-repeat). Must be < the left's LINK_LOSS_TIMEOUT_MS (500ms).
+const KEY_HOLD_KEEPALIVE_MS: u64 = 150;
 const COL_SETTLE_US: u64 = 5;
 
 const SNAPSHOT_MSG: u8 = 0x53;
@@ -361,7 +367,22 @@ async fn main(spawner: Spawner) {
 
     loop {
         while !MATRIX_DIRTY.swap(false, Ordering::AcqRel) {
-            MATRIX_CHANGED.wait().await;
+            // Held keys don't change the matrix, so no event fires — send a
+            // keepalive snapshot periodically so the left's link-loss watchdog
+            // doesn't release the held key (which kills OS auto-repeat).
+            if MATRIX_ROWS_STATE.iter().any(|r| r.load(Ordering::Acquire) != 0) {
+                match select(
+                    MATRIX_CHANGED.wait(),
+                    embassy_time::Timer::after_millis(KEY_HOLD_KEEPALIVE_MS),
+                )
+                .await
+                {
+                    Either::First(()) => {} // change: scan already set MATRIX_DIRTY
+                    Either::Second(()) => MATRIX_DIRTY.store(true, Ordering::Release),
+                }
+            } else {
+                MATRIX_CHANGED.wait().await;
+            }
         }
 
         event_count += 1;
