@@ -353,30 +353,12 @@ async fn prx_task(mpsl: &'static MultiprotocolServiceLayer<'static>) {
                                 payload[5],
                                 changed_count
                             );
-                        } else if payload.len() == 2 {
-                            let key_id = payload[0];
-                            let pressed = payload[1] != 0;
-                            defmt::info!(
-                                "right event pipe={} dev={} key={} pr={} seq={}",
-                                ev.pipe,
-                                header.device_id,
-                                key_id,
-                                pressed as u8,
-                                header.sequence
-                            );
-                            if key_id < (ROWS * RIGHT_COLS) as u8 {
-                                let _ = HID_EVENTS.try_send(KeyEvent {
-                                    key_id: key_id + RIGHT_KEY_BASE,
-                                    pressed,
-                                });
-                            } else {
-                                defmt::warn!(
-                                    "right event invalid key={} pr={}",
-                                    key_id,
-                                    pressed as u8
-                                );
-                            }
                         } else {
+                            // Only snapshots (SNAPSHOT_MSG + ROWS bytes) are accepted.
+                            // The raw (key_id, pressed) event form is intentionally NOT
+                            // handled: the right half never sends it, and accepting it
+                            // would be an unauthenticated keystroke-injection surface
+                            // (ESB has no encryption/authentication).
                             defmt::warn!("right event invalid payload len={}", payload.len());
                         }
                     }
@@ -437,8 +419,8 @@ fn clear_right_keys() {
 }
 
 /// Request the HID task to send an all-keys-up report on the next iteration.
-/// Called on mode switch, panic recovery, or other forced key-release paths.
-#[allow(dead_code)]
+/// Called on BLE disconnect (so held left-half modifiers don't stay stuck
+/// across reconnect) and other forced key-release paths.
 fn request_hid_clear() {
     HID_CLEAR_REQUESTED.store(true, Ordering::Release);
 }
@@ -697,9 +679,14 @@ async fn handle_hci_event(sdc: &SoftdeviceController<'_>, buf: &[u8]) -> bool {
         CONN_HANDLE.store(CONN_NONE, Ordering::Relaxed);
         HID_NOTIFY_ENABLED.store(false, Ordering::Relaxed);
         SMP_STATE.lock(|s| s.borrow_mut().reset_pairing());
-        // Clear right-half keys so stale state cannot survive BLE disconnect.
+        // Clear all keys (left + right) so stale state can't survive BLE
+        // disconnect. Without request_hid_clear, held left-half modifiers stay
+        // stuck in hid_task's `active` array across reconnect (clear_right_keys
+        // only touches right-half state). hid_task drains the flag and sends an
+        // all-keys-up report on its next iteration.
         clear_right_keys();
-        defmt::info!("BLE disconnected, cleared right-half keys");
+        request_hid_clear();
+        defmt::info!("BLE disconnected, cleared all keys");
         return true;
     }
     if buf[0] == 0x08 && buf.len() >= 6 {
