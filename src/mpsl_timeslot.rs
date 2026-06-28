@@ -2407,10 +2407,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                     window_id: state.counters.start,
                     next_delay_us: prx_next_window_delay_us(state),
                     period_us: prx_schedule_period_us(state),
-                    // The PTX may land anywhere in the full RX slot, not just up
-                    // to the in-slot match point — advertise slot_length as the
-                    // window so it aligns against the real target (cuts misses).
-                    window_us: state.slot_length_us,
+                    window_us: state.in_slot_match_us,
                 });
                 let (event, _rx_idx) = driver.ts_on_radio();
                 driver.ts_discard_received();
@@ -2514,7 +2511,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     state.counters.start,
                                     next_delay_us,
                                     period_us,
-                                    state.slot_length_us,
+                                    state.in_slot_match_us,
                                     state.ack_extension_for_pipe(pipe),
                                 );
                                 let dma_ptr =
@@ -2578,7 +2575,7 @@ unsafe extern "C" fn prx_timeslot_callback(
                                     state.counters.start,
                                     next_delay_us,
                                     period_us,
-                                    state.slot_length_us,
+                                    state.in_slot_match_us,
                                     state.ack_extension_for_pipe(pipe),
                                 );
                                 let dma_ptr =
