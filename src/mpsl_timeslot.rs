@@ -3113,8 +3113,22 @@ where
         addresses: &EsbAddresses,
         slot_config: PrxSlotConfig,
     ) -> Result<Self, Error> {
-        let session = open_prx_session(mpsl, config, addresses, slot_config)?;
+        // Open without submitting the first timeslot request yet, but keep
+        // auto-reschedule so the session still runs continuously. Registering
+        // the driver *before* the request goes out closes the race where MPSL
+        // could grant the first slot and run SIGNAL_START with `driver == None`
+        // (the legacy inline engine) between open and set_prx_driver.
+        let mut session = open_prx_session_with_mode(
+            mpsl,
+            config,
+            addresses,
+            slot_config,
+            None,
+            true,  // auto_reschedule: continuous PRX
+            false, // submit_now: defer until driver is registered
+        )?;
         set_prx_driver(prx, addresses, slot_config.enabled_pipes);
+        session.request_window()?;
         Ok(Self { prx, session })
     }
 
@@ -3240,6 +3254,7 @@ pub fn open_prx_session_with_ack_extension(
         slot_config,
         ack_extension_provider,
         true,
+        true,
     )
 }
 
@@ -3264,6 +3279,7 @@ pub fn open_parked_prx_session_with_ack_extension(
         slot_config,
         ack_extension_provider,
         false,
+        false,
     )
 }
 
@@ -3273,7 +3289,8 @@ fn open_prx_session_with_mode(
     addresses: &EsbAddresses,
     slot_config: PrxSlotConfig,
     ack_extension_provider: Option<PrxAckExtensionProvider>,
-    start_immediately: bool,
+    auto_reschedule: bool,
+    submit_now: bool,
 ) -> Result<PrxSlotSession, Error> {
     let busy = PRX_STATE.try_enter()?;
     if config.payload_length < 4 {
@@ -3311,8 +3328,8 @@ fn open_prx_session_with_mode(
         state.extend_length_us = slot_config.extend_length_us;
         state.retry_blocked_at_high_priority = slot_config.request.retry_blocked_at_high_priority;
         state.ack_extension_provider = ack_extension_provider;
-        state.auto_reschedule = start_immediately;
-        state.request_outstanding = start_immediately;
+        state.auto_reschedule = auto_reschedule;
+        state.request_outstanding = submit_now;
         prx_set_earliest_request(
             state,
             TIMESLOT_PRIORITY_NORMAL,
@@ -3337,7 +3354,7 @@ fn open_prx_session_with_mode(
         last_earliest_cancelled: 0,
     };
 
-    if !start_immediately {
+    if !submit_now {
         return Ok(session);
     }
 
