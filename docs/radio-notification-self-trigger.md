@@ -166,17 +166,59 @@ callback-context atomics (no app time source). The ACK hint refreshes on frame
 receipt (before the hint is built) so the right's `bounded_wait` sees the fast
 period with no one-ACK lag.
 
-Measured on hardware: `hid_leg` (receive→next-INACTIVE) **~9ms median** (from
-~28ms). Right-key ≈ ESB hop + hid_leg ≈ **~12-16ms**, beating RMK's pure-BLE
-split (~20ms). 0 BLE disconnects / errors across heavy typing. Idle stays
-low-power (parked ~30ms); the fast cadence only runs while typing.
+### Measured latency (hardware, 2026-06-28)
+
+Both legs measured independently on each half's RTT (active-hold 240ms, fast
+cadence 8ms; `window_us` reverted to `in_slot_match` 530µs — see note below):
+
+**HID leg** (left `hid_leg` = receive→next-BLE-INACTIVE, 695 samples):
+median **~10ms**, range 0–15ms, bimodal (~50% at 0–9ms, ~46% at 10–12ms).
+
+**ESB leg** (right `lat` = keypress→ACK, 466 valid sends, left ACKing):
+
+| attempts | share | ESB latency |
+|---|---|---|
+| att=1 (first try) | 75% | **~2.8ms** (2777–2808µs) |
+| att=2 (one retry) | 24% | **~6ms** (cluster 5.8–6.1ms) |
+| att=3 (two retries) | 1% | ~9–11ms |
+
+**Total right-key latency (steady-state)** = ESB + HID:
+
+| | total |
+|---|---|
+| median (att=1) | **~13ms** |
+| retry tail (att=2, 24%) | ~16ms |
+| att=3 (1%) | ~20ms |
+| transition (first key after >240ms idle) | ~30ms (parked wake-up) |
+
+vs **RMK pure-BLE split (estimated, not measured)**: median ~20ms, worst ~40ms
+(two independent BLE hops both missing their conn events). So steady-state this
+design beats RMK on both median (13 vs 20) and worst-case tail (~20 vs ~40);
+the only weaker spot is the parked-wake-up transition (~30ms vs RMK's no-penalty
+~20ms, but still < RMK's ~40ms worst).
+
+**Retry analysis:** ~25% of sends retry once (att=2). Root cause is timing
+misalignment — the right's RTC drifts vs the left's TIMER0, and `max_wait`=2ms
+makes ~75% of sends fall back to an immediate (unaligned) TX that misses the
+~530µs RX window ~1/3 of the time. An experiment advertising the full
+`slot_length` (1500µs) as `window_us` instead of `in_slot_match` (530µs) was
+**neutral** (~25% either way — the retry is alignment-bound, not window-width-
+bound); reverted (880610c → 71e18f3). The real lever to tighten the tail would
+be raising the right's `max_wait` (2→~6ms, waits for alignment instead of
+falling back) at the cost of ~1ms median — deferred.
+
+0 BLE disconnects / errors across heavy typing. Idle stays low-power (parked
+~30ms); the fast cadence only runs while typing.
+
+### Held-key keepalive + link-loss
 
 Held-key keepalive (right half): the matrix doesn't change during a hold, so
 without keepalives the link-loss watchdog (500ms) released the key mid-hold and
-OS auto-repeat died after ~2 chars. The right now re-sends the current snapshot
-every 150ms while a key is held, keeping the left's `last_seen` fresh. The
-link-loss watchdog moved to a periodic `link_loss_task` (the inline `hid_task`
-check never re-ran when idle).
+OS auto-repeat died after ~2 chars. The right re-sends the current snapshot
+every 100ms while a key is held (was 150ms — widened to ~5x the watchdog margin
+under interference), keeping the left's `last_seen` fresh. The link-loss
+watchdog moved to a periodic `link_loss_task` (the inline `hid_task` check
+never re-ran when idle).
 
 Note: this fixes *ESB* latency. The BLE-idle power floor (~550uA, macOS-enforced
 latency 0 — see the slave-latency section above) is unchanged; adaptive cadence
