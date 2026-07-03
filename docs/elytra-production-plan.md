@@ -2,6 +2,12 @@
 
 Created: 2026-06-23
 
+Status note, 2026-07-03: this remains the product target document for G1, G2,
+and manual runtime switching. It is not the current status source; use
+`current-status.md` for the latest verified state and next actions. The
+radio-notification parked PRX and adaptive-cadence work became the active G1
+hardening path after this sprint plan was written.
+
 Goal: production-grade ESB on Elytra split keyboard within 2 weeks. The sprint
 prioritizes a stable G1 daily-driver path, then a usable G2 dongle path, then
 runtime switching only after both paths are independently verified. This becomes
@@ -291,7 +297,7 @@ dongle insertion/removal is a later extension, not the first implementation.
   - Full regression: G1 30min + G2 30min + mode switch 10 cycles
   - Update README with Elytra production status
   - Record metrics: latency, power, reliability for both modes
-  - Update `docs/roadmap-to-9.md` scores
+  - Update `docs/current-status.md` and README status
   - Explicitly label achieved tier: RC1, RC2, or RC3. Do not describe deferred
     auto-detection as complete unless it has its own verification record.
 

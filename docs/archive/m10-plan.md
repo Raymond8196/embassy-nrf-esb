@@ -1,7 +1,7 @@
 # M10: MPSL Timeslot Adapter — 详细开发与验证计划
 
 > 风格沿用 `m9-verification.md`：逐步骤、每步独立可验证、明确通过/失败标准。
-> 上游 `docs/plan.md` 的 M10 章节给出概念蓝图；本文是其落地执行版。
+> 上游 `implementation-plan-early.md` 的 M10 章节给出概念蓝图；本文是其落地执行版。
 > 本文已根据真实应用场景（多分体键盘多模 + 通用开源库定位）扩展了原 plan.md 中刻意回避的部分。
 
 ---

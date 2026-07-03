@@ -4,9 +4,9 @@ Created: 2026-05-19
 All batches completed: 2026-05-21
 
 This was the review-fix backlog after M10 first pass. All items below are
-done. Kept as a record of what was reviewed and fixed; see `docs/roadmap-to-9.md`
-for current work and `docs/single-engine-convergence-plan.md` for the ongoing
-engine convergence.
+done. Kept as a record of what was reviewed and fixed. See
+`../current-status.md` for current work and
+`../single-engine-convergence-plan.md` for the ongoing engine convergence.
 
 ## Completed Batches
 

@@ -403,5 +403,4 @@ Official and project references to use while executing this plan:
 - Community MPSL timeslot wrapper reference: https://github.com/inductivekickback/timeslot
 - Local current verification log: `docs/archive/m10-verification.md`
 - Local lessons learned: `docs/archive/m10-lessons-learned.md`
-- Local review backlog: `docs/review-fix-backlog.md`
-
+- Local review backlog: `review-fix-backlog.md`

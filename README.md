@@ -155,13 +155,15 @@ buffer ────────────────────────�
 
 ## Documentation
 
-- [Implementation Plan](docs/plan.md)
-- [Roadmap to 9/10](docs/roadmap-to-9.md)
+- [Current Status](docs/current-status.md)
+- [Elytra Parked PRX Findings](docs/radio-notification-self-trigger.md)
+- [Elytra Production Plan](docs/elytra-production-plan.md)
+- [Single-Engine Convergence Plan](docs/single-engine-convergence-plan.md)
+- [Transport ACK Protocol](docs/transport-ack.md)
 - [Core ESB Verification](docs/core-verification.md)
 - [Alpha Testing Guide](docs/alpha-testing.md)
 - [RMK ESB Integration Notes](docs/rmk-integration.md)
-- [M10 MPSL Verification](docs/archive/m10-verification.md)
-- [ESB+BLE Coexistence Analysis](docs/esb-ble-coexistence-analysis.md)
+- [Historical Archive](docs/archive/README.md)
 
 ## License
 

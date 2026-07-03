@@ -953,5 +953,5 @@ Conclusion:
 
 - Add GATT echo/notify once the basic advertising + ESB PRX coexistence smoke test passes.
 - Run Step 8 keyboard-style split scenario with 7.5 ms BLE connection interval.
-- Move review fixes from `docs/review-fix-backlog.md` only after M10 first-pass validation is complete.
+- Move review fixes from `review-fix-backlog.md` only after M10 first-pass validation is complete.
 - Integrate real key matrix scanning into `mpsl_3mode_event` to replace the 50ms mock timer.

@@ -2,7 +2,8 @@
 
 Created: 2026-06-15
 
-This refines **Phase 5 (MPSL Owned Wrapper)** of `docs/roadmap-to-9.md` with a
+This refines **Phase 5 (MPSL Owned Wrapper)** of
+`docs/archive/roadmap-to-9.md` with a
 concrete, staged development + verification plan. Scope is narrow on purpose:
 collapse the **two divergent ESB engines** into one, so the MPSL coexistence
 path runs the same protocol logic as the exclusive path and can carry real
@@ -76,7 +77,8 @@ crates.io, dynamic pairing/channel hopping.
 4. **RADIO ISR ownership.**
    Exclusive SM is invoked from the RADIO ISR (NVIC dance in `isr.rs`); MPSL mode
    is invoked from the `SIGNAL_RADIO` callback (MPSL owns the vector; app must NOT
-   `NVIC::unmask(RADIO)` — see `docs/esb-ble-coexistence-analysis.md`).
+   `NVIC::unmask(RADIO)` — see
+   `docs/archive/esb-ble-coexistence-analysis.md`).
    → The SM core is agnostic; add timeslot entrypoints that skip the NVIC path.
 
 ## 4. Target architecture
@@ -126,7 +128,7 @@ it first to keep the highest-value path low-risk; do PTX second.
   (`write_counter_packet`, `write_ack_counter_packet`, `mpsl_schedule`) into a
   diagnostic wrapper / examples so the core engine carries real payloads.
 - **S9 — Cleanup.** Delete now-dead inline state; `mpsl_timeslot.rs` net −800…−1200
-  lines; update `docs/roadmap-to-9.md` Phase 5 status.
+  lines; update `docs/current-status.md`.
 
 ## 6. Test & verification plan
 

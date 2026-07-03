@@ -3,7 +3,7 @@
 Created: 2026-05-20
 
 This document records the intended RMK integration shape based on the local RMK
-workspace at `/home/qlg/wkspaces/rmk`.
+workspace at `/Users/ray/wkspaces/rmk`.
 
 ## Local RMK Interface Facts
 
